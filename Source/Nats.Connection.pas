@@ -45,6 +45,9 @@ type
 
   TNatsConnection = class;
 
+  /// <summary>
+  ///   Simple Id generator for subscription and inbox
+  /// </summary>
   TNatsGenerator = class
   private
     FSubId: Cardinal;
@@ -54,6 +57,9 @@ type
     function GetNewInbox: string;
   end;
 
+  /// <summary>
+  ///   Worker thread for reading incoming messages from the socket channel
+  /// </summary>
   TNatsReader = class(TNatsThread)
   private
     FConnection: TNatsConnection;
@@ -70,6 +76,9 @@ type
     property Error: string read FError write FError;
   end;
 
+  /// <summary>
+  ///   Worker thread for processing incoming and outgoing messages
+  /// </summary>
   TNatsConsumer = class(TNatsThread)
   private
     FConnection: TNatsConnection;
@@ -84,6 +93,9 @@ type
 
   end;
 
+  /// <summary>
+  ///   Structure holding subscription metadata
+  /// </summary>
   TNatsSubscription = class
     Id: Integer;
     Subject: string;
@@ -91,9 +103,11 @@ type
     Queue: string;
     Received: Integer;
     Expected: Integer;
+    Remaining: Integer;
 
     constructor Create(AId: Integer; const ASubject: string; AHandler: TNatsMsgHandler); overload;
   end;
+  TNatsSubscriptionPair = TPair<Integer, TNatsSubscription>;
   TNatsSubscriptions = TObjectDictionary<Integer, TNatsSubscription>;
 
   /// <summary>
@@ -118,6 +132,8 @@ type
     procedure SendCommand(const ACommand: TBytes; APriority: Boolean); overload;
   private
     procedure SendSubscribe(const ASubscription: TNatsSubscription);
+    function GetConnected: Boolean;
+    procedure EndThreads;
   public
     constructor Create;
     destructor Destroy; override;
@@ -138,9 +154,11 @@ type
     function Subscribe(const ASubject, AQueue: string; AHandler: TNatsMsgHandler): Integer; overload;
 
     procedure Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0);
+
+    function GetSubscriptionList: TArray<TNatsSubscriptionPair>;
   public
     property Name: string read FName write FName;
-    //property Subscriptions: TNatsSubscriptions read FSubscriptions write FSubscriptions;
+    property Connected: Boolean read GetConnected;
   end;
 
   TNatsNetwork = class(TObjectDictionary<string, TNatsConnection>)
@@ -165,7 +183,11 @@ begin
   FConnectHandler := AConnectHandler;
   FDisconnectHandler := ADisconnectHandler;
   FChannel.Open;
+
+  FReader := TNatsReader.Create(Self);
   FReader.Start;
+
+  FConsumer := TNatsConsumer.Create(Self);
   FConsumer.Start;
 end;
 
@@ -177,31 +199,36 @@ begin
 
   { TODO -opaolo -c : Remove the default behavior 31/05/2022 18:17:27 }
   FChannel := TNatsSocketRegistry.Get(String.Empty);
-
-  FReader := TNatsReader.Create(Self);
-  FConsumer := TNatsConsumer.Create(Self);
 end;
 
 destructor TNatsConnection.Destroy;
 begin
-  FReader.Stop;
-  FConsumer.Stop;
+  Close();
 
-  FReader.WaitFor;
-  FReader.Free;
-
-  FConsumer.WaitFor;
-  FConsumer.Free;
-
-  //FSocket.Free;
   FSubscriptions.Free;
   FGenerator.Free;
   FReadQueue.Free;
   inherited;
 end;
 
+function TNatsConnection.GetConnected: Boolean;
+begin
+  Result := FChannel.Connected;
+end;
+
+function TNatsConnection.GetSubscriptionList: TArray<TNatsSubscriptionPair>;
+begin
+  TMonitor.Enter(FSubscriptions);
+  try
+    Result := FSubscriptions.ToArray;
+  finally
+    TMonitor.Exit(FSubscriptions);
+  end;
+end;
+
 procedure TNatsConnection.Close();
 begin
+  EndThreads;
   FChannel.Close;
 end;
 
@@ -246,13 +273,21 @@ procedure TNatsConnection.Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0);
 var
   LSub: TNatsSubscription;
 begin
-  if FSubscriptions.TryGetValue(AId, LSub) then
-    FSubscriptions.Remove(AId);
+  if not FSubscriptions.TryGetValue(AId, LSub) then
+    Exit; // Nothing to do here!
 
   if AMaxMsg = 0 then
     FChannel.SendString(Format('%s %d', [NatsConstants.Protocol.UNSUB, AId]))
   else
-    FChannel.SendString(Format('%s %d %d', [NatsConstants.Protocol.UNSUB, AId, AMaxMsg]))
+    FChannel.SendString(Format('%s %d %d', [NatsConstants.Protocol.UNSUB, AId, AMaxMsg]));
+
+  if AMaxMsg = 0 then
+  begin
+    FSubscriptions.Remove(AId);
+    Exit;
+  end;
+
+  LSub.Remaining := AMaxMsg;
 end;
 
 procedure TNatsConnection.SendCommand(const ACommand: TBytes; APriority: Boolean);
@@ -306,6 +341,21 @@ begin
   Result := LSub.Id;
 end;
 
+procedure TNatsConnection.EndThreads;
+begin
+  if (FReader = nil) or (FConsumer = nil) then
+    Exit;
+
+  FReader.Stop;
+  FConsumer.Stop;
+
+  FReader.WaitFor;
+  FreeAndNil(FReader);
+
+  FConsumer.WaitFor;
+  FreeAndNil(FConsumer);
+end;
+
 procedure TNatsConnection.SendCommand(const ACommand: string);
 begin
   SendCommand(TEncoding.UTF8.GetBytes(ACommand), False);
@@ -344,7 +394,16 @@ begin
       Continue;
     end;
 
-    LRead := FChannel.ReceiveString;
+    try
+      LRead := FChannel.ReceiveString;
+    except
+      on E: Exception do
+      begin
+        LRead := '';
+        FError := E.Message;
+      end;
+    end;
+
     if LRead.IsEmpty then
       Continue;
 
@@ -462,6 +521,12 @@ begin
           LSub.Received := LSub.Received + 1;
           if Assigned(LSub.Handler) then
             LSub.Handler(LCommand.GetArgAsMsg);
+
+          if LSub.Remaining > -1 then
+            LSub.Remaining := LSub.Remaining - 1;
+
+          if LSub.Remaining = 0 then
+            FConnection.FSubscriptions.Remove(LCommand.GetArgAsMsg.Id);
         end;
       end;
       TNatsCommandServer.OK:
@@ -495,6 +560,7 @@ constructor TNatsSubscription.Create(AId: Integer; const ASubject: string; AHand
 begin
   Received := 0;
   Expected := -1;
+  Remaining := -1;
 
   Id := AId;
   Subject := ASubject;

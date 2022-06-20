@@ -57,11 +57,6 @@ type
     DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
     DEFAULT_PING_INTERVAL = 4*1000;
 
-    MAX_PENDING_SIZE = 32768;
-    INIT_BUFFER_SIZE = 1 * 1024 * 1024; // 1 Mb
-    MAX_BUFFER_SIZE = 16 * 1024 * 1024; // 16 Mb
-    REALLOCATION_THRESHOLD = 1 * 1000; // 1 second
-
     CR_LF = #13#10;
     TAB = #9;
     CR_LF_LEN = 2;
@@ -71,15 +66,6 @@ type
     SEP = '.';
     WC = '*';
     ARR = '>';
-
-    // Embeded Server properties
-    DEFAULT_AUTH = False;
-    DEFAULT_SSL = False;
-    DEFAULT_MAX_PAYLOAD = 1 * 1024 * 1024; // 1Mb
-
-    // Server status
-    START = 0;
-    SHUTDOWN = 1;
 
     public type Protocol = class
     const
@@ -95,12 +81,6 @@ type
       ERR = '-ERR';
       OK = '+OK';
       UNKNOWN = 'UNKNOWN';
-
-      // Responses
-      PING_REQUEST = 'PING' + CR_LF;
-      PING_REQUEST_LEN = Length(PING_REQUEST);
-      PONG_RESPONSE = 'PONG' + CR_LF;
-      PONG_RESPONSE_LEN = Length(PONG_RESPONSE);
     end;
 
     class function DEFAULT_URI: string; static;
