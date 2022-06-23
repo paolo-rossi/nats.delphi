@@ -153,7 +153,8 @@ type
     function Subscribe(const ASubject: string; AHandler: TNatsMsgHandler): Integer; overload;
     function Subscribe(const ASubject, AQueue: string; AHandler: TNatsMsgHandler): Integer; overload;
 
-    procedure Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0);
+    procedure Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0); overload;
+    procedure Unsubscribe(const ASubject: string; AMaxMsg: Cardinal = 0); overload;
 
     function GetSubscriptionList: TArray<TNatsSubscriptionPair>;
   public
@@ -341,6 +342,25 @@ begin
   Result := LSub.Id;
 end;
 
+procedure TNatsConnection.Unsubscribe(const ASubject: string; AMaxMsg: Cardinal);
+var
+  LPair: TNatsSubscriptionPair;
+  LId: Integer;
+begin
+  LId := -1;
+  for LPair in FSubscriptions do
+    if LPair.Value.Subject = ASubject then
+    begin
+      LId := LPair.Value.Id;
+      Break;
+    end;
+
+  if LId > -1 then
+    Unsubscribe(LId, AMaxMsg)
+  else
+    raise ENatsException.CreateFmt('Subscription [%s] not found in the subscription list', [ASubject]);
+end;
+
 procedure TNatsConnection.EndThreads;
 begin
   if (FReader = nil) or (FConsumer = nil) then
@@ -408,13 +428,6 @@ begin
       Continue;
 
     LCommand := FParser.Parse(LRead);
-
-    if LCommand.CommandType = TNatsCommandServer.PING then
-    begin
-      // not here?
-      FChannel.SendString(NatsConstants.Protocol.PONG);
-      Continue;
-    end;
 
     if LCommand.CommandType = TNatsCommandServer.MSG then
     begin
@@ -503,17 +516,21 @@ begin
     case LCommand.CommandType of
       TNatsCommandServer.INFO:
       begin
+        { TODO -opaolo -c : read the TLSs parameters and (if) upgrade the connection 23/06/2022 11:00:44 }
         if Assigned(FConnection.FConnectHandler) then
           FConnection.FConnectHandler(LCommand.GetArgAsInfo.Info);
       end;
+
       TNatsCommandServer.PING:
       begin
-        // ?
+        FConnection.SendPong;
       end;
+
       TNatsCommandServer.PONG:
       begin
-        // ?
+        { TODO -opaolo -c : Manage an handler set on the Ping? 23/06/2022 11:03:35 }
       end;
+
       TNatsCommandServer.MSG:
       begin
         if FConnection.FSubscriptions.TryGetValue(LCommand.GetArgAsMsg.Id, LSub) then
@@ -529,13 +546,15 @@ begin
             FConnection.FSubscriptions.Remove(LCommand.GetArgAsMsg.Id);
         end;
       end;
+
       TNatsCommandServer.OK:
       begin
-        // ?
+        // Nothing to do here!
       end;
+
       TNatsCommandServer.ERR:
       begin
-        // ?
+        { TODO -opaolo -c : After an ERR the server will disconnect: Reconnect 23/06/2022 10:58:11 }
       end;
     end
     else

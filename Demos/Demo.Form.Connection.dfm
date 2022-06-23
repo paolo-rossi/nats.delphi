@@ -3,7 +3,7 @@ object frmConnection: TfrmConnection
   Top = 0
   Caption = 'frmConnection'
   ClientHeight = 370
-  ClientWidth = 566
+  ClientWidth = 610
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
   Font.Color = clWindowText
@@ -21,7 +21,6 @@ object frmConnection: TfrmConnection
     Align = alLeft
     Caption = ' Server '
     TabOrder = 0
-    ExplicitHeight = 357
     object lblServerInfo: TLabel
       Left = 16
       Top = 101
@@ -88,12 +87,11 @@ object frmConnection: TfrmConnection
   object grpCommands: TGroupBox
     Left = 209
     Top = 0
-    Width = 200
+    Width = 250
     Height = 370
     Align = alLeft
     Caption = ' Commands '
     TabOrder = 1
-    ExplicitHeight = 357
     object lblCommandList: TLabel
       Left = 6
       Top = 25
@@ -107,6 +105,13 @@ object frmConnection: TfrmConnection
       Width = 119
       Height = 15
       Caption = 'Command Parameters'
+    end
+    object lblSubscriptionList: TLabel
+      Left = 126
+      Top = 25
+      Width = 87
+      Height = 15
+      Caption = 'Subscription List'
     end
     object lstCommandList: TListBox
       Left = 6
@@ -125,7 +130,7 @@ object frmConnection: TfrmConnection
     object lstCommandParams: TValueListEditor
       Left = 6
       Top = 191
-      Width = 179
+      Width = 227
       Height = 118
       DefaultColWidth = 80
       Strings.Strings = (
@@ -137,41 +142,71 @@ object frmConnection: TfrmConnection
         'Value')
       ColWidths = (
         80
-        93)
+        141)
     end
     object btnSend: TButton
       Left = 6
       Top = 322
-      Width = 179
+      Width = 227
       Height = 25
       Caption = 'Send Command'
       TabOrder = 2
       OnClick = btnSendClick
     end
-  end
-  object grpConnection: TGroupBox
-    Left = 409
-    Top = 0
-    Width = 157
-    Height = 370
-    Align = alClient
-    Caption = ' Connection '
-    TabOrder = 2
-    ExplicitHeight = 357
-    object lblSubscriptionList: TLabel
-      Left = 6
-      Top = 25
-      Width = 87
-      Height = 15
-      Caption = 'Subscription List'
-    end
     object lstSubscriptions: TListBox
-      Left = 6
+      Left = 126
       Top = 46
-      Width = 121
+      Width = 107
       Height = 118
       ItemHeight = 15
+      TabOrder = 3
+    end
+  end
+  object grpConnection: TGroupBox
+    Left = 459
+    Top = 0
+    Width = 151
+    Height = 370
+    Align = alClient
+    Caption = ' Misc'
+    TabOrder = 2
+    ExplicitLeft = 465
+    ExplicitWidth = 189
+    object btnSimplePublish: TButton
+      Left = 6
+      Top = 46
+      Width = 139
+      Height = 25
+      Caption = 'Simple Publish Code'
       TabOrder = 0
+      OnClick = btnSimplePublishClick
+    end
+    object btnSimpleSubscribe: TButton
+      Left = 6
+      Top = 77
+      Width = 139
+      Height = 25
+      Caption = 'Simple Subscribe Code'
+      TabOrder = 1
+      OnClick = btnSimpleSubscribeClick
+    end
+    object btnSimpleRequest: TButton
+      Left = 6
+      Top = 108
+      Width = 139
+      Height = 25
+      Caption = 'Simple Request Code'
+      TabOrder = 2
+      OnClick = btnSimpleRequestClick
+    end
+    object btnSimpleUnsubscribe: TButton
+      Left = 6
+      Top = 139
+      Width = 139
+      Height = 25
+      Caption = 'Simple Unsubscribe Code'
+      TabOrder = 3
+      OnClick = btnSimpleUnsubscribeClick
     end
   end
 end

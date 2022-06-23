@@ -50,7 +50,15 @@ type
     grpConnection: TGroupBox;
     lstSubscriptions: TListBox;
     lblSubscriptionList: TLabel;
+    btnSimplePublish: TButton;
+    btnSimpleSubscribe: TButton;
+    btnSimpleRequest: TButton;
+    btnSimpleUnsubscribe: TButton;
+    procedure btnSimplePublishClick(Sender: TObject);
     procedure btnSendClick(Sender: TObject);
+    procedure btnSimpleRequestClick(Sender: TObject);
+    procedure btnSimpleSubscribeClick(Sender: TObject);
+    procedure btnSimpleUnsubscribeClick(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormCreate(Sender: TObject);
     procedure lstCommandListClick(Sender: TObject);
@@ -73,6 +81,44 @@ uses
   Nats.Classes;
 
 {$R *.dfm}
+
+procedure TfrmConnection.btnSimplePublishClick(Sender: TObject);
+begin
+  FConnection.Publish('mysubject', 'My Message');
+end;
+
+procedure TfrmConnection.btnSimpleRequestClick(Sender: TObject);
+var
+  LHandler: TNatsMsgHandler;
+begin
+  LHandler :=
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      // Code to handle the received response
+      // **Remember, your code here must be thread safe!
+    end;
+
+  FConnection.Request('mysubject', LHandler)
+end;
+
+procedure TfrmConnection.btnSimpleSubscribeClick(Sender: TObject);
+var
+  LHandler: TNatsMsgHandler;
+begin
+  LHandler :=
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      // Code to handle received Msg with subject "mysubject"
+      // **Remember, your code here must be thread safe!
+    end;
+
+  FConnection.Subscribe('mysubject', LHandler);
+end;
+
+procedure TfrmConnection.btnSimpleUnsubscribeClick(Sender: TObject);
+begin
+  FConnection.Unsubscribe('mysubject');
+end;
 
 procedure TfrmConnection.btnSendClick(Sender: TObject);
 var
