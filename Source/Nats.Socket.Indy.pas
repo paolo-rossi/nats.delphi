@@ -100,6 +100,7 @@ end;
 procedure TNatsSocketIndy.Open;
 begin
   FClient.Connect;
+  FClient.IOHandler.MaxLineAction := maSplit;
 end;
 
 function TNatsSocketIndy.ReceiveBytes: TBytes;
