@@ -160,6 +160,8 @@ type
   public
     property Name: string read FName write FName;
     property Connected: Boolean read GetConnected;
+    property Reader: TNatsReader read FReader;
+    property Consumer: TNatsConsumer read FConsumer;
   end;
 
   TNatsNetwork = class(TObjectDictionary<string, TNatsConnection>)
@@ -231,6 +233,8 @@ procedure TNatsConnection.Close();
 begin
   EndThreads;
   FChannel.Close;
+  if Assigned(FDisconnectHandler) then
+    FDisconnectHandler();
 end;
 
 procedure TNatsConnection.Ping;
@@ -402,48 +406,68 @@ procedure TNatsReader.DoExecute;
 var
   LRead: string;
   LCommand: TNatsCommand;
-  LStep: Integer;
+  LStep,LCount: Integer;
 begin
+
+  LCount:=0;
   while not Terminated do
   begin
-    if not FChannel.Connected then
-    begin
-      if FStopEvent.WaitFor(1000) = wrSignaled then
-        Break;
-
-      Continue;
-    end;
-
     try
-      LRead := FChannel.ReceiveString;
-    except
-      on E: Exception do
-      begin
-        LRead := '';
-        FError := E.Message;
+      if not FChannel.Connected then
+	  begin
+        if (FStopEvent.WaitFor(1000) = wrSignaled) or (lCount>=5) then
+		begin
+          FConnection.Close;
+          Break;
+        end;
+        Inc(lCount);
+        Continue;
       end;
-    end;
-
-    if LRead.IsEmpty then
-      Continue;
-
-    LCommand := FParser.Parse(LRead);
-
-    if LCommand.CommandType = TNatsCommandServer.MSG then
-    begin
-      LRead := FChannel.ReceiveString;
-      LCommand := FParser.ParsePayload(LCommand, LRead);
-    end;
-
-    TMonitor.Enter(FQueue);
-    try
-      FQueue.Enqueue(LCommand);
-    finally
-      TMonitor.Exit(FQueue);
+      try
+        LRead := FChannel.ReceiveString;
+      except
+        on E: Exception do
+		begin
+          LRead := '';
+          FError := E.Message;
+        end;
+      end;
+      if LRead.IsEmpty then
+        Continue;
+      try
+        LCommand := FParser.Parse(LRead);
+        if LCommand.CommandType = TNatsCommandServer.PING then
+		begin
+          // not here?
+          FChannel.SendString(NatsConstants.Protocol.PONG);
+          Continue;
+        end;
+        if LCommand.CommandType = TNatsCommandServer.MSG then
+		begin
+          LRead := FChannel.ReceiveString;
+          LCommand := FParser.ParsePayload(LCommand, LRead);
+        end;
+      except
+        on E: Exception do
+		begin
+          FError:='LRead='+LRead+', Exception on parsing: '+E.Message;
+          Continue;
+        end;
+      end;
+      TMonitor.Enter(FQueue);
+      try
+        FQueue.Enqueue(LCommand);
+      finally
+        TMonitor.Exit(FQueue);
+      end;
+    except
+      on E:Exception do
+	  begin
+        FError:='Exception on Reader Execution: '+E.Message;
+      end;
     end;
   end;
 end;
-
 procedure TNatsReader.Execute;
 begin
   NameThreadForDebugging(FConnection.Name + ' Reader');
