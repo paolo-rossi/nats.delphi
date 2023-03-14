@@ -65,7 +65,7 @@ type
 
   TNatsMsgHandler = reference to procedure (const AMsg: TNatsArgsMSG);
   TNatsPingHandler = reference to procedure ();
-  TNatsConnectHandler = reference to procedure (AInfo: TNatsServerInfo);
+  TNatsConnectHandler = reference to procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions);
   TNatsDisconnectHandler = reference to procedure ();
 
   TNatsThread = class abstract(TThread)

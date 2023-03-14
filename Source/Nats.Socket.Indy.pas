@@ -38,9 +38,11 @@ type
     function GetHost: string; override;
     function GetPort: Integer; override;
     function GetTimeout: Cardinal; override;
+    function GetMaxLineLength: Cardinal; override;
     procedure SetHost(const Value: string); override;
     procedure SetPort(const Value: Integer); override;
     procedure SetTimeout(const Value: Cardinal); override;
+    procedure SetMaxLineLength(const Value: Cardinal); override;
   public
     constructor Create; override;
     destructor Destroy; override;
@@ -97,6 +99,11 @@ begin
   Result := FClient.ReadTimeout;
 end;
 
+function TNatsSocketIndy.GetMaxLineLength: Cardinal;
+begin
+  Result := FClient.IOHandler.MaxLineLength;
+end;
+
 procedure TNatsSocketIndy.Open;
 begin
   FClient.Connect;
@@ -130,6 +137,11 @@ end;
 procedure TNatsSocketIndy.SetHost(const Value: string);
 begin
   FClient.Host := Value;
+end;
+
+procedure TNatsSocketIndy.SetMaxLineLength(const Value: Cardinal);
+begin
+  FClient.IOHandler.MaxLineLength := Value;
 end;
 
 procedure TNatsSocketIndy.SetPort(const Value: Integer);

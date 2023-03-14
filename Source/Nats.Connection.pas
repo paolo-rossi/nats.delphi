@@ -45,6 +45,7 @@ type
 
   TNatsConnection = class;
 
+
   /// <summary>
   ///   Simple Id generator for subscription and inbox
   /// </summary>
@@ -117,6 +118,7 @@ type
   /// </summary>
   TNatsConnection = class
   private
+    FConnectOptions: TNatsConnectOptions;
     FChannel: INatsSocket;
     FGenerator: TNatsGenerator;
     FSubscriptions: TNatsSubscriptions;
@@ -128,6 +130,7 @@ type
     FDisconnectHandler: TNatsDisconnectHandler;
     procedure SendPing;
     procedure SendPong;
+    procedure SendConnect;
     procedure SendCommand(const ACommand: string); overload;
     procedure SendCommand(const ACommand: TBytes; APriority: Boolean); overload;
   private
@@ -160,6 +163,7 @@ type
   public
     property Name: string read FName write FName;
     property Connected: Boolean read GetConnected;
+    property ConnectOptions: TNatsConnectOptions read FConnectOptions write FConnectOptions;
   end;
 
   TNatsNetwork = class(TObjectDictionary<string, TNatsConnection>)
@@ -296,6 +300,11 @@ begin
   FChannel.SendBytes(ACommand);
 end;
 
+procedure TNatsConnection.SendConnect;
+begin
+  FChannel.SendString(Format('%s %s', [NatsConstants.Protocol.CONNECT, FConnectOptions.ToJSONString]));
+end;
+
 procedure TNatsConnection.SendPing;
 begin
   FChannel.SendString(NatsConstants.Protocol.PING);
@@ -309,9 +318,11 @@ end;
 procedure TNatsConnection.SendSubscribe(const ASubscription: TNatsSubscription);
 begin
   if ASubscription.Queue.IsEmpty then
-    FChannel.SendString(Format('sub %s %d', [ASubscription.Subject, ASubscription.Id]))
+    FChannel.SendString(Format('%s %s %d',
+       [NatsConstants.Protocol.SUB, ASubscription.Subject, ASubscription.Id]))
   else
-    FChannel.SendString(Format('sub %s %s %d', [ASubscription.Subject, ASubscription.Queue, ASubscription.Id]));
+    FChannel.SendString(Format('%s %s %s %d',
+      [NatsConstants.Protocol.SUB, ASubscription.Subject, ASubscription.Queue, ASubscription.Id]));
 end;
 
 function TNatsConnection.SetChannel(const AHost: string; APort, ATimeout: Integer): TNatsConnection;
@@ -518,7 +529,13 @@ begin
       begin
         { TODO -opaolo -c : read the TLSs parameters and (if) upgrade the connection 23/06/2022 11:00:44 }
         if Assigned(FConnection.FConnectHandler) then
-          FConnection.FConnectHandler(LCommand.GetArgAsInfo.Info);
+          FConnection.FConnectHandler(LCommand.GetArgAsInfo.Info, FConnection.FConnectOptions);
+
+        if (FConnection.FChannel.MaxLineLength>0) then
+          FConnection.FChannel.MaxLineLength := LCommand.GetArgAsInfo.Info.max_payload * 2;
+
+        { Send CONNECT message to NATS }
+        FConnection.SendConnect;
       end;
 
       TNatsCommandServer.PING:

@@ -34,10 +34,12 @@ type
     function GetHost: string;
     function GetPort: Integer;
     function GetTimeout: Cardinal;
+    function GetMaxLineLength: Cardinal;
     // Property Setters
     procedure SetHost(const Value: string);
     procedure SetPort(const Value: Integer);
     procedure SetTimeout(const Value: Cardinal);
+    procedure SetMaxLineLength(const Value: Cardinal);
     // Methods
     procedure Open();
     procedure Close();
@@ -50,6 +52,8 @@ type
     property Host: string read GetHost write SetHost;
     property Port: Integer read GetPort write SetPort;
     property Timeout: Cardinal read GetTimeout write SetTimeout;
+    property MaxLineLength: Cardinal read GetMaxLineLength write SetMaxLineLength;
+
   end;
 
   TNatsSocket = class(TInterfacedObject, INatsSocket)
@@ -58,9 +62,12 @@ type
     function GetHost: string; virtual; abstract;
     function GetPort: Integer; virtual; abstract;
     function GetTimeout: Cardinal; virtual; abstract;
+    function GetMaxLineLength: Cardinal; virtual; abstract;
+
     procedure SetHost(const Value: string); virtual; abstract;
     procedure SetPort(const Value: Integer); virtual; abstract;
     procedure SetTimeout(const Value: Cardinal); virtual; abstract;
+    procedure SetMaxLineLength(const Value: Cardinal); virtual; abstract;
   public
     constructor Create; virtual; abstract;
     procedure Open(); virtual; abstract;
