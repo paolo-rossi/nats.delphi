@@ -33,7 +33,11 @@ uses
   Nats.Entities in '..\Source\Nats.Entities.pas',
   Nats.Parser in '..\Source\Nats.Parser.pas',
   Nats.Monitor in '..\Source\Nats.Monitor.pas',
-  Nats.Classes in '..\Source\Nats.Classes.pas';
+  Nats.Classes in '..\Source\Nats.Classes.pas',
+  Nats.JetStream.Client in '..\Source\Nats.JetStream.Client.pas',
+  Nats.JetStream.Entities in '..\Source\Nats.JetStream.Entities.pas',
+  Nats.JetStream.Enums in '..\Source\Nats.JetStream.Enums.pas',
+  Nats.Json.Utils in '..\Source\Nats.Json.Utils.pas';
 
 {$R *.res}
 

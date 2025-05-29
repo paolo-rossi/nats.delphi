@@ -1,24 +1,24 @@
-{******************************************************************************}
-{                                                                              }
-{  NATS.Delphi: Delphi Client Library for NATS                                 }
-{  Copyright (c) 2022 Paolo Rossi                                              }
-{  https://github.com/paolo-rossi/nats.delphi                                  }
-{                                                                              }
-{******************************************************************************}
-{                                                                              }
-{  Licensed under the Apache License, Version 2.0 (the "License");             }
-{  you may not use this file except in compliance with the License.            }
-{  You may obtain a copy of the License at                                     }
-{                                                                              }
-{      http://www.apache.org/licenses/LICENSE-2.0                              }
-{                                                                              }
-{  Unless required by applicable law or agreed to in writing, software         }
-{  distributed under the License is distributed on an "AS IS" BASIS,           }
-{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
-{  See the License for the specific language governing permissions and         }
-{  limitations under the License.                                              }
-{                                                                              }
-{******************************************************************************}
+{ ****************************************************************************** }
+{ }
+{ NATS.Delphi: Delphi Client Library for NATS }
+{ Copyright (c) 2022 Paolo Rossi }
+{ https://github.com/paolo-rossi/nats.delphi }
+{ }
+{ ****************************************************************************** }
+{ }
+{ Licensed under the Apache License, Version 2.0 (the "License"); }
+{ you may not use this file except in compliance with the License. }
+{ You may obtain a copy of the License at }
+{ }
+{ http://www.apache.org/licenses/LICENSE-2.0 }
+{ }
+{ Unless required by applicable law or agreed to in writing, software }
+{ distributed under the License is distributed on an "AS IS" BASIS, }
+{ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. }
+{ See the License for the specific language governing permissions and }
+{ limitations under the License. }
+{ }
+{ ****************************************************************************** }
 unit Nats.Classes;
 
 interface
@@ -32,91 +32,116 @@ uses
   Nats.Entities;
 
 type
-  TNatsCommandClient = (CONNECT, PING, PONG, PUB, SUB, UNSUB);
-  TNatsCommandServer = (INFO, PING, PONG, MSG, OK, ERR);
+      TNatsCommandClient = (CONNECT, PING, PONG, PUB, HPUB, SUB, UNSUB); // Added HPUB for client sending
+      TNatsCommandServer = (INFO, PING, PONG, MSG, HMSG, OK, ERR); // Added HMSG for server receiving
 
-  TNatsArgsINFO = record
-  private
-    FInfoStr: string;
-    procedure SetInfoStr(const Value: string);
-  public
-    Info: TNatsServerInfo;
-    property InfoStr: string read FInfoStr write SetInfoStr;
-  end;
+      TNatsArgsINFO = record
+      private
+        FInfoStr: string;
+        procedure SetInfoStr(const Value: string);
+      public
+        Info: TNatsServerInfo;
+        property InfoStr: string read FInfoStr write SetInfoStr;
+      end;
 
-  TNatsArgsMSG = record
-    Id: Integer;
-    Subject: string;
-    ReplyTo: string;
-    Bytes: Integer;
-    Payload: string;
-  end;
+      TNatsArgsMSG = record
+        Id: Integer;          // Subscription ID
+        Subject: string;
+        ReplyTo: string;
+        PayloadBytes: Integer;  // Length of the actual message payload
+        Payload: string;        // The message payload
+        HeaderBytes: Integer;   // Length of the header block (for HMSG)
+        TotalMsgBytes: Integer; // Total bytes for HMSG (HeaderBytes + PayloadBytes)
+        Headers: TStringList;   // Parsed NATS headers
 
-  TNatsCommand = record
-    CommandType: TNatsCommandServer;
-    Arguments: TValue;
+        class operator Initialize (out Dest: TNatsArgsMSG);
+        class operator Finalize (var Dest: TNatsArgsMSG);
+      end;
 
-    function GetArgAsInfo: TNatsArgsINFO;
-    function GetArgAsMsg: TNatsArgsMSG;
-  end;
+      TNatsCommand = record
+        CommandType: TNatsCommandServer;
+        Arguments: TValue;
 
-  TNatsCommandQueue = class(TQueue<TNatsCommand>)
-  end;
+        function GetArgAsInfo: TNatsArgsINFO;
+        function GetArgAsMsg: TNatsArgsMSG;
+      end;
 
-  TNatsMsgHandler = reference to procedure (const AMsg: TNatsArgsMSG);
-  TNatsPingHandler = reference to procedure ();
-  TNatsConnectHandler = reference to procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions);
-  TNatsDisconnectHandler = reference to procedure ();
+      TNatsCommandQueue = class(TQueue<TNatsCommand>)
+      end;
 
-  TNatsThread = class abstract(TThread)
-  protected
-    FStopEvent: TLightweightEvent;
-  public
-    constructor Create;
-    destructor Destroy; override;
+      TNatsMsgHandler = reference to procedure (const AMsg: TNatsArgsMSG);
+      TNatsPingHandler = reference to procedure ();
+      TNatsConnectHandler = reference to procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions);
+      TNatsDisconnectHandler = reference to procedure ();
 
-    procedure Stop;
-  end;
+      TNatsThread = class abstract(TThread)
+      protected
+        FStopEvent: TLightweightEvent;
+      public
+        constructor Create;
+        destructor Destroy; override;
+        procedure Stop;
+      end;
 
+    implementation
 
-implementation
+    { TNatsArgsMSG }
+    class operator TNatsArgsMSG.Initialize (out Dest: TNatsArgsMSG);
+    begin
+      with Dest do
+      begin
+        Id := 0;
+        Subject := '';
+        ReplyTo := '';
+        PayloadBytes := 0;
+        Payload := '';
+        HeaderBytes := 0;
+        TotalMsgBytes := 0;
+        Headers := TStringList.Create;
+        Headers.CaseSensitive := False; // NATS headers are case-insensitive
+      end;
+    end;
 
-{ TNatsThread }
+    class operator TNatsArgsMSG.Finalize (var Dest: TNatsArgsMSG);
+    begin
+      Dest.Headers.free;
+    end;
 
-constructor TNatsThread.Create;
-begin
-  inherited Create(True);
-  FStopEvent := TLightweightEvent.Create;
-end;
+    { TNatsThread }
+    constructor TNatsThread.Create;
+    begin
+      inherited Create(True);
+      FStopEvent := TLightweightEvent.Create;
+    end;
 
-destructor TNatsThread.Destroy;
-begin
-  FStopEvent.Free;
-  inherited;
-end;
+    destructor TNatsThread.Destroy;
+    begin
+      FStopEvent.Free;
+      inherited;
+    end;
 
-procedure TNatsThread.Stop;
-begin
-  FStopEvent.SetEvent;
-  Terminate;
-end;
+    procedure TNatsThread.Stop;
+    begin
+      FStopEvent.SetEvent;
+      Terminate;
+    end;
 
-{ TNatsCommand }
+    { TNatsCommand }
+    function TNatsCommand.GetArgAsInfo: TNatsArgsINFO;
+    begin
+      Result := Arguments.AsType<TNatsArgsINFO>;
+    end;
 
-function TNatsCommand.GetArgAsInfo: TNatsArgsINFO;
-begin
-  Result := Arguments.AsType<TNatsArgsINFO>;
-end;
+    function TNatsCommand.GetArgAsMsg: TNatsArgsMSG;
+    begin
+      Result := Arguments.AsType<TNatsArgsMSG>;
+    end;
 
-function TNatsCommand.GetArgAsMsg: TNatsArgsMSG;
-begin
-  Result := Arguments.AsType<TNatsArgsMSG>;
-end;
-
-procedure TNatsArgsINFO.SetInfoStr(const Value: string);
-begin
-  FInfoStr := Value;
-  Info := TNatsServerInfo.FromJSONString(Value);
-end;
+    { TNatsArgsINFO }
+    procedure TNatsArgsINFO.SetInfoStr(const Value: string);
+    begin
+      FInfoStr := Value;
+      Info := TNatsServerInfo.FromJSONString(Value); // Uses FromJSONString from Nats.Entities
+    end;
 
 end.

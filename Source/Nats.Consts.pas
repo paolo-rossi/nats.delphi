@@ -31,7 +31,8 @@ type
   NatsConstants = class
   public const
 
-    VERSION = '0.1.0';
+    CLIENT_VERSION = '0.1.0';
+    CLIENT_HEADER_VERSION = 'NATS/1.0'; // Standard NATS header version line
 
     DEFAULT_PORT = 4222;
     DEFAULT_URI_ = 'nats://localhost';
@@ -67,20 +68,27 @@ type
     WC = '*';
     ARR = '>';
 
-    public type Protocol = class
+    INBOX_PREFIX = '_INBOX.'; // Standard prefix for NATS inboxes
+
+  public type
+    Protocol = class
     const
-      // Protocol
-      PUB = 'PUB';
-      SUB = 'SUB';
-      UNSUB = 'UNSUB';
+      // Core Protocol Commands (Client -> Server)
       CONNECT = 'CONNECT';
-      MSG = 'MSG';
-      PONG = 'PONG';
-      PING = 'PING';
-      INFO = 'INFO';
-      ERR = '-ERR';
-      OK = '+OK';
-      UNKNOWN = 'UNKNOWN';
+      PUB     = 'PUB';
+      HPUB    = 'HPUB'; // Publish with Headers JetStream
+      SUB     = 'SUB';
+      UNSUB   = 'UNSUB';
+      PING    = 'PING'; // Client sends PING
+      PONG    = 'PONG'; // Client sends PONG in response to server's PING
+
+      // Core Protocol Commands (Server -> Client)
+      INFO    = 'INFO';
+      MSG     = 'MSG';
+      HMSG    = 'HMSG'; // Message with Headers JetStream
+      OK      = '+OK';
+      ERR     = '-ERR';
+      UNKNOWN = 'UNKNOWN'; // For parser if command is not recognized
     end;
 
     class function DEFAULT_URI: string; static;

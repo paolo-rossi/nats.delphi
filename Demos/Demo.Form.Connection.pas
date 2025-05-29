@@ -305,7 +305,7 @@ begin
     FConnection.
       SetChannel(edtHost.Text, StrToInt(edtPort.Text), 1000).
       Open(
-        procedure (AInfo: TNatsServerInfo)
+        procedure (AInfo: TNatsServerInfo;var AConnectOptions: TNatsConnectOptions)
         begin
           TThread.Queue(TThread.Current,
             procedure
