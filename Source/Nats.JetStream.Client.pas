@@ -749,7 +749,7 @@ begin
   else if ANoWait then
     LTimeoutMS := Max(1000, FDefaultTimeoutMS)
   else
-    LTimeoutMS := FDefaultTimeoutMS * Max(1, LRequest.batch div 5 + 1) + 5000;
+    LTimeoutMS := FDefaultTimeoutMS * Byte(Max(1, LRequest.batch div 5 + 1)) + 5000;
 
   Result := FetchNextMessagesInternal(AStreamName, AConsumerName, LRequest, AMessages, LTimeoutMS);
 end;

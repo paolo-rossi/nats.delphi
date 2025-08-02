@@ -137,7 +137,7 @@ type
     procedure SendConnect;
     procedure SendCommand(const ACommand: string); overload;
     procedure SendCommand(const ACommand: TBytes; APriority: Boolean); overload;
-  private
+
     procedure SendSubscribe(const ASubscription: TNatsSubscription);
     function GetConnected: Boolean;
     procedure EndThreads;
@@ -172,6 +172,8 @@ type
   public
     property Name: string read FName write FName;
     property Connected: Boolean read GetConnected;
+    property Reader: TNatsReader read FReader;
+    property Consumer: TNatsConsumer read FConsumer;
     property ConnectOptions: TNatsConnectOptions read FConnectOptions write FConnectOptions;
   end;
 
