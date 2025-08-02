@@ -1,83 +1,55 @@
 object frmConnection: TfrmConnection
   Left = 0
   Top = 0
-  Margins.Left = 6
-  Margins.Top = 6
-  Margins.Right = 6
-  Margins.Bottom = 6
   Caption = 'frmConnection'
-  ClientHeight = 740
-  ClientWidth = 1240
+  ClientHeight = 370
+  ClientWidth = 618
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
   Font.Color = clWindowText
-  Font.Height = -24
+  Font.Height = -12
   Font.Name = 'Segoe UI'
   Font.Style = []
   OnCreate = FormCreate
   OnDestroy = FormDestroy
-  PixelsPerInch = 192
-  TextHeight = 32
+  TextHeight = 15
   object grpServer: TGroupBox
     Left = 0
     Top = 0
-    Width = 418
-    Height = 740
-    Margins.Left = 6
-    Margins.Top = 6
-    Margins.Right = 6
-    Margins.Bottom = 6
+    Width = 209
+    Height = 370
     Align = alLeft
     Caption = ' Server '
     TabOrder = 0
+    ExplicitHeight = 353
     object lblServerInfo: TLabel
-      Left = 32
-      Top = 202
-      Width = 116
-      Height = 32
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 16
+      Top = 101
+      Width = 56
+      Height = 15
       Caption = 'Server Info'
     end
     object lblServerSettings: TLabel
-      Left = 32
-      Top = 112
-      Width = 124
-      Height = 32
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 16
+      Top = 56
+      Width = 63
+      Height = 15
       Caption = 'Host && Port'
     end
     object switchConnection: TToggleSwitch
-      Left = 32
-      Top = 50
-      Width = 146
-      Height = 40
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
-      SwitchHeight = 40
-      SwitchWidth = 100
+      Left = 16
+      Top = 25
+      Width = 73
+      Height = 20
       TabOrder = 0
-      ThumbWidth = 30
       OnClick = switchConnectionClick
     end
     object lstServerInfo: TValueListEditor
-      Left = 32
-      Top = 244
-      Width = 346
-      Height = 450
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
-      DefaultColWidth = 160
-      DefaultRowHeight = 36
+      Left = 16
+      Top = 122
+      Width = 173
+      Height = 225
+      DefaultColWidth = 80
       Options = [goFixedVertLine, goFixedHorzLine, goVertLine, goHorzLine, goColSizing, goAlwaysShowEditor, goThumbTracking]
       Strings.Strings = (
         'Server ID='
@@ -87,95 +59,68 @@ object frmConnection: TfrmConnection
         'Host='
         'Port='
         'Client ID='
-        'Cllient IP=')
+        'Client IP=')
       TabOrder = 1
       TitleCaptions.Strings = (
         'Prop'
         'Value')
       ColWidths = (
-        160
-        174)
+        80
+        87)
     end
     object edtHost: TEdit
-      Left = 32
-      Top = 144
-      Width = 234
-      Height = 40
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 16
+      Top = 72
+      Width = 117
+      Height = 23
       TabOrder = 2
       Text = '127.0.0.1'
     end
     object edtPort: TEdit
-      Left = 278
-      Top = 144
-      Width = 100
-      Height = 40
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 139
+      Top = 72
+      Width = 50
+      Height = 23
       TabOrder = 3
       Text = '4222'
     end
   end
   object grpCommands: TGroupBox
-    Left = 418
+    Left = 209
     Top = 0
-    Width = 500
-    Height = 740
-    Margins.Left = 6
-    Margins.Top = 6
-    Margins.Right = 6
-    Margins.Bottom = 6
+    Width = 250
+    Height = 370
     Align = alLeft
     Caption = ' Commands '
     TabOrder = 1
+    ExplicitHeight = 353
     object lblCommandList: TLabel
-      Left = 12
-      Top = 50
-      Width = 153
-      Height = 32
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 25
+      Width = 78
+      Height = 15
       Caption = 'Command List'
     end
     object lblCommandParams: TLabel
-      Left = 12
-      Top = 340
-      Width = 235
-      Height = 32
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 170
+      Width = 119
+      Height = 15
       Caption = 'Command Parameters'
     end
     object lblSubscriptionList: TLabel
-      Left = 252
-      Top = 50
-      Width = 174
-      Height = 32
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 126
+      Top = 25
+      Width = 87
+      Height = 15
       Caption = 'Subscription List'
     end
     object lstCommandList: TListBox
-      Left = 12
-      Top = 92
-      Width = 214
-      Height = 236
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
-      ItemHeight = 30
+      Left = 6
+      Top = 46
+      Width = 107
+      Height = 118
+      ItemHeight = 15
       Items.Strings = (
         'Publish'
         'Request'
@@ -185,16 +130,11 @@ object frmConnection: TfrmConnection
       OnClick = lstCommandListClick
     end
     object lstCommandParams: TValueListEditor
-      Left = 12
-      Top = 382
-      Width = 454
-      Height = 236
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
-      DefaultColWidth = 160
-      DefaultRowHeight = 36
+      Left = 6
+      Top = 191
+      Width = 227
+      Height = 118
+      DefaultColWidth = 80
       Strings.Strings = (
         'Topic='
         'Reply-to=')
@@ -203,95 +143,69 @@ object frmConnection: TfrmConnection
         'Prop'
         'Value')
       ColWidths = (
-        160
-        282)
+        80
+        141)
     end
     object btnSend: TButton
-      Left = 12
-      Top = 644
-      Width = 454
-      Height = 50
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 322
+      Width = 227
+      Height = 25
       Caption = 'Send Command'
       TabOrder = 2
       OnClick = btnSendClick
     end
     object lstSubscriptions: TListBox
-      Left = 252
-      Top = 92
-      Width = 214
-      Height = 236
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
-      ItemHeight = 30
+      Left = 126
+      Top = 46
+      Width = 107
+      Height = 118
+      ItemHeight = 15
       TabOrder = 3
     end
   end
   object grpConnection: TGroupBox
-    Left = 918
+    Left = 459
     Top = 0
-    Width = 322
-    Height = 740
-    Margins.Left = 6
-    Margins.Top = 6
-    Margins.Right = 6
-    Margins.Bottom = 6
+    Width = 159
+    Height = 370
     Align = alClient
     Caption = ' Misc'
     TabOrder = 2
+    ExplicitWidth = 153
+    ExplicitHeight = 353
     object btnSimplePublish: TButton
-      Left = 12
-      Top = 92
-      Width = 278
-      Height = 50
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 46
+      Width = 139
+      Height = 25
       Caption = 'Simple Publish Code'
       TabOrder = 0
       OnClick = btnSimplePublishClick
     end
     object btnSimpleSubscribe: TButton
-      Left = 12
-      Top = 154
-      Width = 278
-      Height = 50
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 77
+      Width = 139
+      Height = 25
       Caption = 'Simple Subscribe Code'
       TabOrder = 1
       OnClick = btnSimpleSubscribeClick
     end
     object btnSimpleRequest: TButton
-      Left = 12
-      Top = 216
-      Width = 278
-      Height = 50
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 108
+      Width = 139
+      Height = 25
       Caption = 'Simple Request Code'
       TabOrder = 2
       OnClick = btnSimpleRequestClick
     end
     object btnSimpleUnsubscribe: TButton
-      Left = 12
-      Top = 278
-      Width = 278
-      Height = 50
-      Margins.Left = 6
-      Margins.Top = 6
-      Margins.Right = 6
-      Margins.Bottom = 6
+      Left = 6
+      Top = 139
+      Width = 139
+      Height = 25
       Caption = 'Simple Unsubscribe Code'
       TabOrder = 3
       OnClick = btnSimpleUnsubscribeClick

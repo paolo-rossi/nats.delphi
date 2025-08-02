@@ -1,12 +1,34 @@
+{******************************************************************************}
+{                                                                              }
+{  NATS.Delphi: Delphi Client Library for NATS                                 }
+{  Copyright (c) 2022 Paolo Rossi                                              }
+{  https://github.com/paolo-rossi/nats.delphi                                  }
+{                                                                              }
+{******************************************************************************}
+{                                                                              }
+{  Licensed under the Apache License, Version 2.0 (the "License");             }
+{  you may not use this file except in compliance with the License.            }
+{  You may obtain a copy of the License at                                     }
+{                                                                              }
+{      http://www.apache.org/licenses/LICENSE-2.0                              }
+{                                                                              }
+{  Unless required by applicable law or agreed to in writing, software         }
+{  distributed under the License is distributed on an "AS IS" BASIS,           }
+{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
+{  See the License for the specific language governing permissions and         }
+{  limitations under the License.                                              }
+{                                                                              }
+{******************************************************************************}
 unit Nats.JetStream.Enums;
 
 interface
  uses
-  System.SysUtils, System.Classes, System.Generics.Collections, System.Rtti,
+  System.SysUtils, System.Classes, System.Generics.Collections,
+  System.Rtti, System.TypInfo,
   System.JSON.Converters,
-  System.Json.Serializers,
-  System.Json.Readers, System.Json.Writers,
-  System.TypInfo;
+  System.JSON.Serializers,
+  System.JSON.Readers,
+  System.JSON.Writers;
 
 type
 
@@ -87,15 +109,18 @@ type
     dpLastPerSubject);
 
   const
-  RetentionPolicyStrings: array [TRetentionPolicy] of string = ('limits',
-    'interest', 'work_queue');
-  StorageTypeStrings: array [TStorageType] of string = ('file', 'memory');
-  DiscardPolicyStrings: array [TDiscardPolicy] of string = ('old', 'new');
-  AckPolicyStrings: array [TAckPolicy] of string = ('none', 'all', 'explicit');
-  ReplayPolicyStrings: array [TReplayPolicy] of string = ('instant',
-    'original');
-  DeliverPolicyStrings: array [TDeliverPolicy] of string = ('all', 'last',
-    'new', 'by_start_sequence', 'by_start_time', 'last_per_subject');
+  RetentionPolicyStrings: array [TRetentionPolicy] of string =
+    ('limits', 'interest', 'work_queue');
+  StorageTypeStrings: array [TStorageType] of string =
+    ('file', 'memory');
+  DiscardPolicyStrings: array [TDiscardPolicy] of string =
+    ('old', 'new');
+  AckPolicyStrings: array [TAckPolicy] of string =
+    ('none', 'all', 'explicit');
+  ReplayPolicyStrings: array [TReplayPolicy] of string =
+    ('instant', 'original');
+  DeliverPolicyStrings: array [TDeliverPolicy] of string =
+    ('all', 'last', 'new', 'by_start_sequence', 'by_start_time', 'last_per_subject');
 
 
 

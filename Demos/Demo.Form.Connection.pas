@@ -24,13 +24,13 @@ unit Demo.Form.Connection;
 interface
 
 uses
-  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, Vcl.Graphics,
-  Vcl.Controls, Vcl.Forms, Vcl.Dialogs,
+  Winapi.Windows, System.SysUtils, System.Actions, System.Classes,
+  Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.JumpList,
+  Vcl.ActnList, Vcl.WinXCtrls, Vcl.Grids, Vcl.ValEdit, Vcl.StdCtrls,
 
   Nats.Consts,
   Nats.Entities,
-  Nats.Connection, Vcl.JumpList, System.Actions, Vcl.ActnList, Vcl.WinXCtrls,
-  Vcl.Grids, Vcl.ValEdit, Vcl.StdCtrls;
+  Nats.Connection;
 
 type
   TfrmConnection = class(TForm)
@@ -72,6 +72,7 @@ type
   public
     class function CreateAndShow(const AName: string; AParent: TWinControl; ALog: TStrings): TfrmConnection;
     procedure RefreshLists;
+    procedure Configure(const AHost: string; APort: Integer);
     property Connection: TNatsConnection read FConnection write FConnection;
   end;
 
@@ -235,6 +236,19 @@ begin
   FConnection := TNatsConnection.Create;
 end;
 
+procedure TfrmConnection.Configure(const AHost: string; APort: Integer);
+begin
+  if AHost.IsEmpty then
+    edtHost.Text := '127.0.0.1'
+  else
+    edtHost.Text := AHost;
+
+  if APort = 0 then
+    edtPort.Text := '4222'
+  else
+    edtPort.Text := APort.ToString;
+end;
+
 class function TfrmConnection.CreateAndShow(const AName: string; AParent: TWinControl; ALog: TStrings): TfrmConnection;
 begin
   Result := TfrmConnection.Create(AParent);
@@ -298,14 +312,20 @@ begin
 end;
 
 procedure TfrmConnection.switchConnectionClick(Sender: TObject);
+var
+  LIndex: Integer;
 begin
   if FConnection.Connected then
-    FConnection.Close
+  begin
+    FConnection.Close;
+    for LIndex := 0 to lstServerInfo.Strings.Count - 1 do
+      lstServerInfo.Strings.Values[lstServerInfo.Strings.KeyNames[LIndex]] := ' ';
+  end
   else
     FConnection.
       SetChannel(edtHost.Text, StrToInt(edtPort.Text), 1000).
       Open(
-        procedure (AInfo: TNatsServerInfo;var AConnectOptions: TNatsConnectOptions)
+        procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
         begin
           TThread.Queue(TThread.Current,
             procedure

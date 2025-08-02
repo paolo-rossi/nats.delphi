@@ -37,7 +37,8 @@ uses
   Nats.JetStream.Client in '..\Source\Nats.JetStream.Client.pas',
   Nats.JetStream.Entities in '..\Source\Nats.JetStream.Entities.pas',
   Nats.JetStream.Enums in '..\Source\Nats.JetStream.Enums.pas',
-  Nats.Json.Utils in '..\Source\Nats.Json.Utils.pas';
+  Nats.Json.Utils in '..\Source\Nats.Json.Utils.pas',
+  Nats.Nuid in '..\Source\Nats.Nuid.pas';
 
 {$R *.res}
 

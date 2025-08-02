@@ -79,7 +79,7 @@ type
 
     constructor TNatsSocketIndy.Create;
     begin
-      inherited Create; // Call inherited constructor
+      //inherited Create; // Call inherited constructor
       FClient := TIdTCPClient.Create(nil);
       FClient.ReadTimeout := NatsConstants.DEFAULT_PING_INTERVAL * 3;
       // Extract host from DEFAULT_URI if it contains protocol

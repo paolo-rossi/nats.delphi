@@ -32,7 +32,9 @@ type
   public const
 
     CLIENT_VERSION = '0.1.0';
-    CLIENT_HEADER_VERSION = 'NATS/1.0'; // Standard NATS header version line
+
+    // Standard NATS header version
+    CLIENT_HEADER_VERSION = 'NATS/1.0';
 
     DEFAULT_PORT = 4222;
     DEFAULT_URI_ = 'nats://localhost';
@@ -68,7 +70,8 @@ type
     WC = '*';
     ARR = '>';
 
-    INBOX_PREFIX = '_INBOX.'; // Standard prefix for NATS inboxes
+    // Standard prefix for NATS inboxes
+    INBOX_PREFIX = '_INBOX.';
 
   public type
     Protocol = class
@@ -93,7 +96,6 @@ type
 
     class function DEFAULT_URI: string; static;
   end;
-
 
 
 implementation

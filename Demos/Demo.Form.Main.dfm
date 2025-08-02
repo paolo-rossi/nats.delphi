@@ -22,7 +22,8 @@ object frmMain: TfrmMain
     BevelOuter = bvNone
     ParentBackground = False
     TabOrder = 0
-    ExplicitLeft = 8
+    ExplicitWidth = 1016
+    ExplicitHeight = 597
     object Splitter1: TSplitter
       Left = 0
       Top = 397
@@ -46,7 +47,8 @@ object frmMain: TfrmMain
       Font.Style = []
       ParentFont = False
       TabOrder = 0
-      ExplicitTop = 399
+      ExplicitTop = 383
+      ExplicitWidth = 1016
     end
     object pnlNetwork: TPanel
       Left = 0
@@ -58,9 +60,7 @@ object frmMain: TfrmMain
       Caption = 'pnlNetwork'
       ParentBackground = False
       TabOrder = 1
-      ExplicitLeft = 248
-      ExplicitTop = 9
-      ExplicitHeight = 385
+      ExplicitHeight = 380
       object lstNetwork: TListBox
         Left = 0
         Top = 47
@@ -71,8 +71,7 @@ object frmMain: TfrmMain
         BevelInner = bvNone
         ItemHeight = 15
         TabOrder = 0
-        ExplicitLeft = -6
-        ExplicitHeight = 353
+        ExplicitHeight = 333
       end
       object btnNewConnection: TButton
         Left = 8
@@ -92,8 +91,8 @@ object frmMain: TfrmMain
       ActivePage = tsAbout
       Align = alClient
       TabOrder = 2
-      ExplicitLeft = -268
-      ExplicitHeight = 400
+      ExplicitWidth = 886
+      ExplicitHeight = 380
       object tsAbout: TTabSheet
         Caption = 'About NATS.Delphi'
         DesignSize = (

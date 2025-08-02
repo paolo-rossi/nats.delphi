@@ -19,7 +19,7 @@
 {  limitations under the License.                                              }
 {                                                                              }
 {******************************************************************************}
-unit NATS.Parser;
+unit Nats.Parser;
 
 interface
 
@@ -42,7 +42,7 @@ type
         // Parse the initial command line (e.g., "MSG subject sid len")
         function Parse(const ACommand: string): TNatsCommand;
         // Parse headers from a raw string block
-        procedure ParseHeaders(const AHeaderBlock: string; ADestHeaders: TStringList);
+        procedure ParseHeaders(const AHeaderBlock: string; ADestHeaders: TNatsHeaders);
         // Set payload for a command (used after headers and payload are read separately)
         function SetCommandPayload(var ACmd: TNatsCommand; const APayload: string): TNatsCommand;
       end;
@@ -102,21 +102,22 @@ type
       raise ENatsException.Create('Parsing error or NATS command not supported: ' + ACommand);
     end;
 
-    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; ADestHeaders: TStringList);
+    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; ADestHeaders: TNatsHeaders);
     var
       Lines: TArray<string>;
       S: string;
       P: Integer;
-      Key, Value: string;
+      LKey, LValue: string;
       IsFirstLine: Boolean;
     begin
-      ADestHeaders.Clear;
+      ADestHeaders := [];
       Lines := AHeaderBlock.Split([NatsConstants.CR_LF]);
       IsFirstLine := True;
 
       for S in Lines do
       begin
-        if Trim(S) = '' then Continue; // Skip empty lines
+        if Trim(S) = '' then
+          Continue; // Skip empty lines
 
         if IsFirstLine and S.StartsWith(NatsConstants.CLIENT_HEADER_VERSION) then // Check for NATS/1.0
         begin
@@ -128,9 +129,9 @@ type
         P := Pos(':', S);
         if P > 0 then
         begin
-          Key := Trim(Copy(S, 1, P - 1));
-          Value := Trim(Copy(S, P + 1, Length(S)));
-          ADestHeaders.AddPair(Key, Value);
+          LKey := Trim(Copy(S, 1, P - 1));
+          LValue := Trim(Copy(S, P + 1, Length(S)));
+          ADestHeaders := ADestHeaders + [TNatsHeader.Create(LKey, LValue)];
         end
         else
         begin

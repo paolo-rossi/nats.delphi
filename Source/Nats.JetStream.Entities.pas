@@ -1,13 +1,35 @@
-unit NATS.JetStream.Entities;
+{******************************************************************************}
+{                                                                              }
+{  NATS.Delphi: Delphi Client Library for NATS                                 }
+{  Copyright (c) 2022 Paolo Rossi                                              }
+{  https://github.com/paolo-rossi/nats.delphi                                  }
+{                                                                              }
+{******************************************************************************}
+{                                                                              }
+{  Licensed under the Apache License, Version 2.0 (the "License");             }
+{  you may not use this file except in compliance with the License.            }
+{  You may obtain a copy of the License at                                     }
+{                                                                              }
+{      http://www.apache.org/licenses/LICENSE-2.0                              }
+{                                                                              }
+{  Unless required by applicable law or agreed to in writing, software         }
+{  distributed under the License is distributed on an "AS IS" BASIS,           }
+{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
+{  See the License for the specific language governing permissions and         }
+{  limitations under the License.                                              }
+{                                                                              }
+{******************************************************************************}
+unit Nats.JetStream.Entities;
 
 interface
 
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.Rtti,
-  System.Json,REST.Json,
-  System.Json.Serializers,
-  NATS.Entities,
-  NATS.JetStream.Enums;
+  System.JSON, REST.Json, System.JSON.Serializers,
+
+  Nats.Classes,
+  Nats.Entities,
+  Nats.JetStream.Enums;
 
 const
   // JetStream API Prefixes
@@ -30,11 +52,10 @@ const
     'io.nats.jetstream.api.v1.consumer_delete_response';
   JS_TYPE_MSG_GET_RESPONSE =
     'io.nats.jetstream.api.v1.consumer_msg_next_response';
-  JS_TYPE_PUB_ACK_RESPONSE = 'io.nats.jetstream.api.v1.pub_ack_response';
+  JS_TYPE_PUB_ACK_RESPONSE =
+    'io.nats.jetstream.api.v1.pub_ack_response';
 
 type
-
-
   // --- General JetStream Structures ---
   TJetStreamError = record
     code: Integer;
@@ -47,7 +68,7 @@ type
     [JsonName('type')]
     response_type: string;
     error: TJetStreamError;
-    request_id: string; // Optional
+    request_id: string;      // Optional
 
     constructor Create; virtual;
     function HasError: Boolean;
@@ -60,7 +81,7 @@ type
   TJSStreamSource = record
     name: string;
     opt_start_seq: UInt64;
-    opt_start_time: string; // RFC3339
+    opt_start_time: string;  // RFC3339
     filter_subject: string;
   end;
 
@@ -68,14 +89,14 @@ type
     messages: UInt64;
     bytes: UInt64;
     first_seq: UInt64;
-    first_ts: string; // RFC3339
+    first_ts: string;        // RFC3339
     last_seq: UInt64;
-    last_ts: string; // RFC3339
+    last_ts: string;         // RFC3339
     consumer_count: Integer;
   end;
 
-  TJSStreamConfig = record
   // This is a configuration structure, can remain a record
+  TJSStreamConfig = record
     name: string;
     description: string;
     subjects: TArray<string>;
@@ -125,15 +146,15 @@ type
   TJSStreamCreateResponse = class(TJetStreamBaseResponse)
   public
     config: TJSStreamConfig; // This is a record field
-    created: string; // RFC3339
-    state: TJSStreamState; // This is a record field
-    // did_create: Boolean; // Optional
+    created: string;         // RFC3339
+    state: TJSStreamState;   // This is a record field
+    // did_create: Boolean;    // Optional
   end;
 
   TJSStreamInfoResponse = class(TJetStreamBaseResponse)
   public
     config: TJSStreamConfig;
-    created: string; // RFC3339
+    created: string;         // RFC3339
     state: TJSStreamState;
   end;
 
@@ -167,8 +188,8 @@ type
   end;
 
   // --- Consumer Configuration and State (ConsumerConfig remains a record) ---
-  TJSConsumerConfig = record
   // This is a configuration structure, can remain a record
+  TJSConsumerConfig = record
     name: string;
     [JsonName('durable_name')]
     durable_name: string;
@@ -182,7 +203,7 @@ type
     [JsonName('ack_policy')]
     ack_policy: TAckPolicy;
     [JsonName('ack_wait')]
-    ack_wait: Int64; // Nanoseconds
+    ack_wait: Int64;           // Nanoseconds
     [JsonName('max_deliver')]
     max_deliver: Integer;
     [JsonName('filter_subject')]
@@ -208,7 +229,7 @@ type
     [JsonName('max_batch')]
     max_request_batch: Integer;
     [JsonName('max_expires')]
-    max_request_expires: Int64; // Nanoseconds
+    max_request_expires: Int64;// Nanoseconds
     [JsonName('max_bytes')]
     max_request_max_bytes: Integer;
     [JsonName('inactive_threshold')]
@@ -218,9 +239,8 @@ type
     [JsonName('mem_storage')]
     mem_storage: Boolean;
 
-    function ToJsonString: string; // Instance method for record
-    class function FromJsonString(const AValue: string): TJSConsumerConfig;
-      static; // Class method for record
+    function ToJsonString: string;
+    class function FromJsonString(const AValue: string): TJSConsumerConfig; static;
   end;
 
   TJSSequencePair = record
@@ -231,11 +251,10 @@ type
 
   // --- Consumer API Responses (Now Classes) ---
   TJSConsumerCreateResponse = class(TJetStreamBaseResponse)
-  // Inherits from class
   public
     stream_name: string;
     name: string;
-    config: TJSConsumerConfig; // Record field
+    config: TJSConsumerConfig;  // Record field
     created: string;
     delivered: TJSSequencePair; // Record field
     ack_floor: TJSSequencePair; // Record field
@@ -245,7 +264,7 @@ type
     num_pending: UInt64;
   end;
 
-  TJSConsumerInfoResponse = class(TJetStreamBaseResponse) // Inherits from class
+  TJSConsumerInfoResponse = class(TJetStreamBaseResponse)
   public
     stream_name: string;
     name: string;
@@ -260,13 +279,11 @@ type
   end;
 
   TJSConsumerDeleteResponse = class(TJetStreamBaseResponse)
-  // Inherits from class
   public
     success: Boolean;
   end;
 
   TJSConsumerNamesResponse = class(TJetStreamBaseResponse)
-  // Inherits from class
   public
     consumers: TArray<string>;
     total: Integer;
@@ -278,7 +295,7 @@ type
   TJSMessageGetRequest = record
     batch: Integer;
     max_bytes: Integer;
-    expires: Int64; // Nanoseconds
+    expires: Int64;   // Nanoseconds
     no_wait: Boolean;
     heartbeat: Int64; // Nanoseconds
     function ToJsonString: string;
@@ -288,17 +305,13 @@ type
     Subject: string;
     ReplyTo: string;
     Data: TBytes;
-    Headers: TStringList; // Caller manages lifetime if this record is copied
-    stream: string;
+    Headers: TNatsHeaders;
+    Stream: string;
     Sequence: UInt64;
     ConsumerSequence: UInt64;
     Timestamp: Int64; // Nanoseconds
     NumPending: Integer;
-    domain: string;
-    function GetHeader(const AHeaderName: string): string;
-
-    class operator Initialize(out Dest: TJSReceivedMessage);
-    class operator Finalize(var Dest: TJSReceivedMessage);
+    Domain: string;
   end;
 
   // --- Account Info Response ---
@@ -316,10 +329,12 @@ type
 implementation
 
 { TJetStreamBaseResponse }
+
 constructor TJetStreamBaseResponse.Create;
 begin
   inherited Create;
-  request_id := ''; // Initialize fields
+
+  request_id := '';
   response_type := '';
   // error fields will be default (0, '', etc.)
 end;
@@ -343,6 +358,7 @@ begin
 end;
 
 { TJSStreamConfig - Record methods }
+
 function TJSStreamConfig.ToJsonString: string;
 var
   LSer: TJsonSerializer;
@@ -355,8 +371,7 @@ begin
   end;
 end;
 
-class function TJSStreamConfig.FromJsonString(const AJson: string)
-  : TJSStreamConfig;
+class function TJSStreamConfig.FromJsonString(const AJson: string): TJSStreamConfig;
 var
   LSer: TJsonSerializer;
 begin
@@ -369,6 +384,7 @@ begin
 end;
 
 { TJSPubAck - Class methods }
+
 constructor TJSPubAck.Create;
 begin
   inherited Create;
@@ -389,8 +405,10 @@ begin
 end;
 
 procedure TJSPubAck.FromJson(const AValue: string);
+var
+  LObj: TJSONObject;
 begin
-  var LObj:=TJSONValue.ParseJSONValue(AValue) as TJSONObject;
+  LObj := TJSONValue.ParseJSONValue(AValue) as TJSONObject;
   TJson.JsonToObject(self,LObj);
 end;
 
@@ -400,6 +418,7 @@ begin
 end;
 
 { TJSConsumerConfig - Record methods }
+
 function TJSConsumerConfig.ToJsonString: string;
 var
   LSer: TJsonSerializer;
@@ -412,8 +431,7 @@ begin
   end;
 end;
 
-class function TJSConsumerConfig.FromJsonString(const AValue: string)
-  : TJSConsumerConfig;
+class function TJSConsumerConfig.FromJsonString(const AValue: string): TJSConsumerConfig;
 var
   LSer: TJsonSerializer;
 begin
@@ -426,6 +444,7 @@ begin
 end;
 
 { TJSMessageGetRequest - Record method }
+
 function TJSMessageGetRequest.ToJsonString: string;
 var
   LSer: TJsonSerializer;
@@ -435,42 +454,6 @@ begin
     Result := LSer.Serialize<TJSMessageGetRequest>(Self);
   finally
     LSer.Free;
-  end;
-end;
-
-class operator TJSReceivedMessage.Finalize(var Dest: TJSReceivedMessage);
-begin
-  Dest.Headers.Free;
-end;
-
-function TJSReceivedMessage.GetHeader(const AHeaderName: string): string;
-var
-  I: Integer;
-begin
-  Result := '';
-  if Assigned(Headers) then
-  begin
-    I := Headers.IndexOfName(AHeaderName);
-    if I > -1 then
-      Result := Headers.ValueFromIndex[I];
-  end;
-end;
-
-class operator TJSReceivedMessage.Initialize(out Dest: TJSReceivedMessage);
-begin
-  with Dest do
-  begin
-    Subject := '';
-    ReplyTo := '';
-    SetLength(Data, 0);
-    Headers := TStringList.Create;
-    Headers.CaseSensitive := False;
-    stream := '';
-    Sequence := 0;
-    ConsumerSequence := 0;
-    Timestamp := 0;
-    NumPending := -1;
-    domain := '';
   end;
 end;
 
