@@ -18,14 +18,7 @@
 ## Installation
 
 ```bash
-# To get the latest released Go client:
-go get github.com/nats-io/nats.go@latest
-
-# To get a specific version:
-go get github.com/nats-io/nats.go@v1.44.0
-
-# Note that the latest major version for NATS Server is v2:
-go get github.com/nats-io/nats-server/v2@latest
+...todo
 ```
 
 ## Basic Usage
