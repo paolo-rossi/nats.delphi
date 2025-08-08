@@ -131,7 +131,7 @@ implementation
 function TRetentionPolicyConverter.CanConvert(AType: PTypeInfo): Boolean;
 begin
   Result := AType^.Kind = tkEnumeration;
-  Result := Result and SameText(AType^.Name, 'TRetentionPolicy');
+  Result := Result and SameText(string(AType^.Name), 'TRetentionPolicy');
 end;
 
 function TRetentionPolicyConverter.ReadJson(const AReader: TJsonReader;
@@ -156,7 +156,7 @@ end;
 function TStorageTypeConverter.CanConvert(AType: PTypeInfo): Boolean;
 begin
   Result := AType^.Kind = tkEnumeration;
-  Result := Result and SameText(AType^.Name, 'TStorageType');
+  Result := Result and SameText(string(AType^.Name), 'TStorageType');
 end;
 
 function TStorageTypeConverter.ReadJson(const AReader: TJsonReader;
@@ -181,7 +181,7 @@ end;
 function TDiscardPolicyConverter.CanConvert(AType: PTypeInfo): Boolean;
 begin
   Result := AType^.Kind = tkEnumeration;
-  Result := Result and SameText(AType^.Name, 'TDiscardPolicy');
+  Result := Result and SameText(string(AType^.Name), 'TDiscardPolicy');
 end;
 
 function TDiscardPolicyConverter.ReadJson(const AReader: TJsonReader;
@@ -206,7 +206,7 @@ end;
 function TAckPolicyConverter.CanConvert(AType: PTypeInfo): Boolean;
 begin
   Result := AType^.Kind = tkEnumeration;
-  Result := Result and SameText(AType^.Name, 'TAckPolicy');
+  Result := Result and SameText(string(AType^.Name), 'TAckPolicy');
 end;
 
 function TAckPolicyConverter.ReadJson(const AReader: TJsonReader;
@@ -231,7 +231,7 @@ end;
 function TReplayPolicyConverter.CanConvert(AType: PTypeInfo): Boolean;
 begin
   Result := AType^.Kind = tkEnumeration;
-  Result := Result and SameText(AType^.Name, 'TReplayPolicy');
+  Result := Result and SameText(string(AType^.Name), 'TReplayPolicy');
 end;
 
 function TReplayPolicyConverter.ReadJson(const AReader: TJsonReader;
@@ -256,7 +256,7 @@ end;
 function TDeliverPolicyConverter.CanConvert(AType: PTypeInfo): Boolean;
 begin
   Result := AType^.Kind = tkEnumeration;
-  Result := Result and SameText(AType^.Name, 'TDeliverPolicy');
+  Result := Result and SameText(string(AType^.Name), 'TDeliverPolicy');
 end;
 
 function TDeliverPolicyConverter.ReadJson(const AReader: TJsonReader;
