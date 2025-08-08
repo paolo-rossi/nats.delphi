@@ -1,3 +1,24 @@
+{******************************************************************************}
+{                                                                              }
+{  NATS.Delphi: Delphi Client Library for NATS                                 }
+{  Copyright (c) 2022 Paolo Rossi                                              }
+{  https://github.com/paolo-rossi/nats.delphi                                  }
+{                                                                              }
+{******************************************************************************}
+{                                                                              }
+{  Licensed under the Apache License, Version 2.0 (the "License");             }
+{  you may not use this file except in compliance with the License.            }
+{  You may obtain a copy of the License at                                     }
+{                                                                              }
+{      http://www.apache.org/licenses/LICENSE-2.0                              }
+{                                                                              }
+{  Unless required by applicable law or agreed to in writing, software         }
+{  distributed under the License is distributed on an "AS IS" BASIS,           }
+{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
+{  See the License for the specific language governing permissions and         }
+{  limitations under the License.                                              }
+{                                                                              }
+{******************************************************************************}
 program JetStreamClientDemo;
 
 {$APPTYPE CONSOLE}
@@ -18,6 +39,7 @@ uses
   Nats.Connection,
   // NATS JetStream Library
   NATS.JetStream.Entities,
+  NATS.JetStream.Enums,
   NATS.JetStream.Client;
 
 var
@@ -67,7 +89,7 @@ begin
   Log('Setting up NATS connection...');
   GNatsConn := TNatsConnection.Create;
   GNatsConn.Name := 'JetStreamDemoClient';
-  GNatsConn.SetChannel(Nats.Consts.NATS_HOST, Nats.Consts.NATS_PORT, Nats.Consts.NATS_TIMEOUT); // Use consts from SharedData or define here
+  GNatsConn.SetChannel('localhost', 4222, 1000); // Use consts from SharedData or define here
   GNatsConn.ConnectOptions.verbose := False;
 
   try
@@ -159,8 +181,7 @@ begin
   if Assigned(AMsg.Headers) and (AMsg.Headers.Count > 0) then
   begin
     WriteLn('    Headers:');
-    for var I := 0 to AMsg.Headers.Count - 1 do
-      WriteLn('      ', AMsg.Headers.Names[I], ': ', AMsg.Headers.ValueFromIndex[I]);
+    WriteLn(AMsg.Headers.Text)
   end;
 end;
 
@@ -197,7 +218,7 @@ var
   LStreamConfig: TJSStreamConfig;
   LStreamCreateResp: TJSStreamCreateResponse;
   LStreamInfoResp: TJSStreamInfoResponse;
-  LStreamDeleteResp: TJSStreamDeleteResponse;
+  //LStreamDeleteResp: TJSStreamDeleteResponse;
   LStreamNamesResp: TJSStreamNamesResponse;
   S: string;
 begin
@@ -212,7 +233,7 @@ begin
   LStreamConfig.retention := TRetentionPolicy.rpLimits;
   LStreamConfig.max_msgs := 10000; // Example limit
   LStreamConfig.max_age := 0; // No age limit by default
-  LStreamConfig.duplicate_window := 120 * 1000 * 1000 * 1000; // 2 minutes in ns
+  LStreamConfig.duplicate_window := 120 * 1000 * 1000; // 2 minutes in ns
   LStreamConfig.num_replicas := 1; // For single server setup
 
   LStreamCreateResp := TJSStreamCreateResponse.Create;
@@ -328,7 +349,7 @@ begin
       Log('PublishBytes call failed or timed out.');
 
     // 3. Publish with options (e.g., ExpectedLastSeq)
-    LPublishOpts.Create; // Initialize options record
+    //LPublishOpts.Create; // Initialize options record
     try
       LPublishOpts.MsgID := TGuid.NewGuid.ToString; // Set a unique message ID
       LPublishOpts.ExpectedStream := GStreamName;
@@ -346,7 +367,7 @@ begin
       else
         Log('Publish call (with options) failed or timed out.');
     finally
-      LPublishOpts.Destroy; // Clean up TJetStreamPublishOptions
+      //LPublishOpts.Destroy; // Clean up TJetStreamPublishOptions
     end;
 
     // Publish a few more for batch fetch later
@@ -371,7 +392,7 @@ var
   LConsumerCreateResp: TJSConsumerCreateResponse;
   LConsumerInfoResp: TJSConsumerInfoResponse;
   LConsumerNamesResp: TJSConsumerNamesResponse;
-  LConsumerDeleteResp: TJSConsumerDeleteResponse;
+  //LConsumerDeleteResp: TJSConsumerDeleteResponse;
   S: string;
 begin
   PrintSeparator('Consumer Management');
@@ -464,7 +485,7 @@ begin
     LFetchCount := 3; // Fetch up to 3 messages
     Log(Format('Attempting to fetch %d messages for consumer "%s"...', [LFetchCount, GConsumerName]));
     // Expires in 5 seconds (in nanoseconds), no_wait = false (wait for messages)
-    if GJSContext.FetchMessages(GStreamName, GConsumerName, LFetchCount, LMessages, 5 * 1000 * 1000 * 1000) then
+    if GJSContext.FetchMessages(GStreamName, GConsumerName, LFetchCount, LMessages, 5 * 1000 * 1000) then
     begin
       Log(Format('Fetch call completed. Received %d messages:', [LMessages.Count]));
       if LMessages.Count = 0 then
@@ -484,7 +505,6 @@ begin
       Log('FetchMessages API call itself failed or timed out client-side.');
 
     // Free TJSReceivedMessage contents (specifically Headers)
-    for LMsg in LMessages do LMsg.FreeHeaders;
     LMessages.Clear;
     ReadLn;
 
@@ -509,12 +529,8 @@ begin
     else
       Log('FetchMessages (no_wait) API call failed.');
 
-    for LMsg in LMessages do LMsg.FreeHeaders;
     LMessages.Clear;
-
   finally
-    // Ensure any remaining TJSReceivedMessage in LMessages have their Headers freed if not done above
-    for LMsg in LMessages do LMsg.FreeHeaders;
     LMessages.Free;
   end;
   ReadLn;
@@ -591,8 +607,10 @@ begin
     end;
   except
     on E: Exception do
+    begin
       Log('Unhandled Exception: ' + E.ClassName + ': ' + E.Message);
       ReadLn;
+    end;
   end;
   TeardownNATS;
   Log('JetStream Demo Application Finished. Press Enter to close.');
