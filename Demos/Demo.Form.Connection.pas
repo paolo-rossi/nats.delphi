@@ -66,6 +66,7 @@ type
   private
     FLog: TStrings;
     FConnection: TNatsConnection;
+    procedure ClearServerInfo;
     procedure Log(const AMessage: string);
     procedure LogFmt(const AMessage: string; const Args: array of const);
     procedure SetParams(AParams: TArray<string>);
@@ -130,7 +131,8 @@ begin
     begin
       FConnection.Publish(
         lstCommandParams.Values['Subject'],
-        lstCommandParams.Values['Message']
+        lstCommandParams.Values['Message'],
+        lstCommandParams.Values['ReplyTo*']
       );
     end;
     1: // Request
@@ -236,6 +238,14 @@ begin
   FConnection := TNatsConnection.Create;
 end;
 
+procedure TfrmConnection.ClearServerInfo;
+var
+  LIndex: Integer;
+begin
+  for LIndex := 0 to lstServerInfo.Strings.Count - 1 do
+    lstServerInfo.Strings.Values[lstServerInfo.Strings.KeyNames[LIndex]] := ' ';
+end;
+
 procedure TfrmConnection.Configure(const AHost: string; APort: Integer);
 begin
   if AHost.IsEmpty then
@@ -272,7 +282,7 @@ begin
   case lstCommandList.ItemIndex of
      0: // Publish
      begin
-       SetParams(['Subject', 'Message']);
+       SetParams(['Subject', 'Message', 'ReplyTo*']);
      end;
      1: // Request
      begin
@@ -318,8 +328,6 @@ begin
   if FConnection.Connected then
   begin
     FConnection.Close;
-    for LIndex := 0 to lstServerInfo.Strings.Count - 1 do
-      lstServerInfo.Strings.Values[lstServerInfo.Strings.KeyNames[LIndex]] := ' ';
   end
   else
     FConnection.
@@ -342,6 +350,17 @@ begin
               lstServerInfo.Strings.Values['Client IP'] := AInfo.client_ip;
             end
           );
+        end,
+        procedure
+        begin
+          TThread.Queue(TThread.Current,
+            procedure
+            begin
+              Log('Disconnected from the server');
+              ClearServerInfo;
+            end
+          );
+
         end
       );
 end;

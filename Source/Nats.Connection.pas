@@ -282,7 +282,7 @@ begin
 
     if LWasConnected and Assigned(FDisconnectHandler) then
     begin
-      // FDisconnectHandler(); // Consider thread context if UI updates are involved
+      FDisconnectHandler(); // Consider thread context if UI updates are involved
     end;
 
   finally

@@ -135,9 +135,6 @@ object frmConnection: TfrmConnection
       Width = 227
       Height = 118
       DefaultColWidth = 80
-      Strings.Strings = (
-        'Topic='
-        'Reply-to=')
       TabOrder = 1
       TitleCaptions.Strings = (
         'Prop'
