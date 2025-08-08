@@ -120,7 +120,6 @@ type
   /// </summary>
   TNatsConnection = class
   private
-    FConnectOptions: TNatsConnectOptions;
     FChannel: INatsSocket;
     FGenerator: TNatsGenerator;
     FSubscriptions: TNatsSubscriptions;
@@ -170,11 +169,12 @@ type
 
     function GetNewInbox():string;
   public
+    ConnectOptions: TNatsConnectOptions;
     property Name: string read FName write FName;
     property Connected: Boolean read GetConnected;
     property Reader: TNatsReader read FReader;
     property Consumer: TNatsConsumer read FConsumer;
-    property ConnectOptions: TNatsConnectOptions read FConnectOptions write FConnectOptions;
+    //property ConnectOptions: TNatsConnectOptions read FConnectOptions write FConnectOptions;
   end;
 
   TNatsNetwork = class(TObjectDictionary<string, TNatsConnection>)
@@ -199,10 +199,10 @@ begin
   FGenerator := TNatsGenerator.Create;
   FSubscriptions := TNatsSubscriptions.Create([doOwnsValues]);
 
-  FConnectOptions.lang := 'Delphi';
-  FConnectOptions.version := NatsConstants.CLIENT_VERSION;
-  FConnectOptions.protocol := 1;
-  FConnectOptions.echo := True;
+  ConnectOptions.lang := 'Delphi';
+  ConnectOptions.version := NatsConstants.CLIENT_VERSION;
+  ConnectOptions.protocol := 1;
+  ConnectOptions.echo := True;
 
   { TODO -opaolo -c : Remove the default behavior 31/05/2022 18:17:27 }
   FChannel := TNatsSocketRegistry.Get(String.Empty);
@@ -444,7 +444,7 @@ end;
 
 procedure TNatsConnection.SendConnect;
 begin
-  FChannel.SendString(Format('%s %s', [NatsConstants.Protocol.Connect, FConnectOptions.ToJSONString]));
+  FChannel.SendString(Format('%s %s', [NatsConstants.Protocol.Connect, ConnectOptions.ToJSONString]));
 end;
 
 procedure TNatsConnection.SendPing;
@@ -713,7 +713,7 @@ begin
         begin
           { TODO -opaolo -c : read the TLSs parameters and (if) upgrade the connection 23/06/2022 11:00:44 }
           if Assigned(FConnection.FConnectHandler) then
-            FConnection.FConnectHandler(LCommand.GetArgAsInfo.INFO, FConnection.FConnectOptions);
+            FConnection.FConnectHandler(LCommand.GetArgAsInfo.INFO, FConnection.ConnectOptions);
 
           if (FConnection.FChannel.MaxLineLength > 0) and (LCommand.GetArgAsInfo.Info.max_payload > 0) then
             FConnection.FChannel.MaxLineLength := LCommand.GetArgAsInfo.INFO.max_payload * 2;
