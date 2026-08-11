@@ -322,8 +322,6 @@ begin
 end;
 
 procedure TfrmConnection.switchConnectionClick(Sender: TObject);
-var
-  LIndex: Integer;
 begin
   if FConnection.Connected then
   begin
