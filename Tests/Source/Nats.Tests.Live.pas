@@ -94,7 +94,6 @@ const
   LIVE_HOST = '127.0.0.1';
   LIVE_TIMEOUT = 5000;
   WAIT_MS = 5000;
-  SETTLE_MS = 250;   // see the comment in Connect
 
 var
   GLiveSwitchCount: Integer = 0;
@@ -158,23 +157,21 @@ begin
       [LIVE_HOST, NatsConstants.DEFAULT_PORT]));
 
   // ------------------------------------------------------------------
-  // Deliberate workaround, not padding. The connect handler runs BEFORE
-  // SendConnect (Nats.Connection.pas:715-722), so FHandshakeDone is set while
-  // CONNECT is still unwritten, and there is no callback for "CONNECT is on
-  // the wire" (§16). Worse, SendConnect writes from the consumer thread
-  // without taking FLock while SendSubscribe writes from this thread, also
-  // without FLock (§10) - so a SUB issued right now can be spliced into the
-  // middle of the CONNECT line. Against a real server that costs you the
-  // subscription, and the resulting -ERR then trips the §9 self-join deadlock
-  // and hangs the whole run.
+  // There used to be a 250 ms sleep here. Before the §7-§12 work these tests
+  // were flaky without it - 3 consecutive runs gave 9 passed / 2 failed /
+  // hung - because writes were not serialized (§10), so the SUB issued on this
+  // thread could be spliced into the CONNECT line written by the consumer
+  // thread, and the server's -ERR then tripped the §9 self-join deadlock.
   //
-  // Measured without this sleep: 3 consecutive runs gave 9 passed / 2 failed /
-  // hung. That flakiness IS the bug; it is reproduced deterministically and
-  // safely by ConcurrentWrites_AreNotInterleavedOnTheSocket in the mock suite.
-  // Here we sleep so that the round-trip tests below measure what they claim
-  // to measure. Delete this once §10 and §16 are fixed.
+  // With §9 and §10 fixed the sleep is no longer needed: 6 consecutive runs
+  // are clean without it, so it has been removed rather than left as padding.
+  //
+  // §16 is still open - the connect handler runs BEFORE SendConnect, so a
+  // subscription issued the moment the handler returns can still reach the
+  // server ahead of the CONNECT. nats-server tolerates that when no
+  // authentication is required. If these tests ever turn flaky again against
+  // an authenticated server, that is the reason.
   // ------------------------------------------------------------------
-  TThread.Sleep(SETTLE_MS);
 end;
 
 procedure TNatsLiveServerTests.Handshake_CompletesAgainstARealServer;

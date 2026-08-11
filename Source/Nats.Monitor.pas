@@ -26,6 +26,7 @@ interface
 uses
   System.SysUtils, System.SyncObjs, system.Classes, System.Generics.Collections,
 
+  Nats.Consts,
   Nats.Classes;
 
 type
@@ -48,6 +49,8 @@ type
   TNatsMonitor = class(TNatsThread)
   private
     FResources: TDictionary<string, INatsResource>;
+    FLock: TCriticalSection;
+    function ResourceSnapshot: TArray<TPair<string, INatsResource>>;
   protected
     procedure Execute; override;
   public
@@ -62,48 +65,81 @@ implementation
 
 { TNatsMonitor }
 
-procedure TNatsMonitor.AddResource(AId: string; AResource: INatsResource);
-begin
-  FResources.Add(AId, AResource);
-end;
-
 constructor TNatsMonitor.Create;
 begin
+  { Delphi does not chain constructors: without this the TThread ancestor is
+    never constructed, so no OS thread exists and FStopEvent stays nil }
+  inherited Create;
+  FLock := TCriticalSection.Create;
   FResources := TDictionary<string, INatsResource>.Create;
 end;
 
 destructor TNatsMonitor.Destroy;
 begin
   FResources.Free;
+  FLock.Free;
   inherited;
+end;
+
+procedure TNatsMonitor.AddResource(AId: string; AResource: INatsResource);
+begin
+  FLock.Enter;
+  try
+    FResources.AddOrSetValue(AId, AResource);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TNatsMonitor.RemoveResource(AId: string);
+begin
+  FLock.Enter;
+  try
+    FResources.Remove(AId);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TNatsMonitor.ResourceSnapshot: TArray<TPair<string, INatsResource>>;
+begin
+  FLock.Enter;
+  try
+    Result := FResources.ToArray;
+  finally
+    FLock.Leave;
+  end;
 end;
 
 procedure TNatsMonitor.Execute;
 var
   LPair: TPair<string, INatsResource>;
 begin
+  NameThreadForDebugging('Nats Monitor');
+
   while not Terminated do
-  try
-    FStopEvent.WaitFor(1000); //Ping Interval
-    for LPair in FResources do
-      if LPair.Value.IsConnected then
-        LPair.Value.sendPing(nil);
-  except
+  begin
+    if FStopEvent.WaitFor(NatsConstants.DEFAULT_PING_INTERVAL) = TWaitResult.wrSignaled then
+      Break;
 
+    { Iterate a snapshot: AddResource/RemoveResource may run on another thread,
+      and a resource that fails its ping is removed inside this very loop }
+    for LPair in ResourceSnapshot do
+    begin
+      if Terminated then
+        Break;
 
-    {
-      LOG.log(Level.WARNING, ioe.getMessage() + ", " + "Failed pinging resoure(" +
-          resource.getResourceId() + ")");
-      Subscription.removeSubscribers(resource.getResourceId());
-      this.removeResource(resource.getResourceId());
-    }
-
+      try
+        if LPair.Value.IsConnected then
+          LPair.Value.SendPing(nil);
+      except
+        on E: Exception do
+          { the ping failed: stop monitoring this resource rather than
+            rediscovering the failure every interval }
+          RemoveResource(LPair.Key);
+      end;
+    end;
   end;
-end;
-
-procedure TNatsMonitor.RemoveResource(AId: string);
-begin
-  FResources.Remove(AId);
 end;
 
 end.

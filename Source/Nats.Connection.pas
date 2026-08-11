@@ -95,7 +95,12 @@ type
   end;
 
   /// <summary>
-  ///   Structure holding subscription metadata
+  ///   Structure holding subscription metadata.
+  ///
+  ///   Owned by TNatsConnection.FSubscriptions, which frees it on removal, so
+  ///   an instance may only be reached while holding the connection's
+  ///   subscription lock - never store a reference to one and never pass one
+  ///   outside that lock. Callers get TNatsSubscriptionInfo snapshots instead.
   /// </summary>
   TNatsSubscription = class
     Id: Integer;
@@ -109,15 +114,48 @@ type
     constructor Create(AId: Integer; const ASubject, AQueue: string; AHandler: TNatsMsgHandler); overload;
   end;
 
-  TNatsSubscriptionPair = TPair<Integer, TNatsSubscription>;
+  /// <summary>
+  ///   Detached copy of a subscription's state, safe to hold and read at any
+  ///   time because it shares nothing with the live subscription
+  /// </summary>
+  TNatsSubscriptionInfo = record
+    Id: Integer;
+    Subject: string;
+    Queue: string;
+    Received: Integer;
+    Expected: Integer;
+    Remaining: Integer;
+  end;
+
   TNatsSubscriptions = TObjectDictionary<Integer, TNatsSubscription>;
 
   /// <summary>
   ///   TNatsConnection represents a bidirectional channel to the NATS server.
   ///   Message handler may be attached to each operation which is invoked when
-  ///   the operation is processed by the server
+  ///   the operation is processed by the server.
   /// </summary>
+  /// <remarks>
+  ///   <para>Threading contract - two locks, with strict rules:</para>
+  ///   <para>
+  ///     FWriteLock serializes every write to the channel, and the channel's
+  ///     own open/close. It is held for exactly one complete command, so a
+  ///     multi-part command (control line + payload) can never be split by
+  ///     another thread's write.
+  ///   </para>
+  ///   <para>
+  ///     FSubsLock guards FSubscriptions and every TNatsSubscription it owns.
+  ///   </para>
+  ///   <para>
+  ///     Never hold both at once; never hold either while invoking a user
+  ///     handler; never hold either while joining a worker thread. Handlers are
+  ///     user code and routinely call back into this class, so any of those
+  ///     would deadlock.
+  ///   </para>
+  /// </remarks>
   TNatsConnection = class
+  private const
+    STATE_CLOSED = 0;
+    STATE_OPEN = 1;
   private
     FChannel: INatsSocket;
     FGenerator: TNatsGenerator;
@@ -128,17 +166,27 @@ type
     FReadQueue: TNatsCommandQueue;
     FConnectHandler: TNatsConnectHandler;
     FDisconnectHandler: TNatsDisconnectHandler;
-    FLock: TCriticalSection; // For thread-safe operations on shared resources like FSubscriptions    
+    FWriteLock: TCriticalSection;
+    FSubsLock: TCriticalSection;
+    FState: Integer;
+
+    { every write to the channel goes through one of these }
+    procedure SendCommand(const ALine: string); overload;
+    procedure SendCommand(const ALine: string; const APayload: TBytes); overload;
+    procedure SendCommand(const ALine, AHeaderBlock: string; const APayload: TBytes); overload;
 
     procedure SendPing;
     procedure SendPong;
     procedure SendConnect;
-    procedure SendCommand(const ACommand: string); overload;
-    procedure SendCommand(const ACommand: TBytes; APriority: Boolean); overload;
+    procedure SendSubscribe(AId: Integer; const ASubject, AQueue: string);
 
-    procedure SendSubscribe(const ASubscription: TNatsSubscription);
     function GetConnected: Boolean;
-    procedure EndThreads;
+    function TakeMessageHandler(AId: Integer; out AHandler: TNatsMsgHandler): Boolean;
+    procedure SignalStop;
+    procedure JoinThreads;
+    procedure CloseChannel;
+    procedure ClearSubscriptions;
+    procedure TearDown;
   public
     constructor Create;
     destructor Destroy; override;
@@ -164,7 +212,7 @@ type
     procedure Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0); overload;
     procedure Unsubscribe(const ASubject: string; AMaxMsg: Cardinal = 0); overload;
 
-    function GetSubscriptionList: TArray<TNatsSubscriptionPair>;
+    function GetSubscriptionList: TArray<TNatsSubscriptionInfo>;
 
     function GetNewInbox():string;
   public
@@ -188,13 +236,19 @@ uses
   Nats.Nuid,
   Nats.Exceptions;
 
+const
+  /// How long the consumer waits on the queue before re-checking Terminated
+  QUEUE_WAIT_MS = 250;
+
 { TNatsConnection }
 
 constructor TNatsConnection.Create;
 begin
   inherited Create;
-  
-  FLock := TCriticalSection.Create;
+
+  FWriteLock := TCriticalSection.Create;
+  FSubsLock := TCriticalSection.Create;
+  FState := STATE_CLOSED;
   FReadQueue := TNatsCommandQueue.Create;
   FGenerator := TNatsGenerator.Create;
   FSubscriptions := TNatsSubscriptions.Create([doOwnsValues]);
@@ -216,7 +270,8 @@ begin
   FSubscriptions.Free;
   FGenerator.Free;
   FReadQueue.Free;
-  FLock.Free;
+  FSubsLock.Free;
+  FWriteLock.Free;
   inherited;
 end;
 
@@ -228,29 +283,29 @@ end;
 procedure TNatsConnection.Open(AConnectHandler: TNatsConnectHandler;
   ADisconnectHandler: TNatsDisconnectHandler = nil);
 begin
-  FLock.Enter;
+  FWriteLock.Enter;
   try
     if Connected then
       Exit; // Already open or opening
-	  
+
     FConnectHandler := AConnectHandler;
     FDisconnectHandler := ADisconnectHandler;
     FChannel.Open;
+    FState := STATE_OPEN;
 
     FReader := TNatsReader.Create(Self);
-    FReader.Start;
-
     FConsumer := TNatsConsumer.Create(Self);
+
+    FReader.Start;
     FConsumer.Start;
   finally
-    FLock.Leave;
+    FWriteLock.Leave;
   end;
 end;
 
 function TNatsConnection.GetConnected: Boolean;
 begin
-  Result := Assigned(FChannel) and FChannel.Connected and Assigned(FReader) and
-    Assigned(FConsumer) and (not FReader.Terminated) and (not FConsumer.Terminated);
+  Result := (FState = STATE_OPEN) and Assigned(FChannel) and FChannel.Connected;
 end;
 
 function TNatsConnection.GetNewInbox: string;
@@ -258,37 +313,107 @@ begin
  Result := FGenerator.GetNewInbox;
 end;
 
-function TNatsConnection.GetSubscriptionList: TArray<TNatsSubscriptionPair>;
+function TNatsConnection.GetSubscriptionList: TArray<TNatsSubscriptionInfo>;
+var
+  LPair: TPair<Integer, TNatsSubscription>;
+  LIndex: Integer;
 begin
-  TMonitor.Enter(FSubscriptions);
+  { Snapshots, not the live objects: the dictionary owns them and frees them on
+    removal, so a caller holding one could be left with a dangling pointer }
+  FSubsLock.Enter;
   try
-    Result := FSubscriptions.ToArray;
+    SetLength(Result, FSubscriptions.Count);
+    LIndex := 0;
+    for LPair in FSubscriptions do
+    begin
+      Result[LIndex].Id := LPair.Value.Id;
+      Result[LIndex].Subject := LPair.Value.Subject;
+      Result[LIndex].Queue := LPair.Value.Queue;
+      Result[LIndex].Received := LPair.Value.Received;
+      Result[LIndex].Expected := LPair.Value.Expected;
+      Result[LIndex].Remaining := LPair.Value.Remaining;
+      Inc(LIndex);
+    end;
   finally
-    TMonitor.Exit(FSubscriptions);
+    FSubsLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.SignalStop;
+begin
+  { Only signals - safe from any thread, including the workers themselves }
+  if Assigned(FReader) then
+    FReader.Stop;
+  if Assigned(FConsumer) then
+    FConsumer.Stop;
+
+  FReadQueue.Wake; // release the consumer if it is waiting on the queue
+end;
+
+procedure TNatsConnection.CloseChannel;
+begin
+  FWriteLock.Enter;
+  try
+    if Assigned(FChannel) and FChannel.Connected then
+      FChannel.Close;
+  finally
+    FWriteLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.ClearSubscriptions;
+begin
+  FSubsLock.Enter;
+  try
+    FSubscriptions.Clear;
+  finally
+    FSubsLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.TearDown;
+var
+  LWasOpen: Boolean;
+begin
+  { Safe to call from any thread INCLUDING the workers, because it never joins
+    them - it only asks them to stop. The state flip is atomic, so the
+    disconnect handler runs exactly once however many callers race here. }
+  LWasOpen := TInterlocked.Exchange(FState, STATE_CLOSED) = STATE_OPEN;
+
+  SignalStop;
+  CloseChannel;
+  ClearSubscriptions;
+
+  if LWasOpen and Assigned(FDisconnectHandler) then
+    FDisconnectHandler();
+end;
+
+procedure TNatsConnection.JoinThreads;
+begin
+  { No lock may be held here: a handler running on the consumer thread may be
+    inside Publish waiting for FWriteLock, and it has to finish before the
+    thread can end.
+
+    A thread is never joined from itself: the consumer tears the connection
+    down on a fatal -ERR, and joining itself there would hang forever. Workers
+    only ever signal; whoever owns the connection does the freeing. }
+  if Assigned(FReader) and (TThread.CurrentThread.ThreadID <> FReader.ThreadID) then
+  begin
+    FReader.WaitFor;
+    FreeAndNil(FReader);
+  end;
+
+  if Assigned(FConsumer) and (TThread.CurrentThread.ThreadID <> FConsumer.ThreadID) then
+  begin
+    FConsumer.WaitFor;
+    FreeAndNil(FConsumer);
   end;
 end;
 
 procedure TNatsConnection.Close();
-var
-  LWasConnected: Boolean;
 begin
-  FLock.Enter;
-  try
-    LWasConnected := Self.Connected;
-    EndThreads;
-    if Assigned(FChannel) and FChannel.Connected then
-      FChannel.Close;
-
-    FSubscriptions.Clear;
-
-    if LWasConnected and Assigned(FDisconnectHandler) then
-    begin
-      FDisconnectHandler(); // Consider thread context if UI updates are involved
-    end;
-
-  finally
-    FLock.Leave;
-  end;
+  TearDown;
+  JoinThreads;
 end;
 
 procedure TNatsConnection.Ping;
@@ -310,13 +435,7 @@ begin
   else
     LPub := Format('%s %s %s %d', [NatsConstants.Protocol.PUB, ASubject, AReplyTo, Length(LMessageBytes)]);
 
-  FLock.Enter;
-  try
-    FChannel.SendString(LPub);
-    FChannel.SendBytes(LMessageBytes);
-  finally
-    FLock.Leave;
-  end;
+  SendCommand(LPub, LMessageBytes);
 end;
 
 procedure TNatsConnection.PublishBytes(const ASubject: string; const AData: TBytes; const AReplyTo: string = '');
@@ -331,13 +450,7 @@ begin
   else
     LPub := Format('%s %s %s %d', [NatsConstants.Protocol.PUB, ASubject, AReplyTo, Length(AData)]);
 
-  FLock.Enter;
-  try
-    FChannel.SendString(LPub);
-    FChannel.SendBytes(AData);
-  finally
-    FLock.Leave;
-  end;
+  SendCommand(LPub, AData);
 end;
 
 procedure TNatsConnection.Publish(const ASubject, AMessage: string; const AReplyTo: string; AHeaders: TNatsHeaders);
@@ -395,14 +508,7 @@ begin
       LTotalBytes
     ]);
 
-  FLock.Enter;
-  try
-    FChannel.SendString(LPub);
-    FChannel.SendString(LHeaderBlock);
-    FChannel.SendBytes(AData);
-  finally
-    FLock.Leave;
-  end;
+  SendCommand(LPub, LHeaderBlock, AData);
 end;
 
 function TNatsConnection.Request(const ASubject: string; AHandler: TNatsMsgHandler): Integer;
@@ -431,72 +537,136 @@ procedure TNatsConnection.Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0);
 var
   LSub: TNatsSubscription;
   LRemaining: Integer;
+  LFound: Boolean;
 begin
-  FLock.Enter;
+  { Bookkeeping under the subscription lock, the write under the write lock -
+    never both at once }
+  FSubsLock.Enter;
   try
-    if not FSubscriptions.TryGetValue(AId, LSub) then
-      Exit; // Nothing to do here!
-
-    if AMaxMsg = 0 then
-      FChannel.SendString(Format('%s %d', [NatsConstants.Protocol.UNSUB, AId]))
-    else
-      FChannel.SendString(Format('%s %d %d', [NatsConstants.Protocol.UNSUB, AId, AMaxMsg]));
-
-    if AMaxMsg = 0 then
+    LFound := FSubscriptions.TryGetValue(AId, LSub);
+    if LFound then
     begin
-      FSubscriptions.Remove(AId);
-      Exit;
+      if AMaxMsg = 0 then
+        FSubscriptions.Remove(AId)
+      else
+      begin
+        { <max_msgs> is the TOTAL the server will have delivered on this sid
+          before it drops the subscription, not "this many more". So what is
+          still to come is <max_msgs> minus what has already arrived, and if
+          that count is already reached the server drops the subscription the
+          moment it reads this UNSUB - so drop ours too, otherwise it would
+          linger forever. }
+        LSub.Expected := AMaxMsg;
+        LRemaining := Integer(AMaxMsg) - LSub.Received;
+
+        if LRemaining <= 0 then
+          FSubscriptions.Remove(AId)
+        else
+          LSub.Remaining := LRemaining;
+      end;
     end;
-
-    { <max_msgs> is the TOTAL the server will have delivered on this sid before
-      it drops the subscription, not "this many more". So what is still to come
-      is <max_msgs> minus what has already arrived, and if that count is already
-      reached the server drops the subscription the moment it reads this UNSUB -
-      so drop ours too, otherwise it would linger forever.
-
-      NOTE: LSub.Received is maintained by the consumer thread, which does not
-      take FLock (see §7/§8 in Docs\Core-Protocol-Review.md); this read is
-      therefore still racy until subscription access is serialized. }
-    LSub.Expected := AMaxMsg;
-    LRemaining := Integer(AMaxMsg) - LSub.Received;
-
-    if LRemaining <= 0 then
-      FSubscriptions.Remove(AId)
-    else
-      LSub.Remaining := LRemaining;
   finally
-    FLock.Leave;
+    FSubsLock.Leave;
+  end;
+
+  if not LFound then
+    Exit; // Nothing to do here!
+
+  if AMaxMsg = 0 then
+    SendCommand(Format('%s %d', [NatsConstants.Protocol.UNSUB, AId]))
+  else
+    SendCommand(Format('%s %d %d', [NatsConstants.Protocol.UNSUB, AId, AMaxMsg]));
+end;
+
+function TNatsConnection.TakeMessageHandler(AId: Integer; out AHandler: TNatsMsgHandler): Boolean;
+var
+  LSub: TNatsSubscription;
+begin
+  AHandler := nil;
+
+  FSubsLock.Enter;
+  try
+    Result := FSubscriptions.TryGetValue(AId, LSub);
+    if not Result then
+      Exit;
+
+    { All of the bookkeeping happens here, under the lock, and the handler is
+      copied out. TNatsMsgHandler is a refcounted closure, so the copy keeps it
+      alive even when the line below frees the subscription that owns it - which
+      is what lets the caller invoke it with no lock held. LSub must not be
+      touched after the Remove. }
+    AHandler := LSub.Handler;
+    LSub.Received := LSub.Received + 1;
+
+    if LSub.Remaining > -1 then
+    begin
+      LSub.Remaining := LSub.Remaining - 1;
+      if LSub.Remaining <= 0 then
+        FSubscriptions.Remove(AId);
+    end;
+  finally
+    FSubsLock.Leave;
   end;
 end;
 
-procedure TNatsConnection.SendCommand(const ACommand: TBytes; APriority: Boolean);
+procedure TNatsConnection.SendCommand(const ALine: string);
 begin
-  FChannel.SendBytes(ACommand);
+  FWriteLock.Enter;
+  try
+    FChannel.SendString(ALine);
+  finally
+    FWriteLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.SendCommand(const ALine: string; const APayload: TBytes);
+begin
+  { One lock for the whole command: a control line and its payload must never
+    be separated by another thread's write }
+  FWriteLock.Enter;
+  try
+    FChannel.SendString(ALine);
+    FChannel.SendBytes(APayload);
+  finally
+    FWriteLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.SendCommand(const ALine, AHeaderBlock: string; const APayload: TBytes);
+begin
+  FWriteLock.Enter;
+  try
+    FChannel.SendString(ALine);
+    FChannel.SendString(AHeaderBlock);
+    FChannel.SendBytes(APayload);
+  finally
+    FWriteLock.Leave;
+  end;
 end;
 
 procedure TNatsConnection.SendConnect;
 begin
-  FChannel.SendString(Format('%s %s', [NatsConstants.Protocol.Connect, ConnectOptions.ToJSONString]));
+  SendCommand(Format('%s %s', [NatsConstants.Protocol.Connect, ConnectOptions.ToJSONString]));
 end;
 
 procedure TNatsConnection.SendPing;
 begin
-  FChannel.SendString(NatsConstants.Protocol.Ping);
+  SendCommand(NatsConstants.Protocol.Ping);
 end;
 
 procedure TNatsConnection.SendPong;
 begin
-  FChannel.SendString(NatsConstants.Protocol.PONG);
+  SendCommand(NatsConstants.Protocol.PONG);
 end;
 
-procedure TNatsConnection.SendSubscribe(const ASubscription: TNatsSubscription);
+procedure TNatsConnection.SendSubscribe(AId: Integer; const ASubject, AQueue: string);
 begin
-  if ASubscription.Queue.IsEmpty then
-    FChannel.SendString(Format('%s %s %d', 
-	  [NatsConstants.Protocol.SUB, ASubscription.Subject, ASubscription.Id]))
+  { Takes copies rather than the TNatsSubscription: by the time this runs the
+    subscription lock has been released and the object may already be gone }
+  if AQueue.IsEmpty then
+    SendCommand(Format('%s %s %d', [NatsConstants.Protocol.SUB, ASubject, AId]))
   else
-    FChannel.SendString(Format('%s %s %s %d',
-	  [NatsConstants.Protocol.SUB, ASubscription.Subject, ASubscription.Queue, ASubscription.Id]));
+    SendCommand(Format('%s %s %s %d', [NatsConstants.Protocol.SUB, ASubject, AQueue, AId]));
 end;
 
 function TNatsConnection.SetChannel(const AHost: string; APort, ATimeout: Integer): TNatsConnection;
@@ -518,54 +688,42 @@ var
 begin
   LSub := TNatsSubscription.Create(FGenerator.GetSubNextId, ASubject, AQueue, AHandler);
 
-  TMonitor.Enter(FSubscriptions);
+  { Register before sending, so a message that arrives immediately after the
+    server processes the SUB always finds its subscription }
+  FSubsLock.Enter;
   try
     FSubscriptions.Add(LSub.Id, LSub);
+    Result := LSub.Id;
   finally
-    TMonitor.Exit(FSubscriptions);
+    FSubsLock.Leave;
   end;
 
-  SendSubscribe(LSub);
-  Result := LSub.Id;
+  SendSubscribe(Result, ASubject, AQueue);
 end;
 
 procedure TNatsConnection.Unsubscribe(const ASubject: string; AMaxMsg: Cardinal);
 var
-  LPair: TNatsSubscriptionPair;
+  LPair: TPair<Integer, TNatsSubscription>;
   LId: Integer;
 begin
   LId := -1;
-  for LPair in FSubscriptions do
-    if LPair.Value.Subject = ASubject then
-    begin
-      LId := LPair.Value.Id;
-      Break;
-    end;
+
+  FSubsLock.Enter;
+  try
+    for LPair in FSubscriptions do
+      if LPair.Value.Subject = ASubject then
+      begin
+        LId := LPair.Value.Id;
+        Break;
+      end;
+  finally
+    FSubsLock.Leave;
+  end;
 
   if LId > -1 then
-    Unsubscribe(LId, AMaxMsg)
+    Unsubscribe(Cardinal(LId), AMaxMsg)
   else
     raise ENatsException.CreateFmt('Subscription [%s] not found in the subscription list', [ASubject]);
-end;
-
-procedure TNatsConnection.EndThreads;
-begin
-  if (FReader = nil) or (FConsumer = nil) then
-    Exit;
-
-  FReader.Stop;
-  FConsumer.Stop;
-
-  FReader.WaitFor;
-  FreeAndNil(FReader);
-
-  FConsumer.WaitFor;
-  FreeAndNil(FConsumer);
-end;
-
-procedure TNatsConnection.SendCommand(const ACommand: string);
-begin
-  SendCommand(TEncoding.UTF8.GetBytes(ACommand), False);
 end;
 
 { TNatsReader }
@@ -653,12 +811,7 @@ begin
       LCommand := FParser.SetCommandPayload(LCommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
     end;
 
-    TMonitor.Enter(FQueue);
-    try
-      FQueue.Enqueue(LCommand);
-    finally
-      TMonitor.Exit(FQueue);
-    end;
+    FQueue.Enqueue(LCommand); // the queue does its own locking and signalling
   end;
 end;
 
@@ -719,24 +872,18 @@ end;
 
 procedure TNatsConsumer.DoExecute;
 var
-  LProcess: Boolean;
   LCommand: TNatsCommand;
-  LSub: TNatsSubscription;
+  LHandler: TNatsMsgHandler;
   LShouldDisconnect: Boolean;
 begin
   LShouldDisconnect := False;
   while not Terminated do
   begin
-    TMonitor.Enter(FQueue);
-    try
-      LProcess := FQueue.Count > 0;
-      if LProcess then
-        LCommand := FQueue.Dequeue;
-    finally
-      TMonitor.Exit(FQueue);
-    end;
+    { Blocks until a command arrives, the timeout expires, or SignalStop wakes
+      the queue - no polling, so a message is dispatched as soon as it is read }
+    if not FQueue.Dequeue(LCommand, QUEUE_WAIT_MS) then
+      Continue;
 
-    if LProcess then
       case LCommand.CommandType of
         TNatsCommandServer.INFO:
         begin
@@ -765,18 +912,11 @@ begin
         TNatsCommandServer.HMSG:
         begin
           var LMsgArgs := LCommand.GetArgAsMsg;
-          if FConnection.FSubscriptions.TryGetValue(LMsgArgs.Id,LSub) then
-          begin
-            LSub.Received := LSub.Received + 1;
-            if Assigned(LSub.Handler) then
-              LSub.Handler(LMsgArgs);
-
-            if LSub.Remaining > -1 then
-              LSub.Remaining := LSub.Remaining - 1;
-
-            if LSub.Remaining = 0 then
-              FConnection.FSubscriptions.Remove(LMsgArgs.Id);
-          end;
+          { The lookup and all the counting happen inside the connection, under
+            its subscription lock; the handler comes back as a copy so it can be
+            invoked here with no lock held }
+          if FConnection.TakeMessageHandler(LMsgArgs.Id, LHandler) and Assigned(LHandler) then
+            LHandler(LMsgArgs);
         end;
 
         TNatsCommandServer.OK:
@@ -788,14 +928,15 @@ begin
         begin
           FError := 'ERR from server: ' + LCommand.Arguments.ToString; // Placeholder
           LShouldDisconnect := True;
+          Break;
         end;
-      end
-    else
-      Sleep(100);
+      end;
   end; // while
 
+  { TearDown, never Close: Close joins the worker threads and this IS one of
+    them, so it would wait for itself forever }
   if LShouldDisconnect then
-    FConnection.Close;
+    FConnection.TearDown;
 end;
 
 procedure TNatsConsumer.Execute;

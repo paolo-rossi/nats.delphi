@@ -81,7 +81,32 @@ type
     function GetArgAsMsg: TNatsArgsMSG;
   end;
 
-  TNatsCommandQueue = class(TQueue<TNatsCommand>);
+  /// <summary>
+  ///   Thread-safe command queue with a wait/signal handshake: the reader
+  ///   thread enqueues, the consumer thread blocks in Dequeue until something
+  ///   arrives instead of polling, and Wake releases it at shutdown
+  /// </summary>
+  TNatsCommandQueue = class
+  private
+    FItems: TQueue<TNatsCommand>;
+    FLock: TCriticalSection;
+    FEvent: TLightweightEvent;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure Enqueue(const ACommand: TNatsCommand);
+    /// <summary>
+    ///   Waits up to ATimeoutMs for a command; False when none arrived
+    /// </summary>
+    function Dequeue(out ACommand: TNatsCommand; ATimeoutMs: Cardinal): Boolean;
+    /// <summary>
+    ///   Releases anyone blocked in Dequeue, without enqueuing anything
+    /// </summary>
+    procedure Wake;
+    procedure Clear;
+    function Count: Integer;
+  end;
 
   TNatsMsgHandler = reference to procedure (const AMsg: TNatsArgsMSG);
   TNatsPingHandler = reference to procedure ();
@@ -98,6 +123,90 @@ type
   end;
 
 implementation
+
+{ TNatsCommandQueue }
+
+constructor TNatsCommandQueue.Create;
+begin
+  inherited Create;
+  FItems := TQueue<TNatsCommand>.Create;
+  FLock := TCriticalSection.Create;
+  FEvent := TLightweightEvent.Create;
+end;
+
+destructor TNatsCommandQueue.Destroy;
+begin
+  FEvent.Free;
+  FItems.Free;
+  FLock.Free;
+  inherited;
+end;
+
+procedure TNatsCommandQueue.Enqueue(const ACommand: TNatsCommand);
+begin
+  FLock.Enter;
+  try
+    FItems.Enqueue(ACommand);
+  finally
+    FLock.Leave;
+  end;
+  FEvent.SetEvent;
+end;
+
+function TNatsCommandQueue.Dequeue(out ACommand: TNatsCommand; ATimeoutMs: Cardinal): Boolean;
+
+  function TryTake: Boolean;
+  begin
+    FLock.Enter;
+    try
+      Result := FItems.Count > 0;
+      if Result then
+        ACommand := FItems.Dequeue;
+      { Reset while holding the lock: an Enqueue between here and the WaitFor
+        below signals the event again, so nothing is missed }
+      if FItems.Count = 0 then
+        FEvent.ResetEvent;
+    finally
+      FLock.Leave;
+    end;
+  end;
+
+begin
+  Result := TryTake;
+  if Result then
+    Exit;
+
+  if FEvent.WaitFor(ATimeoutMs) <> TWaitResult.wrSignaled then
+    Exit(False);
+
+  Result := TryTake;
+end;
+
+procedure TNatsCommandQueue.Wake;
+begin
+  FEvent.SetEvent;
+end;
+
+procedure TNatsCommandQueue.Clear;
+begin
+  FLock.Enter;
+  try
+    FItems.Clear;
+    FEvent.ResetEvent;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TNatsCommandQueue.Count: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FItems.Count;
+  finally
+    FLock.Leave;
+  end;
+end;
 
 { TNatsThread }
 constructor TNatsThread.Create;

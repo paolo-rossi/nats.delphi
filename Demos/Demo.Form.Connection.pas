@@ -301,12 +301,12 @@ end;
 
 procedure TfrmConnection.RefreshLists;
 var
-  LPair: TNatsSubscriptionPair;
+  LInfo: TNatsSubscriptionInfo;
 begin
   lstSubscriptions.Clear;
-  for LPair in FConnection.GetSubscriptionList do
+  for LInfo in FConnection.GetSubscriptionList do
   begin
-    lstSubscriptions.Items.Add(Format('%s (%d)', [LPair.Value.Subject, LPair.Key]));
+    lstSubscriptions.Items.Add(Format('%s (%d)', [LInfo.Subject, LInfo.Id]));
   end;
 end;
 

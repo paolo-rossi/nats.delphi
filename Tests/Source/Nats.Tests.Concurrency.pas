@@ -79,15 +79,14 @@ type
     [Test]
     procedure Close_WhenNeverOpened_DoesNotRaise;
 
-    // [KNOWN BUG §8] TObjectDictionary owns the values, so Unsubscribe frees a
-    // TNatsSubscription the consumer thread may be dispatching through
+    // §8: the dictionary owns its values, so an Unsubscribe must not free a
+    // subscription out from under a dispatch in flight
     [Test]
-    [Ignore('Reproduces the §8 use-after-free: crashes the process instead of failing. Enable once subscription access is serialized.')]
     procedure Dispatch_WhileUnsubscribing_DoesNotUseFreedMemory;
 
-    // [KNOWN BUG §9] the consumer calls Close on itself, which WaitFor's itself
+    // §9: a fatal -ERR must tear the connection down without the consumer
+    // thread joining itself
     [Test]
-    [Ignore('Reproduces the §9 self-join deadlock: hangs the runner instead of failing. Enable once the -ERR path stops calling Close on the consumer thread.')]
     procedure ServerError_DoesNotDeadlockTheConsumer;
   end;
 
