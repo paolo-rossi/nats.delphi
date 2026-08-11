@@ -51,10 +51,12 @@ type
   /// </summary>
   TNatsGenerator = class
   private
-    FSubId: Cardinal;
+    FSubId: Integer;
   public
     constructor Create(); // Initialize counters
-    function GetSubNextId: Cardinal;
+    { Integer throughout: a subscription id is a dictionary key and a field on
+      TNatsSubscription, both of which are Integer }
+    function GetSubNextId: Integer;
     function GetNewInbox: string;
   end;
 
@@ -152,6 +154,16 @@ type
   ///     user code and routinely call back into this class, so any of those
   ///     would deadlock.
   ///   </para>
+  ///   <para>
+  ///     EVERY handler - message, connect, disconnect, error - must be written
+  ///     to be thread safe. None of them is guaranteed to run on the thread
+  ///     that opened the connection: message and connect handlers always run on
+  ///     the consumer thread, and the disconnect and error handlers run on
+  ///     whichever thread discovered the failure, which is a worker thread
+  ///     whenever the server or the socket caused it and the caller's thread
+  ///     when it was a deliberate Close. Marshal to the UI yourself, as the
+  ///     demo does with TThread.Queue.
+  ///   </para>
   /// </remarks>
   TNatsConnection = class
   private const
@@ -187,6 +199,12 @@ type
     procedure SendConnect;
     procedure SendSubscribe(AId: Integer; const ASubject, AQueue: string);
 
+    /// <summary>
+    ///   Raises if ASubject could not be sent as-is. Whitespace or a line break
+    ///   would split the control line and desynchronize the whole stream, which
+    ///   is far harder to diagnose than an exception at the call site
+    /// </summary>
+    procedure CheckSubject(const ASubject: string);
     function GetConnected: Boolean;
     function GetReady: Boolean;
     function GetLastError: string;
@@ -231,8 +249,8 @@ type
     function Subscribe(const ASubject: string; AHandler: TNatsMsgHandler): Integer; overload;
     function Subscribe(const ASubject, AQueue: string; AHandler: TNatsMsgHandler): Integer; overload;
 
-    procedure Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0); overload;
-    procedure Unsubscribe(const ASubject: string; AMaxMsg: Cardinal = 0); overload;
+    procedure Unsubscribe(AId: Integer; AMaxMsg: Integer = 0); overload;
+    procedure Unsubscribe(const ASubject: string; AMaxMsg: Integer = 0); overload;
 
     function GetSubscriptionList: TArray<TNatsSubscriptionInfo>;
 
@@ -359,6 +377,19 @@ begin
   finally
     FWriteLock.Leave;
   end;
+end;
+
+procedure TNatsConnection.CheckSubject(const ASubject: string);
+var
+  LChar: Char;
+begin
+  if ASubject.IsEmpty then
+    raise ENatsException.Create('The subject cannot be empty');
+
+  for LChar in ASubject do
+    if (LChar = ' ') or (LChar = #9) or (LChar = #13) or (LChar = #10) then
+      raise ENatsException.CreateFmt(
+        'The subject [%s] cannot contain whitespace or a line break', [ASubject]);
 end;
 
 function TNatsConnection.GetConnected: Boolean;
@@ -591,8 +622,7 @@ var
   LMessageBytes: TBytes;
   LPub: string;
 begin
-  if ASubject.IsEmpty then
-    Exit;
+  CheckSubject(ASubject);
 
   LMessageBytes := TEncoding.UTF8.GetBytes(AMessage);
   if AReplyTo.IsEmpty then
@@ -607,8 +637,7 @@ procedure TNatsConnection.PublishBytes(const ASubject: string; const AData: TByt
 var
   LPub: string;
 begin
-  if ASubject.IsEmpty then
-    Exit;
+  CheckSubject(ASubject);
 
   if AReplyTo.IsEmpty then
     LPub := Format('%s %s %d', [NatsConstants.Protocol.PUB, ASubject, Length(AData)])
@@ -633,8 +662,7 @@ var
   LHeaderBytes, LTotalBytes: Integer;
   LPub: string;
 begin
-  if ASubject.IsEmpty then
-    Exit;
+  CheckSubject(ASubject);
 
   if AHeaders.Count = 0 then
   begin
@@ -693,17 +721,20 @@ begin
     this side or on the server's, and every request leaks one }
   { TODO -opaolo -c : no timeout yet - a reply that never arrives leaves the
     subscription in place until the connection closes }
-  Unsubscribe(Cardinal(Result), 1);
+  Unsubscribe(Result, 1);
 
   Publish(ASubject, AMessage, LInbox);
 end;
 
-procedure TNatsConnection.Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0);
+procedure TNatsConnection.Unsubscribe(AId: Integer; AMaxMsg: Integer = 0);
 var
   LSub: TNatsSubscription;
   LRemaining: Integer;
   LFound: Boolean;
 begin
+  if AMaxMsg < 0 then
+    raise ENatsException.Create('The maximum message count cannot be negative');
+
   { Bookkeeping under the subscription lock, the write under the write lock -
     never both at once }
   FSubsLock.Enter;
@@ -722,7 +753,7 @@ begin
           moment it reads this UNSUB - so drop ours too, otherwise it would
           linger forever. }
         LSub.Expected := AMaxMsg;
-        LRemaining := Integer(AMaxMsg) - LSub.Received;
+        LRemaining := AMaxMsg - LSub.Received;
 
         if LRemaining <= 0 then
           FSubscriptions.Remove(AId)
@@ -863,6 +894,8 @@ function TNatsConnection.Subscribe(const ASubject, AQueue: string; AHandler: TNa
 var
   LSub: TNatsSubscription;
 begin
+  CheckSubject(ASubject);
+
   LSub := TNatsSubscription.Create(FGenerator.GetSubNextId, ASubject, AQueue, AHandler);
 
   { Register before sending, so a message that arrives immediately after the
@@ -878,7 +911,7 @@ begin
   SendSubscribe(Result, ASubject, AQueue);
 end;
 
-procedure TNatsConnection.Unsubscribe(const ASubject: string; AMaxMsg: Cardinal);
+procedure TNatsConnection.Unsubscribe(const ASubject: string; AMaxMsg: Integer);
 var
   LPair: TPair<Integer, TNatsSubscription>;
   LId: Integer;
@@ -898,7 +931,7 @@ begin
   end;
 
   if LId > -1 then
-    Unsubscribe(Cardinal(LId), AMaxMsg)
+    Unsubscribe(LId, AMaxMsg)
   else
     raise ENatsException.CreateFmt('Subscription [%s] not found in the subscription list', [ASubject]);
 end;
@@ -1004,7 +1037,7 @@ begin
       SetLength(LPayloadBlockBytes, 0);
 
     FChannel.ReceiveString; // Consume the trailing CRLF after payload
-    ACommand := FParser.SetCommandPayload(ACommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
+    FParser.SetCommandPayload(ACommand, LPayloadBlockBytes);
   end
   else if ACommand.CommandType = TNatsCommandServer.HMSG then
   begin
@@ -1025,7 +1058,7 @@ begin
       SetLength(LPayloadBlockBytes, 0);
     FChannel.ReceiveString; // Consume CRLF after payload block
 
-    ACommand := FParser.SetCommandPayload(ACommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
+    FParser.SetCommandPayload(ACommand, LPayloadBlockBytes);
   end;
 end;
 
@@ -1055,15 +1088,9 @@ begin
   Result := NatsConstants.INBOX_PREFIX + TNUID.NextNuid;
 end;
 
-function TNatsGenerator.GetSubNextId: Cardinal;
+function TNatsGenerator.GetSubNextId: Integer;
 begin
-  TMonitor.Enter(Self);
-  try
-    Inc(FSubId);
-    Result := FSubId;
-  finally
-    TMonitor.Exit(Self);
-  end;
+  Result := TInterlocked.Increment(FSubId);
 end;
 
 { TNatsNetwork }

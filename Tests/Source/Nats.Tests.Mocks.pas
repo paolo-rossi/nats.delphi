@@ -327,8 +327,7 @@ end;
 
 constructor TNatsMockSocket.Create;
 begin
-  // no "inherited Create": TNatsSocket.Create is abstract, calling it raises
-  // an abstract error (TNatsSocketIndy does the same)
+  inherited Create;
   FLock := TCriticalSection.Create;
   FHost := '127.0.0.1';
   FPort := NatsConstants.DEFAULT_PORT;

@@ -66,8 +66,16 @@ type
     Id: Integer;            // Subscription ID
     Subject: string;
     ReplyTo: string;
-    PayloadBytes: Integer;  // Length of the actual message payload
-    Payload: string;        // The message payload
+    PayloadBytes: Integer;  // Length in bytes of the actual message payload
+    /// <summary>
+    ///   The payload decoded as UTF-8. Convenient, but lossy for anything that
+    ///   is not text - use PayloadData when the payload is binary
+    /// </summary>
+    Payload: string;
+    /// <summary>
+    ///   The payload exactly as it came off the wire
+    /// </summary>
+    PayloadData: TBytes;
     HeaderBytes: Integer;   // Length of the header block (for HMSG)
     TotalMsgBytes: Integer; // Total bytes for HMSG (HeaderBytes + PayloadBytes)
     Headers: TNatsHeaders;  // Parsed NATS headers
@@ -265,8 +273,14 @@ end;
 { TNatsHeadersHelper }
 
 procedure TNatsHeadersHelper.Add(const AName, AValue: string);
+var
+  LIndex: Integer;
 begin
-  Self := Self + [TNatsHeader.Create(AName, AValue)];
+  { Grow in place. "Self := Self + [...]" builds a one-element temporary array
+    and then a whole new array on every single call }
+  LIndex := Length(Self);
+  SetLength(Self, LIndex + 1);
+  Self[LIndex] := TNatsHeader.Create(AName, AValue);
 end;
 
 procedure TNatsHeadersHelper.CopyHeaders(const AHeaders: TNatsHeaders);

@@ -81,7 +81,10 @@ type
 implementation
 
 uses
-  System.JSON, REST.Json;
+  { Serialization here is System.JSON.Serializers.TJsonSerializer only. REST.Json
+    used to be listed too and was never called - it was the sole reason the
+    package required RESTComponents }
+  System.JSON;
 
 { TNatsServerInfo }
 

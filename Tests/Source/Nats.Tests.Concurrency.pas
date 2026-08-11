@@ -536,7 +536,7 @@ begin
 
     LSocket.ServerSend(Format('MSG churn %d 5'#13#10'hello'#13#10, [LSid]));
     // races the consumer thread, which may be inside LSub.Handler right now
-    LConn.Unsubscribe(Cardinal(LSid));
+    LConn.Unsubscribe(LSid);
   end;
 
   Assert.AreEqual(0, Length(LConn.GetSubscriptionList),

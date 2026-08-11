@@ -309,7 +309,7 @@ begin
     WAIT_MS),
     'the first message never came back');
 
-  FConn.Unsubscribe(Cardinal(LSid));
+  FConn.Unsubscribe(LSid);
   FConn.Publish(FSubject, 'second');
 
   // give the server a chance to (wrongly) deliver it

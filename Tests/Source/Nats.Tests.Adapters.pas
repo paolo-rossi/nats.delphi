@@ -136,7 +136,11 @@ type
     [Test]
     procedure Publish_MultiBytePayload_DeclaresByteLengthNotCharLength;
     [Test]
-    procedure Publish_EmptySubject_WritesNothing;
+    procedure Publish_EmptySubject_Raises;
+    [Test]
+    procedure Publish_SubjectWithWhitespace_Raises;
+    [Test]
+    procedure Subscribe_EmptySubject_Raises;
 
     { subscribe }
 
@@ -174,6 +178,8 @@ type
     procedure Msg_ForUnknownSid_IsIgnored;
     [Test]
     procedure Msg_CarriesReplyToSubject;
+    [Test]
+    procedure Msg_BinaryPayload_IsDeliveredIntact;
 
     { headers }
 
@@ -551,13 +557,84 @@ begin
   Assert.AreEqual('PUB foo 6'#13#10 + ACCENTED + #13#10, FSocket.ClientText);
 end;
 
-procedure TNatsConnectionProtocolTests.Publish_EmptySubject_WritesNothing;
+procedure TNatsConnectionProtocolTests.Publish_EmptySubject_Raises;
 begin
   OpenAndHandshake;
 
-  FConn.Publish('', 'hello');
+  // it used to Exit silently, which is easy to debug past for a long time
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('', 'hello');
+    end,
+    ENatsException, 'publishing without a subject must not be silently ignored');
 
-  Assert.AreEqual('', FSocket.ClientText, 'publishing without a subject must not write to the socket');
+  Assert.AreEqual('', FSocket.ClientText, 'and nothing must reach the socket');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_SubjectWithWhitespace_Raises;
+begin
+  OpenAndHandshake;
+
+  { A space would end the subject token and shift every field after it, so the
+    server would read a different message than the one intended - and a line
+    break would desynchronize the stream outright }
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('foo bar', 'hello');
+    end,
+    ENatsException);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('foo'#13#10'PUB evil 3', 'hello');
+    end,
+    ENatsException, 'a subject must not be able to inject a second command');
+
+  Assert.AreEqual('', FSocket.ClientText);
+end;
+
+procedure TNatsConnectionProtocolTests.Subscribe_EmptySubject_Raises;
+begin
+  OpenAndHandshake;
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Subscribe('', LogHandler());
+    end,
+    ENatsException);
+end;
+
+procedure TNatsConnectionProtocolTests.Msg_BinaryPayload_IsDeliveredIntact;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('bin',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d:%d,%d',
+        [Length(AMsg.PayloadData), AMsg.PayloadData[0], AMsg.PayloadData[1]]);
+    end);
+
+  // 0x00 and 0xFF are not valid UTF-8; the string form cannot represent them
+  FSocket.ServerSend(Format('MSG bin %d 3'#13#10, [LSid]));
+  FSocket.ServerSendBytes([0, 255, 65]);
+  FSocket.ServerSend(#13#10);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the binary message was never dispatched');
+  Assert.AreEqual('3:0,255', FMsgLog.Item(0), 'binary payloads must survive byte for byte');
 end;
 
 procedure TNatsConnectionProtocolTests.Subscribe_WritesSubFrame;
@@ -595,7 +672,7 @@ begin
   LSid := FConn.Subscribe('foo.bar', LogHandler());
   FSocket.ClearClientData;
 
-  FConn.Unsubscribe(Cardinal(LSid));
+  FConn.Unsubscribe(LSid);
 
   Assert.AreEqual('UNSUB 1'#13#10, FSocket.ClientText);
   Assert.AreEqual(0, Length(FConn.GetSubscriptionList), 'the subscription must be forgotten');
@@ -609,7 +686,7 @@ begin
   LSid := FConn.Subscribe('foo.bar', LogHandler());
   FSocket.ClearClientData;
 
-  FConn.Unsubscribe(Cardinal(LSid), 5);
+  FConn.Unsubscribe(LSid, 5);
 
   Assert.AreEqual('UNSUB 1 5'#13#10, FSocket.ClientText);
   Assert.AreEqual(1, Length(FConn.GetSubscriptionList),
@@ -642,7 +719,7 @@ begin
   Assert.AreEqual(3, FMsgLog.Count, 'setup: three messages should have arrived');
 
   // the server has already delivered 3, so "stop after 5 in total" leaves 2
-  FConn.Unsubscribe(Cardinal(LSid), 5);
+  FConn.Unsubscribe(LSid, 5);
   Assert.AreEqual(1, Length(FConn.GetSubscriptionList), 'two messages are still expected');
 
   DeliverAndWait('four', 4);
@@ -672,7 +749,7 @@ begin
 
   // the count is already reached: the server drops the subscription as soon as
   // it reads this UNSUB, so the client must not keep it either
-  FConn.Unsubscribe(Cardinal(LSid), 2);
+  FConn.Unsubscribe(LSid, 2);
 
   Assert.AreEqual('UNSUB 1 2'#13#10, FSocket.ClientText, 'the server must still be told');
   Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
@@ -687,7 +764,7 @@ begin
   LSid := FConn.Subscribe('foo.bar', LogHandler());
 
   // nothing received yet, so max_msgs and "how many more" coincide here
-  FConn.Unsubscribe(Cardinal(LSid), 2);
+  FConn.Unsubscribe(LSid, 2);
   Assert.AreEqual(1, Length(FConn.GetSubscriptionList));
 
   FSocket.ServerSend(Format('MSG foo.bar %d 3'#13#10'one'#13#10, [LSid]));

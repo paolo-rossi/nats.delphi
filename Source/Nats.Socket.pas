@@ -87,7 +87,12 @@ type
     procedure SetReadTimeout(const Value: Cardinal); virtual; abstract;
     procedure SetMaxLineLength(const Value: Cardinal); virtual; abstract;
   public
-    constructor Create; virtual; abstract;
+    /// <summary>
+    ///   Virtual but concrete on purpose: an abstract constructor turns
+    ///   "inherited Create" - the obvious thing for an implementor to write -
+    ///   into a runtime Abstract Error with no compile-time warning
+    /// </summary>
+    constructor Create; virtual;
     procedure Open(); virtual; abstract;
     procedure Close(); virtual; abstract;
     procedure SendBytes(const AValue: TBytes); virtual; abstract;
@@ -120,6 +125,13 @@ implementation
 
 uses
   Nats.Exceptions;
+
+{ TNatsSocket }
+
+constructor TNatsSocket.Create;
+begin
+  inherited Create;
+end;
 
 class destructor TNatsSocketRegistry.Destroy;
 begin

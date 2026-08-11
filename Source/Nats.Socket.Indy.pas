@@ -82,6 +82,7 @@ end;
 
 constructor TNatsSocketIndy.Create;
 begin
+  inherited Create;
   FClient := TIdTCPClient.Create(nil);
   { A read timeout is not a connect timeout: an idle connection is normal and
     must not be torn down, so this has to outlast the server's ping interval }

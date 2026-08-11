@@ -79,6 +79,8 @@ type
 
     [Test]
     procedure SetCommandPayload_AttachesPayloadToMsg;
+    [Test]
+    procedure SetCommandPayload_KeepsTheRawBytes;
 
     // [KNOWN BUG §4] ADestHeaders is passed by value, so the caller never sees
     // the parsed headers
@@ -327,9 +329,27 @@ var
   LCommand: TNatsCommand;
 begin
   LCommand := FParser.Parse('MSG foo 1 5');
-  LCommand := FParser.SetCommandPayload(LCommand, 'hello');
+  FParser.SetCommandPayload(LCommand, TEncoding.UTF8.GetBytes('hello'));
 
   Assert.AreEqual('hello', LCommand.GetArgAsMsg.Payload);
+end;
+
+procedure TNatsParserTests.SetCommandPayload_KeepsTheRawBytes;
+var
+  LCommand: TNatsCommand;
+  LBinary: TBytes;
+  LArgs: TNatsArgsMSG;
+begin
+  // 0x00 and 0xFF are not valid UTF-8: decoding to a string loses them
+  LBinary := [0, 255, 16, 200, 7];
+
+  LCommand := FParser.Parse('MSG foo 1 5');
+  FParser.SetCommandPayload(LCommand, LBinary);
+
+  LArgs := LCommand.GetArgAsMsg;
+  Assert.AreEqual(5, Length(LArgs.PayloadData), 'the raw payload must be preserved');
+  Assert.AreEqual<TBytes>(LBinary, LArgs.PayloadData,
+    'a binary payload must survive byte for byte');
 end;
 
 procedure TNatsParserTests.ParseHeaders_FillsTheDestinationArray;

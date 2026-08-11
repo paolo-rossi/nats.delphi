@@ -44,8 +44,10 @@ type
         // Parse headers from a raw string block into ADestHeaders (which is
         // overwritten, hence "var": TNatsHeaders is a dynamic array)
         procedure ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
-        // Set payload for a command (used after headers and payload are read separately)
-        function SetCommandPayload(var ACmd: TNatsCommand; const APayload: string): TNatsCommand;
+        // Attach the payload to a command, once it has been read off the wire.
+        // A procedure, not a function that also takes a var parameter: the old
+        // signature let a caller do both and left it unclear which one mattered
+        procedure SetCommandPayload(var ACommand: TNatsCommand; const APayload: TBytes);
       end;
 
     implementation
@@ -146,21 +148,34 @@ type
       end;
     end;
 
-    function TNatsParser.SetCommandPayload(var ACmd: TNatsCommand; const APayload: string): TNatsCommand;
+    procedure TNatsParser.SetCommandPayload(var ACommand: TNatsCommand; const APayload: TBytes);
     var
       LArg: TNatsArgsMSG;
     begin
-      if (ACmd.CommandType = TNatsCommandServer.MSG) or (ACmd.CommandType = TNatsCommandServer.HMSG) then
-      begin
-        LArg := ACmd.Arguments.AsType<TNatsArgsMSG>;
-        LArg.Payload := APayload;
-        // PayloadBytes should accurately reflect the bytes of the *actual* payload,
-        // not necessarily Length(APayload) if there are multi-byte UTF8 characters.
-        // The server sends the byte count, so we trust that.
-        // This method is more about associating the read payload string with the command.
-        ACmd.Arguments := TValue.From<TNatsArgsMSG>(LArg);
+      if (ACommand.CommandType <> TNatsCommandServer.MSG) and
+         (ACommand.CommandType <> TNatsCommandServer.HMSG) then
+        Exit;
+
+      LArg := ACommand.Arguments.AsType<TNatsArgsMSG>;
+
+      { Keep the bytes as they arrived - decoding to a string is lossy for
+        anything that is not text - and offer the UTF-8 reading alongside.
+        PayloadBytes stays the count the server declared: it is authoritative,
+        and Length(Payload) is not, because a character is not a byte. }
+      LArg.PayloadData := APayload;
+
+      { GetString RAISES on bytes that are not valid UTF-8. Letting that
+        propagate would take the whole connection down over one binary
+        message, so a payload that is not text simply has no string form -
+        PayloadData still holds every byte of it. }
+      try
+        LArg.Payload := TEncoding.UTF8.GetString(APayload);
+      except
+        on E: Exception do
+          LArg.Payload := '';
       end;
-      Result := ACmd;
+
+      ACommand.Arguments := TValue.From<TNatsArgsMSG>(LArg);
     end;
 
     function TNatsParser.ParseINFO(const ACommand: string): TNatsCommand;
