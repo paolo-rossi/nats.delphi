@@ -69,6 +69,7 @@ type
     FQueue: TNatsCommandQueue;
     FError: string;
     procedure DoExecute;
+    procedure ReadMessageBody(var ACommand: TNatsCommand);
   protected
     procedure Execute; override;
   public
@@ -154,8 +155,11 @@ type
   /// </remarks>
   TNatsConnection = class
   private const
+    { The socket being up is not the same as the connection being usable: until
+      CONNECT has been written the server knows nothing about this client }
     STATE_CLOSED = 0;
-    STATE_OPEN = 1;
+    STATE_CONNECTING = 1;   // socket open, waiting for the server's INFO
+    STATE_READY = 2;        // CONNECT written, safe to publish and subscribe
   private
     FChannel: INatsSocket;
     FGenerator: TNatsGenerator;
@@ -166,9 +170,12 @@ type
     FReadQueue: TNatsCommandQueue;
     FConnectHandler: TNatsConnectHandler;
     FDisconnectHandler: TNatsDisconnectHandler;
+    FErrorHandler: TNatsErrorHandler;
     FWriteLock: TCriticalSection;
     FSubsLock: TCriticalSection;
     FState: Integer;
+    FPingOutstanding: Integer;
+    FLastError: string;
 
     { every write to the channel goes through one of these }
     procedure SendCommand(const ALine: string); overload;
@@ -181,12 +188,21 @@ type
     procedure SendSubscribe(AId: Integer; const ASubject, AQueue: string);
 
     function GetConnected: Boolean;
+    function GetReady: Boolean;
+    function GetLastError: string;
     function TakeMessageHandler(AId: Integer; out AHandler: TNatsMsgHandler): Boolean;
     procedure SignalStop;
     procedure JoinThreads;
     procedure CloseChannel;
     procedure ClearSubscriptions;
-    procedure TearDown;
+    procedure TearDown; overload;
+    procedure TearDown(const AError: string); overload;
+    procedure HandleInfo(const AInfo: TNatsServerInfo);
+    /// <summary>
+    ///   Called by the reader when a read times out: an idle connection is not
+    ///   a dead one, so probe it rather than tearing it down
+    /// </summary>
+    procedure PingOnIdle;
   public
     constructor Create;
     destructor Destroy; override;
@@ -221,10 +237,33 @@ type
     function GetSubscriptionList: TArray<TNatsSubscriptionInfo>;
 
     function GetNewInbox():string;
+
+    /// <summary>
+    ///   Blocks until the handshake has completed, i.e. until CONNECT has
+    ///   actually been written. Open only starts the handshake, so publishing
+    ///   or subscribing before this returns True races it
+    /// </summary>
+    function WaitForReady(ATimeoutMs: Cardinal = 5000): Boolean;
   public
     ConnectOptions: TNatsConnectOptions;
     property Name: string read FName write FName;
+    /// <summary>
+    ///   True once the handshake has completed. A socket that is up but has not
+    ///   exchanged INFO/CONNECT yet does not count: the server does not know
+    ///   this client's options, and nothing may be published over it
+    /// </summary>
     property Connected: Boolean read GetConnected;
+    property Ready: Boolean read GetReady;
+    /// <summary>
+    ///   Why the connection last failed; empty after a clean Close
+    /// </summary>
+    property LastError: string read GetLastError;
+    /// <summary>
+    ///   Fires on a protocol error, a dead socket or an -ERR from the server -
+    ///   the failures an application would otherwise never see. Runs on a
+    ///   worker thread
+    /// </summary>
+    property OnError: TNatsErrorHandler read FErrorHandler write FErrorHandler;
     property Reader: TNatsReader read FReader;
     property Consumer: TNatsConsumer read FConsumer;
     //property ConnectOptions: TNatsConnectOptions read FConnectOptions write FConnectOptions;
@@ -289,15 +328,28 @@ end;
 procedure TNatsConnection.Open(AConnectHandler: TNatsConnectHandler;
   ADisconnectHandler: TNatsDisconnectHandler = nil);
 begin
+  if FState <> STATE_CLOSED then
+    Exit; // Already open or opening
+
+  { Reap whatever is left of a previous session before taking the lock: a
+    reader that died on its own is still an unfreed TThread, and simply
+    overwriting FReader/FConsumer below would leak it }
+  SignalStop;
+  JoinThreads;
+
   FWriteLock.Enter;
   try
-    if Connected then
-      Exit; // Already open or opening
-
     FConnectHandler := AConnectHandler;
     FDisconnectHandler := ADisconnectHandler;
+
+    FLastError := '';
+    FPingOutstanding := 0;
+    FReadQueue.Clear;
+
     FChannel.Open;
-    FState := STATE_OPEN;
+    { CONNECTING, not READY: the socket is up but the server has not been told
+      who we are yet, so nothing may be published over it }
+    FState := STATE_CONNECTING;
 
     FReader := TNatsReader.Create(Self);
     FConsumer := TNatsConsumer.Create(Self);
@@ -311,7 +363,38 @@ end;
 
 function TNatsConnection.GetConnected: Boolean;
 begin
-  Result := (FState = STATE_OPEN) and Assigned(FChannel) and FChannel.Connected;
+  Result := (FState = STATE_READY) and Assigned(FChannel) and FChannel.Connected;
+end;
+
+function TNatsConnection.GetReady: Boolean;
+begin
+  Result := GetConnected;
+end;
+
+function TNatsConnection.GetLastError: string;
+begin
+  FWriteLock.Enter;
+  try
+    Result := FLastError;
+  finally
+    FWriteLock.Leave;
+  end;
+end;
+
+function TNatsConnection.WaitForReady(ATimeoutMs: Cardinal): Boolean;
+var
+  LDeadline: UInt64;
+begin
+  LDeadline := TThread.GetTickCount64 + ATimeoutMs;
+  repeat
+    if Connected then
+      Exit(True);
+    if FState = STATE_CLOSED then
+      Exit(False); // the handshake failed outright
+    TThread.Sleep(5);
+  until TThread.GetTickCount64 > LDeadline;
+
+  Result := Connected;
 end;
 
 function TNatsConnection.GetNewInbox: string;
@@ -378,20 +461,96 @@ begin
 end;
 
 procedure TNatsConnection.TearDown;
+begin
+  TearDown('');
+end;
+
+procedure TNatsConnection.TearDown(const AError: string);
 var
   LWasOpen: Boolean;
 begin
   { Safe to call from any thread INCLUDING the workers, because it never joins
-    them - it only asks them to stop. The state flip is atomic, so the
-    disconnect handler runs exactly once however many callers race here. }
-  LWasOpen := TInterlocked.Exchange(FState, STATE_CLOSED) = STATE_OPEN;
+    them - it only asks them to stop. The state flip is atomic, so the handlers
+    run exactly once however many callers race here. }
+  LWasOpen := TInterlocked.Exchange(FState, STATE_CLOSED) <> STATE_CLOSED;
 
   SignalStop;
   CloseChannel;
   ClearSubscriptions;
 
-  if LWasOpen and Assigned(FDisconnectHandler) then
+  { Everything below happens once per connection. Tearing down an already
+    closed connection is a no-op: in particular it must not overwrite the
+    error that closed it, nor invent one when Close simply raced the reader. }
+  if not LWasOpen then
+    Exit;
+
+  if AError <> '' then
+  begin
+    FWriteLock.Enter;
+    try
+      FLastError := AError;
+    finally
+      FWriteLock.Leave;
+    end;
+
+    { An application cannot see a protocol error or a dead socket any other
+      way, so say why before saying that the connection is gone }
+    if Assigned(FErrorHandler) then
+      FErrorHandler(AError);
+  end;
+
+  if Assigned(FDisconnectHandler) then
     FDisconnectHandler();
+end;
+
+procedure TNatsConnection.HandleInfo(const AInfo: TNatsServerInfo);
+begin
+  if FChannel.MaxLineLength > 0 then
+    if AInfo.max_payload > 0 then
+      FChannel.MaxLineLength := AInfo.max_payload * 2;
+
+  { A server sends INFO again during the session - a cluster topology change,
+    or lame duck mode. Answering those with a second CONNECT is a protocol
+    violation, so only the first one drives the handshake. }
+  if FState <> STATE_CONNECTING then
+    Exit;
+
+  if AInfo.tls_required then
+  begin
+    { Carrying on in plaintext just gets the connection dropped by the server
+      with no explanation }
+    TearDown('The server requires TLS, which this client does not support yet ' +
+      '(see §18 in Docs\Core-Protocol-Review.md)');
+    Exit;
+  end;
+
+  if Assigned(FConnectHandler) then
+    FConnectHandler(AInfo, ConnectOptions);
+
+  SendConnect;
+
+  { Only now is the connection usable: the server knows our options and any
+    caller blocked in WaitForReady can proceed }
+  TInterlocked.Exchange(FState, STATE_READY);
+end;
+
+procedure TNatsConnection.PingOnIdle;
+begin
+  { Nothing has arrived for a whole read timeout, which is longer than the
+    server's ping interval - so either the peer is gone or it is very quiet.
+    Probe it once: if the PONG for the previous probe never came, it is gone. }
+  if TInterlocked.CompareExchange(FPingOutstanding, 1, 0) <> 0 then
+  begin
+    TearDown('The server stopped responding: no PONG within the read timeout');
+    Exit;
+  end;
+
+  try
+    SendPing;
+  except
+    on E: Exception do
+      TearDown('Keep-alive PING failed: ' + E.Message);
+  end;
 end;
 
 procedure TNatsConnection.JoinThreads;
@@ -765,71 +924,108 @@ procedure TNatsReader.DoExecute;
 var
   LRead: string;
   LCommand: TNatsCommand;
-  //LStep: Integer;
-
-  LMsgArgs: TNatsArgsMSG;
-  LHeaderBlockBytes: TBytes;
-  LPayloadBlockBytes: TBytes;
 begin
   while not Terminated do
   begin
     if not FChannel.Connected then
     begin
-      if FStopEvent.WaitFor(1000) = wrSignaled then
-        Break;
+      { The peer went away. Nothing else will ever arrive on this socket, so
+        say so instead of spinning here in silence until someone calls Close }
+      if not Terminated then
+        FConnection.TearDown('The connection to the server was lost');
 
-      Continue;
+      Break;
     end;
 
     try
       LRead := FChannel.ReceiveString;
     except
+      on E: ENatsReadTimeout do
+      begin
+        { Not a failure: an idle connection is a healthy one. Probe it. }
+        LRead := '';
+        FConnection.PingOnIdle;
+      end;
       on E: Exception do
       begin
-        LRead := '';
+        { Any other read failure leaves the stream at an unknown offset, so
+          everything after it would be parsed out of alignment. Stop. }
         FError := E.Message;
+        FConnection.TearDown('Read failed: ' + E.Message);
+        Break;
       end;
     end;
 
     if LRead.IsEmpty then
       Continue;
 
-    LCommand := FParser.Parse(LRead);
+    try
+      LCommand := FParser.Parse(LRead);
+    except
+      on E: Exception do
+      begin
+        { Previously this ran outside the try, so one unrecognized line took
+          the reader thread down without a word to anybody }
+        FError := E.Message;
+        FConnection.TearDown('Protocol error: ' + E.Message);
+        Break;
+      end;
+    end;
 
-    if LCommand.CommandType = TNatsCommandServer.MSG then
-    begin
-      LMsgArgs := LCommand.GetArgAsMsg;
-      if LMsgArgs.PayloadBytes > 0 then
-        LPayloadBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.PayloadBytes)
-      else
-        SetLength(LPayloadBlockBytes, 0);
-
-      LRead := FChannel.ReceiveString; // Consume the trailing CRLF after payload
-      LCommand := FParser.SetCommandPayload(LCommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
-    end
-    else if LCommand.CommandType = TNatsCommandServer.HMSG then
-    begin
-      LMsgArgs := LCommand.GetArgAsMsg;
-      { <#header bytes> already covers the CRLFCRLF that terminates the header
-        block, so the next byte is the first payload byte: do NOT read a line here }
-      if LMsgArgs.HeaderBytes > 0 then
-        LHeaderBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.HeaderBytes)
-      else
-        SetLength(LHeaderBlockBytes, 0);
-
-      FParser.ParseHeaders(TEncoding.UTF8.GetString(LHeaderBlockBytes), LMsgArgs.Headers);
-      LCommand.Arguments := TValue.From<TNatsArgsMSG>(LMsgArgs);
-
-      if LMsgArgs.PayloadBytes > 0 then
-        LPayloadBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.PayloadBytes)
-      else
-        SetLength(LPayloadBlockBytes, 0);
-      LRead := FChannel.ReceiveString; // Consume CRLF after payload block
-
-      LCommand := FParser.SetCommandPayload(LCommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
+    try
+      ReadMessageBody(LCommand);
+    except
+      on E: Exception do
+      begin
+        { A half-read body means the stream is no longer aligned with the
+          protocol, so there is nothing sensible to resume from }
+        FError := E.Message;
+        FConnection.TearDown('Failed reading a message body: ' + E.Message);
+        Break;
+      end;
     end;
 
     FQueue.Enqueue(LCommand); // the queue does its own locking and signalling
+  end;
+end;
+
+procedure TNatsReader.ReadMessageBody(var ACommand: TNatsCommand);
+var
+  LMsgArgs: TNatsArgsMSG;
+  LHeaderBlockBytes: TBytes;
+  LPayloadBlockBytes: TBytes;
+begin
+  if ACommand.CommandType = TNatsCommandServer.MSG then
+  begin
+    LMsgArgs := ACommand.GetArgAsMsg;
+    if LMsgArgs.PayloadBytes > 0 then
+      LPayloadBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.PayloadBytes)
+    else
+      SetLength(LPayloadBlockBytes, 0);
+
+    FChannel.ReceiveString; // Consume the trailing CRLF after payload
+    ACommand := FParser.SetCommandPayload(ACommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
+  end
+  else if ACommand.CommandType = TNatsCommandServer.HMSG then
+  begin
+    LMsgArgs := ACommand.GetArgAsMsg;
+    { <#header bytes> already covers the CRLFCRLF that terminates the header
+      block, so the next byte is the first payload byte: do NOT read a line here }
+    if LMsgArgs.HeaderBytes > 0 then
+      LHeaderBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.HeaderBytes)
+    else
+      SetLength(LHeaderBlockBytes, 0);
+
+    FParser.ParseHeaders(TEncoding.UTF8.GetString(LHeaderBlockBytes), LMsgArgs.Headers);
+    ACommand.Arguments := TValue.From<TNatsArgsMSG>(LMsgArgs);
+
+    if LMsgArgs.PayloadBytes > 0 then
+      LPayloadBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.PayloadBytes)
+    else
+      SetLength(LPayloadBlockBytes, 0);
+    FChannel.ReceiveString; // Consume CRLF after payload block
+
+    ACommand := FParser.SetCommandPayload(ACommand, TEncoding.UTF8.GetString(LPayloadBlockBytes));
   end;
 end;
 
@@ -905,15 +1101,10 @@ begin
       case LCommand.CommandType of
         TNatsCommandServer.INFO:
         begin
-          { TODO -opaolo -c : read the TLSs parameters and (if) upgrade the connection 23/06/2022 11:00:44 }
-          if Assigned(FConnection.FConnectHandler) then
-            FConnection.FConnectHandler(LCommand.GetArgAsInfo.INFO, FConnection.ConnectOptions);
-
-          if (FConnection.FChannel.MaxLineLength > 0) and (LCommand.GetArgAsInfo.Info.max_payload > 0) then
-            FConnection.FChannel.MaxLineLength := LCommand.GetArgAsInfo.INFO.max_payload * 2;
-
-          { Send CONNECT message to NATS }
-          FConnection.SendConnect;
+          { The whole handshake - TLS check, connect handler, CONNECT, and the
+            move to READY - lives in the connection, because only the first
+            INFO drives it }
+          FConnection.HandleInfo(LCommand.GetArgAsInfo.Info);
         end;
 
         TNatsCommandServer.Ping:
@@ -923,7 +1114,8 @@ begin
 
         TNatsCommandServer.PONG:
         begin
-          { TODO -opaolo -c : Manage an handler set on the Ping? 23/06/2022 11:03:35 }
+          { the answer to our keep-alive probe: the peer is alive }
+          TInterlocked.Exchange(FConnection.FPingOutstanding, 0);
         end;
 
         TNatsCommandServer.MSG,
@@ -944,7 +1136,7 @@ begin
 
         TNatsCommandServer.ERR:
         begin
-          FError := 'ERR from server: ' + LCommand.Arguments.ToString; // Placeholder
+          FError := 'ERR from server: ' + LCommand.GetArgAsErr;
           LShouldDisconnect := True;
           Break;
         end;
@@ -954,7 +1146,7 @@ begin
   { TearDown, never Close: Close joins the worker threads and this IS one of
     them, so it would wait for itself forever }
   if LShouldDisconnect then
-    FConnection.TearDown;
+    FConnection.TearDown(FError);
 end;
 
 procedure TNatsConsumer.Execute;

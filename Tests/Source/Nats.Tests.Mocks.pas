@@ -42,8 +42,14 @@ type
   /// </summary>
   TNatsMockSocket = class(TNatsSocket)
   public const
-    /// Mirrors Indy's ReadTimeout. Kept short so tests fail fast instead of hanging.
-    DEFAULT_READ_TIMEOUT = 200;
+    /// <summary>
+    ///   Long by default so an idle test connection is never mistaken for a
+    ///   dead one and probed with a keep-alive PING. A test that wants to
+    ///   exercise the idle path sets a short one explicitly. Shutdown does not
+    ///   depend on this: Close closes the channel, and the read notices within
+    ///   POLL_INTERVAL.
+    /// </summary>
+    DEFAULT_READ_TIMEOUT = 30000;
     POLL_INTERVAL = 5;
   public
     /// <summary>
@@ -418,7 +424,9 @@ begin
     TThread.Sleep(POLL_INTERVAL);
   until TThread.GetTickCount64 > LDeadline;
 
-  raise ENatsMock.Create('Mock socket: read timeout waiting for a line');
+  { ENatsReadTimeout, like the Indy adapter: an idle connection is not a broken
+    one, and the reader must be able to tell the difference }
+  raise ENatsReadTimeout.Create('Mock socket: read timeout waiting for a line');
 end;
 
 function TNatsMockSocket.ReceiveBytes: TBytes;

@@ -29,6 +29,20 @@ uses
 type
   ENatsException = class(Exception);
 
+  /// <summary>
+  ///   A read exceeded the socket's read timeout. Distinct from every other
+  ///   socket failure because it is not by itself fatal: an idle connection is
+  ///   healthy, and the client answers it with a keep-alive PING rather than
+  ///   tearing the connection down
+  /// </summary>
+  ENatsReadTimeout = class(ENatsException);
+
+  /// <summary>
+  ///   The peer sent something this client cannot make sense of. The stream can
+  ///   no longer be trusted to be aligned, so the connection is torn down
+  /// </summary>
+  ENatsProtocolError = class(ENatsException);
+
 implementation
 
 end.

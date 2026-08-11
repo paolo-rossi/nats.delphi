@@ -79,6 +79,10 @@ type
 
     function GetArgAsInfo: TNatsArgsINFO;
     function GetArgAsMsg: TNatsArgsMSG;
+    /// <summary>
+    ///   The text the server sent with -ERR, e.g. 'Authorization Violation'
+    /// </summary>
+    function GetArgAsErr: string;
   end;
 
   /// <summary>
@@ -112,6 +116,12 @@ type
   TNatsPingHandler = reference to procedure ();
   TNatsConnectHandler = reference to procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions);
   TNatsDisconnectHandler = reference to procedure ();
+  /// <summary>
+  ///   Called when the connection fails for a reason the application cannot
+  ///   otherwise see: a protocol error, a dead socket, or an -ERR from the
+  ///   server. Runs on a worker thread, so it must be thread safe
+  /// </summary>
+  TNatsErrorHandler = reference to procedure (const AError: string);
 
   TNatsThread = class abstract(TThread)
   protected
@@ -236,6 +246,13 @@ end;
 function TNatsCommand.GetArgAsMsg: TNatsArgsMSG;
 begin
   Result := Arguments.AsType<TNatsArgsMSG>;
+end;
+
+function TNatsCommand.GetArgAsErr: string;
+begin
+  if Arguments.IsEmpty or not Arguments.IsType<string> then
+    Exit('');
+  Result := Arguments.AsString;
 end;
 
 { TNatsArgsINFO }

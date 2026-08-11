@@ -144,34 +144,20 @@ begin
       FHandshakeDone := True;
     end);
 
-  // Open() returns as soon as the TCP socket is up; CONNECT is only sent once
-  // the consumer thread has seen INFO (see §16), so publishing before this
-  // point can race the handshake
-  Assert.IsTrue(WaitForCondition(
-    function: Boolean
-    begin
-      Result := FHandshakeDone;
-    end,
-    WAIT_MS),
-    Format('no INFO from nats-server at %s:%d - is one running?',
-      [LIVE_HOST, NatsConstants.DEFAULT_PORT]));
+  { Open only starts the handshake. WaitForReady is what guarantees CONNECT is
+    actually on the wire before anything is published over it (§16) - waiting
+    on the connect handler is not enough, because that runs *before* CONNECT is
+    written.
 
-  // ------------------------------------------------------------------
-  // There used to be a 250 ms sleep here. Before the §7-§12 work these tests
-  // were flaky without it - 3 consecutive runs gave 9 passed / 2 failed /
-  // hung - because writes were not serialized (§10), so the SUB issued on this
-  // thread could be spliced into the CONNECT line written by the consumer
-  // thread, and the server's -ERR then tripped the §9 self-join deadlock.
-  //
-  // With §9 and §10 fixed the sleep is no longer needed: 6 consecutive runs
-  // are clean without it, so it has been removed rather than left as padding.
-  //
-  // §16 is still open - the connect handler runs BEFORE SendConnect, so a
-  // subscription issued the moment the handler returns can still reach the
-  // server ahead of the CONNECT. nats-server tolerates that when no
-  // authentication is required. If these tests ever turn flaky again against
-  // an authenticated server, that is the reason.
-  // ------------------------------------------------------------------
+    There used to be a 250 ms sleep here instead. Before the §7-§12 work these
+    tests were flaky without it - 3 consecutive runs gave 9 passed / 2 failed /
+    hung - because writes were not serialized (§10) and the resulting -ERR
+    tripped the §9 self-join deadlock. }
+  Assert.IsTrue(FConn.WaitForReady(WAIT_MS),
+    Format('handshake with nats-server at %s:%d did not complete - is one running? %s',
+      [LIVE_HOST, NatsConstants.DEFAULT_PORT, FConn.LastError]));
+
+  Assert.IsTrue(FHandshakeDone, 'the connect handler must have run by then');
 end;
 
 procedure TNatsLiveServerTests.Handshake_CompletesAgainstARealServer;

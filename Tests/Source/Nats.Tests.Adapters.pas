@@ -314,7 +314,7 @@ begin
     begin
       FSocket.ReceiveString;
     end,
-    ENatsMock, 'the mock must time out like Indy does, never block forever');
+    ENatsReadTimeout, 'the mock must time out like Indy does, never block forever');
 end;
 
 { TNatsChannelTimeoutTests }

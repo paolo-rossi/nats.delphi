@@ -199,7 +199,7 @@ begin
     begin
       FParser.Parse(NatsConstants.Protocol.INFO);
     end,
-    ENatsException, 'INFO without a JSON payload must be rejected');
+    ENatsProtocolError, 'INFO without a JSON payload must be rejected');
 end;
 
 procedure TNatsParserTests.Parse_PING_ReturnsPingCommand;
@@ -231,7 +231,7 @@ begin
     begin
       FParser.Parse('WAT this is not nats');
     end,
-    ENatsException);
+    ENatsProtocolError);
 end;
 
 procedure TNatsParserTests.Parse_MSG_WithoutReplyTo;
@@ -267,7 +267,7 @@ begin
     begin
       FParser.Parse('MSG foo.bar not-a-number 11');
     end,
-    ENatsException);
+    ENatsProtocolError);
 end;
 
 procedure TNatsParserTests.Parse_MSG_TooFewArguments_Raises;
@@ -277,7 +277,7 @@ begin
     begin
       FParser.Parse('MSG foo.bar 7');
     end,
-    ENatsException);
+    ENatsProtocolError);
 end;
 
 procedure TNatsParserTests.Parse_HMSG_IsNotParsedAsMSG;
@@ -319,7 +319,7 @@ begin
     begin
       FParser.Parse('HMSG foo 1 30 23');
     end,
-    ENatsException);
+    ENatsProtocolError);
 end;
 
 procedure TNatsParserTests.SetCommandPayload_AttachesPayloadToMsg;

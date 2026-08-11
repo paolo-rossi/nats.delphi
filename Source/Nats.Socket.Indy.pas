@@ -25,7 +25,7 @@ interface
 
 uses
   System.SysUtils, System.Classes,
-  IdTCPClient, IdTCPConnection, IdGlobal,
+  IdTCPClient, IdTCPConnection, IdGlobal, IdExceptionCore,
   Nats.Consts,
   Nats.Socket,
   Nats.Exceptions;
@@ -145,7 +145,9 @@ begin
 
   try
     FClient.Connect;
-    FClient.IOHandler.MaxLineAction := maSplit;
+    { maSplit would silently cut an over-long line in two and hand us both
+      halves as if they were commands; maException surfaces it instead }
+    FClient.IOHandler.MaxLineAction := maException;
   except
     on E: Exception do
       raise ENatsException.CreateFmt('Failed to connect to NATS server %s:%d. Error: %s', [FClient.Host, FClient.Port, E.Message]);
@@ -163,6 +165,12 @@ end;
 function TNatsSocketIndy.ReceiveString: string;
 begin
   Result := FClient.IOHandler.ReadLn(NatsConstants.CR_LF, IndyTextEncoding_UTF8);
+
+  { Indy swallows the timeout and returns an empty line, which is
+    indistinguishable from a protocol error unless we translate it. The caller
+    treats a timeout as "idle", not as a failure }
+  if FClient.IOHandler.ReadLnTimedout then
+    raise ENatsReadTimeout.Create('No data from the server within the read timeout');
 end;
 
 function TNatsSocketIndy.ReceiveExactBytes(ACount: Integer): TBytes;
@@ -178,7 +186,16 @@ begin
     raise ENatsException.Create('IOHandler not assigned in TNatsSocketIndy.ReceiveExactBytes');
 
   // ReadBytes reads exactly ACount bytes into LIdBytes.
-  FClient.IOHandler.ReadBytes(LIdBytes, ACount, False); // False for AAppend (replace content)
+  try
+    FClient.IOHandler.ReadBytes(LIdBytes, ACount, False); // False for AAppend (replace content)
+  except
+    on E: EIdReadTimeout do
+      { mid-message, so unlike a timeout waiting for the next command this one
+        leaves the stream desynchronized - it is a hard failure }
+      raise ENatsException.CreateFmt(
+        'Timed out after %d bytes of a %d byte block; the stream is out of sync',
+        [Length(LIdBytes), ACount]);
+  end;
   Result := IdBytesToBytes(LIdBytes);
 
   if Length(Result) <> ACount then // Should not happen if ReadBytes succeeds without exception

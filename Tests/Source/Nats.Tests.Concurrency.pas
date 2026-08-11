@@ -56,7 +56,9 @@ type
     FConn: TNatsConnection;
     FSocket: TNatsMockSocket;
     FLog: TNatsTestLog;
+    procedure OpenConnection;
     procedure OpenAndHandshake;
+    function WaitForLog(const AText: string): Boolean;
   public
     [Setup]
     procedure Setup;
@@ -68,9 +70,35 @@ type
     [Test]
     procedure ConcurrentWrites_AreNotInterleavedOnTheSocket;
 
-    // [KNOWN BUG §14] one unparsable line kills the reader thread silently
+    // §14: a failure must never be silent
     [Test]
-    procedure Reader_SurvivesAnUnparsableCommand;
+    procedure Reader_UnparsableCommand_TearsDownAndReportsIt;
+    [Test]
+    procedure Reader_ServerError_ReportsTheServersReason;
+
+    // §15: a server-side disconnect must reach the application
+    [Test]
+    procedure ServerDisconnect_IsReportedToTheApplication;
+    [Test]
+    procedure IdleConnection_IsProbedWithAKeepAlivePing;
+    [Test]
+    procedure MissedPong_TearsDownAndReportsIt;
+
+    // §16: "connected" must mean the handshake finished
+    [Test]
+    procedure Connected_IsFalseUntilTheHandshakeCompletes;
+    [Test]
+    procedure WaitForReady_ReturnsFalseWhenNoInfoArrives;
+    [Test]
+    procedure SecondInfo_DoesNotResendConnect;
+
+    // §17: a session that died on its own must not leak into the next one
+    [Test]
+    procedure Open_AfterAFailure_StartsACleanSession;
+
+    // §18
+    [Test]
+    procedure Info_RequiringTls_TearsDownWithAClearError;
 
     [Test]
     procedure Close_ThenOpen_RestartsTheConnection;
@@ -78,6 +106,8 @@ type
     procedure Close_InvokesTheDisconnectHandler;
     [Test]
     procedure Close_WhenNeverOpened_DoesNotRaise;
+    [Test]
+    procedure Close_LeavesNoError;
 
     // §8: the dictionary owns its values, so an Unsubscribe must not free a
     // subscription out from under a dispatch in flight
@@ -220,8 +250,14 @@ begin
   FLog.Free;
 end;
 
-procedure TNatsConnectionConcurrencyTests.OpenAndHandshake;
+procedure TNatsConnectionConcurrencyTests.OpenConnection;
 begin
+  FConn.OnError :=
+    procedure (const AError: string)
+    begin
+      FLog.Add('ERROR:' + AError);
+    end;
+
   FConn.Open(
     procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
     begin
@@ -231,10 +267,180 @@ begin
     begin
       FLog.Add('DISCONNECT');
     end);
+end;
+
+procedure TNatsConnectionConcurrencyTests.OpenAndHandshake;
+begin
+  OpenConnection;
 
   FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON);
-  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.CONNECT), 'handshake did not complete');
+  Assert.IsTrue(FConn.WaitForReady(3000), 'handshake did not complete');
   FSocket.ClearClientData;
+end;
+
+function TNatsConnectionConcurrencyTests.WaitForLog(const AText: string): Boolean;
+begin
+  Result := WaitForCondition(
+    function: Boolean
+    var
+      LEntry: string;
+    begin
+      Result := False;
+      for LEntry in FLog.ToArray do
+        if LEntry.StartsWith(AText) then
+          Exit(True);
+    end);
+end;
+
+procedure TNatsConnectionConcurrencyTests.Reader_UnparsableCommand_TearsDownAndReportsIt;
+begin
+  OpenAndHandshake;
+
+  { The old version of this test asserted the reader carried on delivering
+    afterwards. That was the wrong contract: an unknown protocol operation
+    means the stream can no longer be trusted to be aligned, and every other
+    NATS client treats it as fatal. What §14 is really about is that the
+    failure used to be SILENT - the reader thread died and nobody was told. }
+  FSocket.ServerSendLine('NONSENSE not a nats command');
+
+  Assert.IsTrue(WaitForLog('ERROR:Protocol error'),
+    'a protocol error must reach the error handler, log was: ' + FLog.Text);
+  Assert.IsTrue(FLog.Contains('DISCONNECT'), 'and the connection must be reported as gone');
+  Assert.IsFalse(FConn.Connected, 'and it must not still claim to be connected');
+  Assert.IsTrue(FConn.LastError.Contains('Protocol error'), 'LastError: ' + FConn.LastError);
+end;
+
+procedure TNatsConnectionConcurrencyTests.Reader_ServerError_ReportsTheServersReason;
+begin
+  OpenAndHandshake;
+
+  FSocket.ServerSendLine(NatsConstants.Protocol.ERR + ' ''Authorization Violation''');
+
+  Assert.IsTrue(WaitForLog('ERROR:'), 'the -ERR must reach the error handler, log was: ' + FLog.Text);
+  // the reason used to be discarded by the parser entirely
+  Assert.IsTrue(FConn.LastError.Contains('Authorization Violation'),
+    'the server''s reason must be preserved, got: ' + FConn.LastError);
+end;
+
+procedure TNatsConnectionConcurrencyTests.ServerDisconnect_IsReportedToTheApplication;
+begin
+  OpenAndHandshake;
+
+  // the peer goes away without a word
+  FSocket.Close;
+
+  Assert.IsTrue(WaitForLog('ERROR:'),
+    'losing the connection must be reported, not silently ignored; log was: ' + FLog.Text);
+  Assert.IsTrue(FLog.Contains('DISCONNECT'), 'the disconnect handler must run');
+  Assert.IsFalse(FConn.Connected);
+end;
+
+procedure TNatsConnectionConcurrencyTests.IdleConnection_IsProbedWithAKeepAlivePing;
+begin
+  // short read timeout so "idle" happens within the test's lifetime
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT, 200);
+  OpenAndHandshake;
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.PING),
+    'an idle connection must be probed rather than assumed dead or assumed alive');
+
+  // answering the probe keeps it alive
+  FSocket.ServerSendLine(NatsConstants.Protocol.PONG);
+  TThread.Sleep(300);
+
+  Assert.IsTrue(FConn.Connected, 'a PONG must keep the connection alive');
+  Assert.IsFalse(FLog.Contains('DISCONNECT'), 'log was: ' + FLog.Text);
+end;
+
+procedure TNatsConnectionConcurrencyTests.MissedPong_TearsDownAndReportsIt;
+begin
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT, 200);
+  OpenAndHandshake;
+
+  // never answer the keep-alive: the peer is a black hole
+  Assert.IsTrue(WaitForLog('ERROR:'),
+    'an unanswered keep-alive must tear the connection down; log was: ' + FLog.Text);
+  Assert.IsTrue(FConn.LastError.Contains('PONG'), 'LastError: ' + FConn.LastError);
+  Assert.IsFalse(FConn.Connected);
+end;
+
+procedure TNatsConnectionConcurrencyTests.Connected_IsFalseUntilTheHandshakeCompletes;
+begin
+  OpenConnection;
+
+  { The socket is up, but the server has not been told who we are, so nothing
+    may be published yet - Connected must not claim otherwise }
+  Assert.IsFalse(FConn.Connected, 'the socket being open is not the same as being connected');
+
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON);
+
+  Assert.IsTrue(FConn.WaitForReady(3000), 'WaitForReady must return once CONNECT has been written');
+  Assert.IsTrue(FConn.Connected);
+  Assert.IsTrue(FSocket.ClientText.Contains(NatsConstants.Protocol.CONNECT),
+    'and CONNECT really is on the wire by then');
+end;
+
+procedure TNatsConnectionConcurrencyTests.WaitForReady_ReturnsFalseWhenNoInfoArrives;
+begin
+  OpenConnection;
+
+  // no INFO is ever sent
+  Assert.IsFalse(FConn.WaitForReady(300), 'a handshake that never happens must not report ready');
+end;
+
+procedure TNatsConnectionConcurrencyTests.SecondInfo_DoesNotResendConnect;
+begin
+  OpenAndHandshake; // clears the captured wire data
+
+  // servers send INFO again on cluster changes and lame duck mode
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON);
+  TThread.Sleep(300);
+
+  Assert.IsFalse(FSocket.ClientText.Contains(NatsConstants.Protocol.CONNECT),
+    'a second CONNECT is a protocol violation, wrote: ' + FSocket.ClientText);
+  Assert.IsTrue(FConn.Connected, 'and the connection must survive it');
+end;
+
+procedure TNatsConnectionConcurrencyTests.Open_AfterAFailure_StartsACleanSession;
+begin
+  OpenAndHandshake;
+
+  FSocket.ServerSendLine('NONSENSE not a nats command');
+  Assert.IsTrue(WaitForLog('ERROR:'), 'setup: the session should have failed');
+
+  { Re-opening has to reap the threads of the dead session rather than
+    overwrite them, and must not inherit its error }
+  FSocket.ClearClientData;
+  OpenAndHandshake;
+
+  Assert.IsTrue(FConn.Connected, 'the connection must be usable again');
+  Assert.AreEqual('', FConn.LastError, 'a new session must not inherit the old error');
+  Assert.AreEqual(2, FSocket.OpenCount, 'the channel must have been reopened');
+end;
+
+procedure TNatsConnectionConcurrencyTests.Info_RequiringTls_TearsDownWithAClearError;
+begin
+  OpenConnection;
+
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO +
+    ' {"server_name":"nats-1","proto":1,"tls_required":true,"max_payload":1048576}');
+
+  { Carrying on in plaintext just gets the connection dropped by the server
+    with no explanation }
+  Assert.IsTrue(WaitForLog('ERROR:'),
+    'a TLS-only server must produce a clear error; log was: ' + FLog.Text);
+  Assert.IsTrue(FConn.LastError.Contains('TLS'), 'LastError: ' + FConn.LastError);
+  Assert.IsFalse(FSocket.ClientText.Contains(NatsConstants.Protocol.CONNECT),
+    'and CONNECT must not be sent in the clear');
+end;
+
+procedure TNatsConnectionConcurrencyTests.Close_LeavesNoError;
+begin
+  OpenAndHandshake;
+
+  FConn.Close;
+
+  Assert.AreEqual('', FConn.LastError, 'a deliberate Close is not a failure');
 end;
 
 procedure TNatsConnectionConcurrencyTests.ConcurrentWrites_AreNotInterleavedOnTheSocket;
@@ -273,31 +479,6 @@ begin
     on E: ENatsMock do
       Assert.Fail(E.Message);
   end;
-end;
-
-procedure TNatsConnectionConcurrencyTests.Reader_SurvivesAnUnparsableCommand;
-var
-  LSid: Integer;
-begin
-  OpenAndHandshake;
-  LSid := FConn.Subscribe('foo',
-    procedure (const AMsg: TNatsArgsMSG)
-    begin
-      FLog.Add('MSG:' + AMsg.Payload);
-    end);
-
-  // an unknown control line must not be fatal
-  FSocket.ServerSendLine('NONSENSE not a nats command');
-  FSocket.ServerSend(Format('MSG foo %d 5'#13#10'hello'#13#10, [LSid]));
-
-  // [KNOWN BUG §14] FParser.Parse runs outside the reader's try/except, so the
-  // reader thread dies and nothing is ever delivered again
-  Assert.IsTrue(WaitForCondition(
-    function: Boolean
-    begin
-      Result := FLog.Contains('MSG:hello');
-    end),
-    'the reader must keep working after an unparsable command, log was: ' + FLog.Text);
 end;
 
 procedure TNatsConnectionConcurrencyTests.Close_ThenOpen_RestartsTheConnection;

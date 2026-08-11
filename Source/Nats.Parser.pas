@@ -97,10 +97,14 @@ type
       if LTrimmedCmd.StartsWith(NatsConstants.Protocol.ERR) then
       begin
         Result.CommandType := TNatsCommandServer.ERR;
+        { keep the reason - 'Authorization Violation' and 'Permissions
+          Violation' need to reach the application, not be thrown away }
+        Result.Arguments := TValue.From<string>(
+          Trim(LTrimmedCmd.Substring(Length(NatsConstants.Protocol.ERR))).DeQuotedString(''''));
         Exit(Result);
       end;
 
-      raise ENatsException.Create('Parsing error or NATS command not supported: ' + ACommand);
+      raise ENatsProtocolError.Create('Parsing error or NATS command not supported: ' + ACommand);
     end;
 
     procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
@@ -169,7 +173,7 @@ type
       // Example: "INFO {...}"
       LJsonInfoPart := Trim(Copy(ACommand, Length(NatsConstants.Protocol.INFO) + 2, MaxInt));
       if LJsonInfoPart = '' then
-        raise ENatsException.Create('Malformed NATS command received (INFO): Missing JSON payload. Command: ' + ACommand);
+        raise ENatsProtocolError.Create('Malformed NATS command received (INFO): Missing JSON payload. Command: ' + ACommand);
 
       LArg.InfoStr := LJsonInfoPart;
       Result.Arguments := TValue.From<TNatsArgsINFO>(LArg);
@@ -185,23 +189,23 @@ type
       LSplit := ACommand.Split([NatsConstants.SPC]);
       // MSG <subject> <sid> [reply-to] <#bytes>
       if (Length(LSplit) < 4) or (Length(LSplit) > 5) then
-         raise ENatsException.Create('Malformed NATS command received (MSG): Incorrect number of arguments. Command: ' + ACommand);
+         raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Incorrect number of arguments. Command: ' + ACommand);
 
       LArg.Subject := LSplit[1];
       LArg.Id := StrToIntDef(LSplit[2], -1);
-      if LArg.Id = -1 then raise ENatsException.Create('Malformed NATS command received (MSG): Invalid SID. Command: ' + ACommand);
+      if LArg.Id = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Invalid SID. Command: ' + ACommand);
 
       if Length(LSplit) = 4 then // MSG <subject> <sid> <#bytes>
       begin
         LArg.ReplyTo := '';
         LArg.PayloadBytes := StrToIntDef(LSplit[3], -1);
-        if LArg.PayloadBytes = -1 then raise ENatsException.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
+        if LArg.PayloadBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
       end
       else // Length(LSplit) = 5 then // MSG <subject> <sid> <reply-to> <#bytes>
       begin
         LArg.ReplyTo := LSplit[3];
         LArg.PayloadBytes := StrToIntDef(LSplit[4], -1);
-         if LArg.PayloadBytes = -1 then raise ENatsException.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
+         if LArg.PayloadBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
       end;
 
       LArg.HeaderBytes := 0;
@@ -219,11 +223,11 @@ type
       LSplit := ACommand.Split([NatsConstants.SPC]);
       // HMSG <subject> <sid> [reply-to] <#header_bytes> <#total_bytes>
       if (Length(LSplit) < 5) or (Length(LSplit) > 6) then
-        raise ENatsException.Create('Malformed NATS command received (HMSG): Incorrect number of arguments. Command: ' + ACommand);
+        raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Incorrect number of arguments. Command: ' + ACommand);
 
       LArg.Subject := LSplit[1];
       LArg.Id := StrToIntDef(LSplit[2], -1);
-      if LArg.Id = -1 then raise ENatsException.Create('Malformed NATS command received (HMSG): Invalid SID. Command: ' + ACommand);
+      if LArg.Id = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Invalid SID. Command: ' + ACommand);
 
       if Length(LSplit) = 5 then // HMSG <subject> <sid> <#header_bytes> <#total_bytes>
       begin
@@ -238,12 +242,12 @@ type
         LArg.TotalMsgBytes := StrToIntDef(LSplit[5], -1);
       end;
 
-      if LArg.HeaderBytes = -1 then raise ENatsException.Create('Malformed NATS command received (HMSG): Invalid header bytes. Command: ' + ACommand);
-      if LArg.TotalMsgBytes = -1 then raise ENatsException.Create('Malformed NATS command received (HMSG): Invalid total bytes. Command: ' + ACommand);
+      if LArg.HeaderBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Invalid header bytes. Command: ' + ACommand);
+      if LArg.TotalMsgBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Invalid total bytes. Command: ' + ACommand);
 
       LArg.PayloadBytes := LArg.TotalMsgBytes - LArg.HeaderBytes;
       if LArg.PayloadBytes < 0 then
-        raise ENatsException.Create('Invalid byte counts in HMSG: HeaderBytes > TotalMsgBytes. Command: ' + ACommand);
+        raise ENatsProtocolError.Create('Invalid byte counts in HMSG: HeaderBytes > TotalMsgBytes. Command: ' + ACommand);
 
       Result.Arguments := TValue.From<TNatsArgsMSG>(LArg);
     end;
