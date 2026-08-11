@@ -422,6 +422,7 @@ end;
 procedure TNatsConnection.Unsubscribe(AId: Cardinal; AMaxMsg: Cardinal = 0);
 var
   LSub: TNatsSubscription;
+  LRemaining: Integer;
 begin
   FLock.Enter;
   try
@@ -439,7 +440,22 @@ begin
       Exit;
     end;
 
-    LSub.Remaining := AMaxMsg;
+    { <max_msgs> is the TOTAL the server will have delivered on this sid before
+      it drops the subscription, not "this many more". So what is still to come
+      is <max_msgs> minus what has already arrived, and if that count is already
+      reached the server drops the subscription the moment it reads this UNSUB -
+      so drop ours too, otherwise it would linger forever.
+
+      NOTE: LSub.Received is maintained by the consumer thread, which does not
+      take FLock (see §7/§8 in Docs\Core-Protocol-Review.md); this read is
+      therefore still racy until subscription access is serialized. }
+    LSub.Expected := AMaxMsg;
+    LRemaining := Integer(AMaxMsg) - LSub.Received;
+
+    if LRemaining <= 0 then
+      FSubscriptions.Remove(AId)
+    else
+      LSub.Remaining := LRemaining;
   finally
     FLock.Leave;
   end;

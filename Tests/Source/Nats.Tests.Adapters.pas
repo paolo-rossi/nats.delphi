@@ -128,6 +128,13 @@ type
     procedure Unsubscribe_WritesUnsubFrame;
     [Test]
     procedure Unsubscribe_WithMaxMessages_WritesMaxCount;
+    // §5: <max_msgs> is the total delivered on the sid, not "this many more"
+    [Test]
+    procedure Unsubscribe_WithMax_CountsMessagesAlreadyReceived;
+    [Test]
+    procedure Unsubscribe_WithMaxAlreadyReached_DropsTheSubscriptionAtOnce;
+    [Test]
+    procedure Unsubscribe_WithMax_DropsTheSubscriptionAfterTheLastMessage;
     [Test]
     procedure Unsubscribe_BySubject_WritesUnsubFrame;
     [Test]
@@ -521,6 +528,92 @@ begin
   Assert.AreEqual('UNSUB 1 5'#13#10, FSocket.ClientText);
   Assert.AreEqual(1, Length(FConn.GetSubscriptionList),
     'the subscription stays until the server has delivered the remaining messages');
+end;
+
+procedure TNatsConnectionProtocolTests.Unsubscribe_WithMax_CountsMessagesAlreadyReceived;
+var
+  LSid: Integer;
+
+  { ASCII payloads only: the frame declares Length(APayload) as a byte count }
+  procedure DeliverAndWait(const APayload: string; AExpectedCount: Integer);
+  begin
+    FSocket.ServerSend(Format('MSG foo.bar %d %d'#13#10'%s'#13#10,
+      [LSid, Length(APayload), APayload]));
+    WaitForCondition(
+      function: Boolean
+      begin
+        Result := FMsgLog.Count >= AExpectedCount;
+      end);
+  end;
+
+begin
+  OpenAndHandshake;
+  LSid := FConn.Subscribe('foo.bar', LogHandler());
+
+  DeliverAndWait('one', 1);
+  DeliverAndWait('two', 2);
+  DeliverAndWait('333', 3);
+  Assert.AreEqual(3, FMsgLog.Count, 'setup: three messages should have arrived');
+
+  // the server has already delivered 3, so "stop after 5 in total" leaves 2
+  FConn.Unsubscribe(Cardinal(LSid), 5);
+  Assert.AreEqual(1, Length(FConn.GetSubscriptionList), 'two messages are still expected');
+
+  DeliverAndWait('four', 4);
+  Assert.AreEqual(1, Length(FConn.GetSubscriptionList), 'one message is still expected');
+
+  DeliverAndWait('five', 5);
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'the subscription must be dropped once max_msgs messages have arrived in total');
+end;
+
+procedure TNatsConnectionProtocolTests.Unsubscribe_WithMaxAlreadyReached_DropsTheSubscriptionAtOnce;
+var
+  LSid: Integer;
+begin
+  OpenAndHandshake;
+  LSid := FConn.Subscribe('foo.bar', LogHandler());
+
+  FSocket.ServerSend(Format('MSG foo.bar %d 3'#13#10'one'#13#10, [LSid]));
+  FSocket.ServerSend(Format('MSG foo.bar %d 3'#13#10'two'#13#10, [LSid]));
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count >= 2;
+    end),
+    'setup: two messages should have arrived');
+  FSocket.ClearClientData;
+
+  // the count is already reached: the server drops the subscription as soon as
+  // it reads this UNSUB, so the client must not keep it either
+  FConn.Unsubscribe(Cardinal(LSid), 2);
+
+  Assert.AreEqual('UNSUB 1 2'#13#10, FSocket.ClientText, 'the server must still be told');
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'a subscription that has already reached max_msgs must not linger');
+end;
+
+procedure TNatsConnectionProtocolTests.Unsubscribe_WithMax_DropsTheSubscriptionAfterTheLastMessage;
+var
+  LSid: Integer;
+begin
+  OpenAndHandshake;
+  LSid := FConn.Subscribe('foo.bar', LogHandler());
+
+  // nothing received yet, so max_msgs and "how many more" coincide here
+  FConn.Unsubscribe(Cardinal(LSid), 2);
+  Assert.AreEqual(1, Length(FConn.GetSubscriptionList));
+
+  FSocket.ServerSend(Format('MSG foo.bar %d 3'#13#10'one'#13#10, [LSid]));
+  FSocket.ServerSend(Format('MSG foo.bar %d 3'#13#10'two'#13#10, [LSid]));
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := Length(FConn.GetSubscriptionList) = 0;
+    end),
+    'the subscription must be dropped after the second message');
+  Assert.AreEqual(2, FMsgLog.Count, 'both messages must still reach the handler');
 end;
 
 procedure TNatsConnectionProtocolTests.Unsubscribe_BySubject_WritesUnsubFrame;
