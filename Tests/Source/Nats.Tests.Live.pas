@@ -391,6 +391,17 @@ begin
     WAIT_MS),
     'the request never got a reply');
   Assert.AreEqual('pong:ping', FMsgLog.Item(0));
+
+  // §6: the inbox subscription must not outlive the reply - only the responder
+  // subscription should be left
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := Length(FConn.GetSubscriptionList) = 1;
+    end,
+    WAIT_MS),
+    Format('the request inbox leaked: %d subscriptions still open',
+      [Length(FConn.GetSubscriptionList)]));
 end;
 
 procedure TNatsLiveServerTests.Headers_RoundTripThroughTheServer;

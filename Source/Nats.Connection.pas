@@ -52,7 +52,6 @@ type
   TNatsGenerator = class
   private
     FSubId: Cardinal;
-    FInboxId: Cardinal;
   public
     constructor Create(); // Initialize counters
     function GetSubNextId: Cardinal;
@@ -186,6 +185,7 @@ implementation
 
 uses
   Nats.Consts,
+  Nats.Nuid,
   Nats.Exceptions;
 
 { TNatsConnection }
@@ -416,6 +416,14 @@ var
 begin
   LInbox := FGenerator.GetNewInbox;
   Result := Subscribe(LInbox, AHandler);
+
+  { A request expects exactly one reply, so arm the auto-unsubscribe before the
+    request goes out: without it the inbox subscription is never removed, on
+    this side or on the server's, and every request leaks one }
+  { TODO -opaolo -c : no timeout yet - a reply that never arrives leaves the
+    subscription in place until the connection closes }
+  Unsubscribe(Cardinal(Result), 1);
+
   Publish(ASubject, AMessage, LInbox);
 end;
 
@@ -668,20 +676,16 @@ end;
 constructor TNatsGenerator.Create;
 begin
   FSubId := 0;
-  FInboxId := 0;
 end;
 
 { TNatsGenerator }
 
 function TNatsGenerator.GetNewInbox: string;
 begin
-  TMonitor.Enter(Self);
-  try
-    Inc(FInboxId);
-    Result := NatsConstants.INBOX_PREFIX + FInboxId.ToString;
-  finally
-    TMonitor.Exit(Self);
-  end;
+  { A counter would only be unique within this connection: every client in the
+    network would start at _INBOX.1 and replies could be delivered to the wrong
+    one. TNUID is what the other NATS clients use for exactly this }
+  Result := NatsConstants.INBOX_PREFIX + TNUID.NextNuid;
 end;
 
 function TNatsGenerator.GetSubNextId: Cardinal;

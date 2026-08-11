@@ -175,10 +175,11 @@ type
     procedure Request_SubscribesToAnInbox;
     [Test]
     procedure Request_PublishesWithTheInboxAsReplyTo;
-    // [KNOWN BUG §6]
+    // §6: a request expects exactly one reply and must not leak its inbox
     [Test]
     procedure Request_AutoUnsubscribesAfterOneReply;
-    // [KNOWN BUG §6]
+    [Test]
+    procedure Request_SubscriptionIsDroppedAfterTheReply;
     [Test]
     procedure NewInbox_IsUniqueAcrossConnections;
   end;
@@ -882,15 +883,53 @@ begin
 end;
 
 procedure TNatsConnectionProtocolTests.Request_AutoUnsubscribesAfterOneReply;
+var
+  LSid: Integer;
+  LText: string;
+  LUnsubPos, LPubPos: Integer;
 begin
   OpenAndHandshake;
 
-  FConn.Request('svc.time', 'ping', LogHandler());
+  LSid := FConn.Request('svc.time', 'ping', LogHandler());
 
-  // [KNOWN BUG §6] without UNSUB <sid> 1 the inbox subscription leaks on both
-  // the client and the server
-  Assert.IsTrue(FSocket.ClientText.Contains(NatsConstants.Protocol.UNSUB),
-    'Request must auto-unsubscribe after one reply, wrote: ' + FSocket.ClientText);
+  // §6: without UNSUB <sid> 1 the inbox subscription leaks on both sides
+  LText := FSocket.ClientText;
+  LUnsubPos := Pos(Format('%s %d 1%s', [NatsConstants.Protocol.UNSUB, LSid, NatsConstants.CR_LF]), LText);
+  LPubPos := Pos(NatsConstants.Protocol.PUB + ' svc.time ', LText);
+
+  Assert.IsTrue(LUnsubPos > 0,
+    'Request must auto-unsubscribe after one reply, wrote: ' + LText);
+  Assert.IsTrue(LPubPos > LUnsubPos,
+    'the auto-unsubscribe must be armed before the request is published, wrote: ' + LText);
+end;
+
+procedure TNatsConnectionProtocolTests.Request_SubscriptionIsDroppedAfterTheReply;
+var
+  LSid: Integer;
+  LInbox: string;
+  LLines: TArray<string>;
+begin
+  OpenAndHandshake;
+
+  LSid := FConn.Request('svc.time', 'ping', LogHandler());
+  Assert.AreEqual(1, Length(FConn.GetSubscriptionList), 'the inbox subscription must be live');
+
+  // first line written is "SUB <inbox> <sid>"
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+  LInbox := LLines[0].Split([NatsConstants.SPC])[1];
+  Assert.IsTrue(LInbox.StartsWith(NatsConstants.INBOX_PREFIX), 'unexpected SUB line: ' + LLines[0]);
+
+  FSocket.ServerSend(Format('MSG %s %d 4'#13#10'pong'#13#10, [LInbox, LSid]));
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the reply never reached the handler');
+  Assert.AreEqual(LInbox + '||pong', FMsgLog.Item(0));
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'the inbox subscription must be gone once the single reply has arrived');
 end;
 
 procedure TNatsConnectionProtocolTests.NewInbox_IsUniqueAcrossConnections;
@@ -899,10 +938,12 @@ var
 begin
   LOther := TNatsConnection.Create;
   try
-    // [KNOWN BUG §6] inboxes come from a per-connection counter, so every
-    // client in the network starts at _INBOX.1
+    // §6: a per-connection counter would have every client in the network
+    // starting at _INBOX.1, so replies could reach the wrong one
     Assert.AreNotEqual(FConn.GetNewInbox, LOther.GetNewInbox,
       'inbox subjects must be unique across clients, not just within one connection');
+    Assert.AreNotEqual(FConn.GetNewInbox, FConn.GetNewInbox,
+      'and unique per call within one connection');
   finally
     LOther.Free;
   end;
