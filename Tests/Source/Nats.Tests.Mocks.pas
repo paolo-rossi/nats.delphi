@@ -61,7 +61,8 @@ type
     FConnected: Boolean;
     FHost: string;
     FPort: Integer;
-    FTimeout: Cardinal;
+    FConnectTimeout: Cardinal;
+    FReadTimeout: Cardinal;
     FMaxLineLength: Cardinal;
     FOpenCount: Integer;
     /// Both assume FLock is already held
@@ -71,11 +72,13 @@ type
     function GetConnected: Boolean; override;
     function GetHost: string; override;
     function GetPort: Integer; override;
-    function GetTimeout: Cardinal; override;
+    function GetConnectTimeout: Cardinal; override;
+    function GetReadTimeout: Cardinal; override;
     function GetMaxLineLength: Cardinal; override;
     procedure SetHost(const Value: string); override;
     procedure SetPort(const Value: Integer); override;
-    procedure SetTimeout(const Value: Cardinal); override;
+    procedure SetConnectTimeout(const Value: Cardinal); override;
+    procedure SetReadTimeout(const Value: Cardinal); override;
     procedure SetMaxLineLength(const Value: Cardinal); override;
   public
     constructor Create; override;
@@ -105,6 +108,11 @@ type
     function WaitForClientText(const ASubText: string; ATimeoutMs: Cardinal = 3000): Boolean;
 
     property OpenCount: Integer read FOpenCount;
+    { INatsSocket exposes these as properties, TNatsSocket only as protected
+      accessors - repeat them here so a test holding the concrete mock can
+      assert on them }
+    property ConnectTimeout: Cardinal read FConnectTimeout;
+    property ReadTimeout: Cardinal read FReadTimeout;
   end;
 
   /// <summary>
@@ -318,7 +326,8 @@ begin
   FLock := TCriticalSection.Create;
   FHost := '127.0.0.1';
   FPort := NatsConstants.DEFAULT_PORT;
-  FTimeout := DEFAULT_READ_TIMEOUT;
+  FConnectTimeout := DEFAULT_READ_TIMEOUT;
+  FReadTimeout := DEFAULT_READ_TIMEOUT;
   FMaxLineLength := 16 * 1024;
   LastInstance := Self;
 end;
@@ -395,7 +404,7 @@ function TNatsMockSocket.ReceiveString: string;
 var
   LDeadline: UInt64;
 begin
-  LDeadline := TThread.GetTickCount64 + FTimeout;
+  LDeadline := TThread.GetTickCount64 + FReadTimeout;
   repeat
     FLock.Enter;
     try
@@ -424,7 +433,7 @@ begin
   if ACount <= 0 then
     Exit(nil);
 
-  LDeadline := TThread.GetTickCount64 + FTimeout;
+  LDeadline := TThread.GetTickCount64 + FReadTimeout;
   repeat
     FLock.Enter;
     try
@@ -531,9 +540,14 @@ begin
   Result := FPort;
 end;
 
-function TNatsMockSocket.GetTimeout: Cardinal;
+function TNatsMockSocket.GetConnectTimeout: Cardinal;
 begin
-  Result := FTimeout;
+  Result := FConnectTimeout;
+end;
+
+function TNatsMockSocket.GetReadTimeout: Cardinal;
+begin
+  Result := FReadTimeout;
 end;
 
 function TNatsMockSocket.GetMaxLineLength: Cardinal;
@@ -551,9 +565,14 @@ begin
   FPort := Value;
 end;
 
-procedure TNatsMockSocket.SetTimeout(const Value: Cardinal);
+procedure TNatsMockSocket.SetConnectTimeout(const Value: Cardinal);
 begin
-  FTimeout := Value;
+  FConnectTimeout := Value;
+end;
+
+procedure TNatsMockSocket.SetReadTimeout(const Value: Cardinal);
+begin
+  FReadTimeout := Value;
 end;
 
 procedure TNatsMockSocket.SetMaxLineLength(const Value: Cardinal);

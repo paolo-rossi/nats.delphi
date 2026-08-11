@@ -36,8 +36,12 @@ uses
 LConnection := TNatsConnection.Create;
 
 
-// Connect to a NATS Server
-LConnection.SetChannel('localhost', 4222, 1000).
+// Connect to a NATS Server.
+// The third argument is the *connect* timeout in ms - how long establishing the
+// connection may take. It is not a read timeout: an idle connection is healthy,
+// and the socket's own read timeout is sized to outlast the server's ping
+// interval. Pass a fourth argument only if you need to override that.
+LConnection.SetChannel('localhost', 4222, 5000).
     Open(
         procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
         begin

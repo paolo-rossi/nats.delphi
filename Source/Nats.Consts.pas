@@ -60,6 +60,26 @@ type
     DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
     DEFAULT_PING_INTERVAL = 4*1000;
 
+    /// <summary>
+    ///   How long to wait for the TCP connection to be established. Nothing to
+    ///   do with how long a read may block - see DEFAULT_READ_TIMEOUT
+    /// </summary>
+    DEFAULT_CONNECT_TIMEOUT = 5*1000;
+
+    /// <summary>
+    ///   nats-server pings an idle client every 2 minutes by default and the
+    ///   client answers PONG, so on a healthy connection something arrives at
+    ///   least that often
+    /// </summary>
+    DEFAULT_SERVER_PING_INTERVAL = 2*60*1000;
+
+    /// <summary>
+    ///   How long a single read may block. It MUST be comfortably longer than
+    ///   DEFAULT_SERVER_PING_INTERVAL, otherwise an idle but perfectly healthy
+    ///   connection times out over and over
+    /// </summary>
+    DEFAULT_READ_TIMEOUT = 3*60*1000;
+
     CR_LF = #13#10;
     TAB = #9;
     CR_LF_LEN = 2;

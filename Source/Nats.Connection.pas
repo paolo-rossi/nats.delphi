@@ -191,7 +191,13 @@ type
     constructor Create;
     destructor Destroy; override;
   public
-    function SetChannel(const AHost: string; APort, ATimeout: Integer): TNatsConnection;
+    /// <summary>
+    ///   AConnectTimeout bounds establishing the connection; AReadTimeout (0 =
+    ///   keep the socket's default) bounds a single read. They are not the same
+    ///   thing and must not be given the same value
+    /// </summary>
+    function SetChannel(const AHost: string; APort, AConnectTimeout: Integer;
+      AReadTimeout: Integer = 0): TNatsConnection;
     procedure Open(AConnectHandler: TNatsConnectHandler; ADisconnectHandler: TNatsDisconnectHandler = nil); overload;
     procedure Close();
 
@@ -669,11 +675,23 @@ begin
     SendCommand(Format('%s %s %s %d', [NatsConstants.Protocol.SUB, ASubject, AQueue, AId]));
 end;
 
-function TNatsConnection.SetChannel(const AHost: string; APort, ATimeout: Integer): TNatsConnection;
+function TNatsConnection.SetChannel(const AHost: string; APort, AConnectTimeout: Integer;
+  AReadTimeout: Integer = 0): TNatsConnection;
 begin
   FChannel.Host := AHost;
   FChannel.Port := APort;
-  FChannel.Timeout := ATimeout;
+
+  { AConnectTimeout bounds how long establishing the connection may take. It is
+    NOT how long a read may block: an idle connection is healthy, and the demo
+    passes 1000 here, which as a read timeout meant the reader failed every
+    single second. Leave AReadTimeout at 0 to keep the socket's default, which
+    is sized to outlast the server's ping interval. }
+  if AConnectTimeout > 0 then
+    FChannel.ConnectTimeout := AConnectTimeout;
+
+  if AReadTimeout > 0 then
+    FChannel.ReadTimeout := AReadTimeout;
+
   Result := Self;
 end;
 

@@ -329,7 +329,8 @@ begin
   end
   else
     FConnection.
-      SetChannel(edtHost.Text, StrToInt(edtPort.Text), 1000).
+      // third argument is the connect timeout, not a read timeout
+      SetChannel(edtHost.Text, StrToInt(edtPort.Text), 5000).
       Open(
         procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
         begin

@@ -33,12 +33,14 @@ type
     function GetConnected: Boolean;
     function GetHost: string;
     function GetPort: Integer;
-    function GetTimeout: Cardinal;
+    function GetConnectTimeout: Cardinal;
+    function GetReadTimeout: Cardinal;
     function GetMaxLineLength: Cardinal;
     // Property Setters
     procedure SetHost(const Value: string);
     procedure SetPort(const Value: Integer);
-    procedure SetTimeout(const Value: Cardinal);
+    procedure SetConnectTimeout(const Value: Cardinal);
+    procedure SetReadTimeout(const Value: Cardinal);
     procedure SetMaxLineLength(const Value: Cardinal);
     // Methods
     procedure Open();
@@ -55,7 +57,17 @@ type
     property Connected: Boolean read GetConnected;
     property Host: string read GetHost write SetHost;
     property Port: Integer read GetPort write SetPort;
-    property Timeout: Cardinal read GetTimeout write SetTimeout;
+    /// <summary>
+    ///   How long Open may take to establish the connection
+    /// </summary>
+    property ConnectTimeout: Cardinal read GetConnectTimeout write SetConnectTimeout;
+    /// <summary>
+    ///   How long a single Receive may block. These are two different things:
+    ///   a connection that takes 5 seconds to establish is broken, whereas one
+    ///   that says nothing for 5 seconds is merely idle, so this must be longer
+    ///   than the server's ping interval
+    /// </summary>
+    property ReadTimeout: Cardinal read GetReadTimeout write SetReadTimeout;
     property MaxLineLength: Cardinal read GetMaxLineLength
       write SetMaxLineLength;
   end;
@@ -65,12 +77,14 @@ type
     function GetConnected: Boolean; virtual; abstract;
     function GetHost: string; virtual; abstract;
     function GetPort: Integer; virtual; abstract;
-    function GetTimeout: Cardinal; virtual; abstract;
+    function GetConnectTimeout: Cardinal; virtual; abstract;
+    function GetReadTimeout: Cardinal; virtual; abstract;
     function GetMaxLineLength: Cardinal; virtual; abstract;
 
     procedure SetHost(const Value: string); virtual; abstract;
     procedure SetPort(const Value: Integer); virtual; abstract;
-    procedure SetTimeout(const Value: Cardinal); virtual; abstract;
+    procedure SetConnectTimeout(const Value: Cardinal); virtual; abstract;
+    procedure SetReadTimeout(const Value: Cardinal); virtual; abstract;
     procedure SetMaxLineLength(const Value: Cardinal); virtual; abstract;
   public
     constructor Create; virtual; abstract;

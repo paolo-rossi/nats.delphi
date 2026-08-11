@@ -38,11 +38,13 @@ type
     function GetConnected: Boolean; override;
     function GetHost: string; override;
     function GetPort: Integer; override;
-    function GetTimeout: Cardinal; override;
+    function GetConnectTimeout: Cardinal; override;
+    function GetReadTimeout: Cardinal; override;
     function GetMaxLineLength: Cardinal; override;
     procedure SetHost(const Value: string); override;
     procedure SetPort(const Value: Integer); override;
-    procedure SetTimeout(const Value: Cardinal); override;
+    procedure SetConnectTimeout(const Value: Cardinal); override;
+    procedure SetReadTimeout(const Value: Cardinal); override;
     procedure SetMaxLineLength(const Value: Cardinal); override;
   public
     constructor Create; override;
@@ -81,7 +83,10 @@ end;
 constructor TNatsSocketIndy.Create;
 begin
   FClient := TIdTCPClient.Create(nil);
-  FClient.ReadTimeout := NatsConstants.DEFAULT_PING_INTERVAL * 3;
+  { A read timeout is not a connect timeout: an idle connection is normal and
+    must not be torn down, so this has to outlast the server's ping interval }
+  FClient.ReadTimeout := NatsConstants.DEFAULT_READ_TIMEOUT;
+  FClient.ConnectTimeout := NatsConstants.DEFAULT_CONNECT_TIMEOUT;
   // Extract host from DEFAULT_URI if it contains protocol
   var LDefaultHost: string;
   LDefaultHost := NatsConstants.DEFAULT_URI_;
@@ -115,7 +120,12 @@ begin
   Result := FClient.Port;
 end;
 
-function TNatsSocketIndy.GetTimeout: Cardinal;
+function TNatsSocketIndy.GetConnectTimeout: Cardinal;
+begin
+  Result := FClient.ConnectTimeout;
+end;
+
+function TNatsSocketIndy.GetReadTimeout: Cardinal;
 begin
   Result := FClient.ReadTimeout;
 end;
@@ -202,7 +212,12 @@ begin
   FClient.Port := Value;
 end;
 
-procedure TNatsSocketIndy.SetTimeout(const Value: Cardinal);
+procedure TNatsSocketIndy.SetConnectTimeout(const Value: Cardinal);
+begin
+  FClient.ConnectTimeout := Value;
+end;
+
+procedure TNatsSocketIndy.SetReadTimeout(const Value: Cardinal);
 begin
   FClient.ReadTimeout := Value;
 end;

@@ -72,6 +72,28 @@ type
     procedure ReceiveString_WithoutData_TimesOut;
   end;
 
+  // §13: a connect timeout and a read timeout are different things
+  [TestFixture]
+  TNatsChannelTimeoutTests = class
+  private
+    FConn: TNatsConnection;
+    FSocket: TNatsMockSocket;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    [Test]
+    procedure SetChannel_SetsTheConnectTimeout;
+    [Test]
+    procedure SetChannel_DoesNotTouchTheReadTimeout;
+    [Test]
+    procedure SetChannel_CanSetTheReadTimeoutExplicitly;
+    [Test]
+    procedure DefaultReadTimeout_OutlastsTheServerPingInterval;
+  end;
+
   [TestFixture]
   TNatsConnectionProtocolTests = class
   private
@@ -229,7 +251,7 @@ end;
 procedure TNatsMockSocketTests.Setup;
 begin
   FSocket := TNatsSocketRegistry.Get('Mock');
-  FSocket.Timeout := MOCK_TIMEOUT;
+  FSocket.ReadTimeout := MOCK_TIMEOUT;
   FSocket.Open;
 end;
 
@@ -293,6 +315,69 @@ begin
       FSocket.ReceiveString;
     end,
     ENatsMock, 'the mock must time out like Indy does, never block forever');
+end;
+
+{ TNatsChannelTimeoutTests }
+
+procedure TNatsChannelTimeoutTests.Setup;
+begin
+  UseMockSocket;
+  FConn := TNatsConnection.Create;
+  FSocket := TNatsMockSocket.LastInstance;
+end;
+
+procedure TNatsChannelTimeoutTests.TearDown;
+begin
+  FConn.Free;
+end;
+
+procedure TNatsChannelTimeoutTests.SetChannel_SetsTheConnectTimeout;
+begin
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, 1234);
+
+  Assert.AreEqual(Cardinal(1234), FSocket.ConnectTimeout,
+    'the third argument bounds establishing the connection');
+end;
+
+procedure TNatsChannelTimeoutTests.SetChannel_DoesNotTouchTheReadTimeout;
+var
+  LBefore: Cardinal;
+begin
+  LBefore := FSocket.ReadTimeout;
+
+  // the demo passes 1000 here; as a read timeout that made an idle but
+  // perfectly healthy connection fail every single second
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, 1000);
+
+  Assert.AreEqual(LBefore, FSocket.ReadTimeout,
+    'a connect timeout must not become the read timeout');
+end;
+
+procedure TNatsChannelTimeoutTests.SetChannel_CanSetTheReadTimeoutExplicitly;
+begin
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, 1000, 4321);
+
+  Assert.AreEqual(Cardinal(1000), FSocket.ConnectTimeout);
+  Assert.AreEqual(Cardinal(4321), FSocket.ReadTimeout);
+end;
+
+procedure TNatsChannelTimeoutTests.DefaultReadTimeout_OutlastsTheServerPingInterval;
+var
+  LRead, LPing, LConnect: Cardinal;
+begin
+  { through variables, so the compiler compares values instead of folding two
+    constants and warning that the answer is known }
+  LRead := NatsConstants.DEFAULT_READ_TIMEOUT;
+  LPing := NatsConstants.DEFAULT_SERVER_PING_INTERVAL;
+  LConnect := NatsConstants.DEFAULT_CONNECT_TIMEOUT;
+
+  // nothing arrives on an idle connection until the server's next PING, so a
+  // shorter read timeout would report a healthy connection as broken
+  Assert.IsTrue(LRead > LPing,
+    Format('read timeout %d must outlast the server ping interval %d', [LRead, LPing]));
+
+  Assert.IsTrue(LConnect < LRead,
+    'establishing a connection should be bounded far more tightly than a read');
 end;
 
 { TNatsConnectionProtocolTests }
@@ -952,6 +1037,7 @@ end;
 initialization
   TDUnitX.RegisterTestFixture(TNatsSocketRegistryTests);
   TDUnitX.RegisterTestFixture(TNatsMockSocketTests);
+  TDUnitX.RegisterTestFixture(TNatsChannelTimeoutTests);
   TDUnitX.RegisterTestFixture(TNatsConnectionProtocolTests);
 
 end.
