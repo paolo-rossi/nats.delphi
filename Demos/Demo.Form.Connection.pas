@@ -301,12 +301,12 @@ end;
 
 procedure TfrmConnection.RefreshLists;
 var
-  LPair: TNatsSubscriptionPair;
+  LInfo: TNatsSubscriptionInfo;
 begin
   lstSubscriptions.Clear;
-  for LPair in FConnection.GetSubscriptionList do
+  for LInfo in FConnection.GetSubscriptionList do
   begin
-    lstSubscriptions.Items.Add(Format('%s (%d)', [LPair.Value.Subject, LPair.Key]));
+    lstSubscriptions.Items.Add(Format('%s (%d)', [LInfo.Subject, LInfo.Id]));
   end;
 end;
 
@@ -322,8 +322,6 @@ begin
 end;
 
 procedure TfrmConnection.switchConnectionClick(Sender: TObject);
-var
-  LIndex: Integer;
 begin
   if FConnection.Connected then
   begin
@@ -331,7 +329,8 @@ begin
   end
   else
     FConnection.
-      SetChannel(edtHost.Text, StrToInt(edtPort.Text), 1000).
+      // third argument is the connect timeout, not a read timeout
+      SetChannel(edtHost.Text, StrToInt(edtPort.Text), 5000).
       Open(
         procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
         begin

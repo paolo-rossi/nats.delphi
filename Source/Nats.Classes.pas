@@ -66,8 +66,16 @@ type
     Id: Integer;            // Subscription ID
     Subject: string;
     ReplyTo: string;
-    PayloadBytes: Integer;  // Length of the actual message payload
-    Payload: string;        // The message payload
+    PayloadBytes: Integer;  // Length in bytes of the actual message payload
+    /// <summary>
+    ///   The payload decoded as UTF-8. Convenient, but lossy for anything that
+    ///   is not text - use PayloadData when the payload is binary
+    /// </summary>
+    Payload: string;
+    /// <summary>
+    ///   The payload exactly as it came off the wire
+    /// </summary>
+    PayloadData: TBytes;
     HeaderBytes: Integer;   // Length of the header block (for HMSG)
     TotalMsgBytes: Integer; // Total bytes for HMSG (HeaderBytes + PayloadBytes)
     Headers: TNatsHeaders;  // Parsed NATS headers
@@ -79,14 +87,49 @@ type
 
     function GetArgAsInfo: TNatsArgsINFO;
     function GetArgAsMsg: TNatsArgsMSG;
+    /// <summary>
+    ///   The text the server sent with -ERR, e.g. 'Authorization Violation'
+    /// </summary>
+    function GetArgAsErr: string;
   end;
 
-  TNatsCommandQueue = class(TQueue<TNatsCommand>);
+  /// <summary>
+  ///   Thread-safe command queue with a wait/signal handshake: the reader
+  ///   thread enqueues, the consumer thread blocks in Dequeue until something
+  ///   arrives instead of polling, and Wake releases it at shutdown
+  /// </summary>
+  TNatsCommandQueue = class
+  private
+    FItems: TQueue<TNatsCommand>;
+    FLock: TCriticalSection;
+    FEvent: TLightweightEvent;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure Enqueue(const ACommand: TNatsCommand);
+    /// <summary>
+    ///   Waits up to ATimeoutMs for a command; False when none arrived
+    /// </summary>
+    function Dequeue(out ACommand: TNatsCommand; ATimeoutMs: Cardinal): Boolean;
+    /// <summary>
+    ///   Releases anyone blocked in Dequeue, without enqueuing anything
+    /// </summary>
+    procedure Wake;
+    procedure Clear;
+    function Count: Integer;
+  end;
 
   TNatsMsgHandler = reference to procedure (const AMsg: TNatsArgsMSG);
   TNatsPingHandler = reference to procedure ();
   TNatsConnectHandler = reference to procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions);
   TNatsDisconnectHandler = reference to procedure ();
+  /// <summary>
+  ///   Called when the connection fails for a reason the application cannot
+  ///   otherwise see: a protocol error, a dead socket, or an -ERR from the
+  ///   server. Runs on a worker thread, so it must be thread safe
+  /// </summary>
+  TNatsErrorHandler = reference to procedure (const AError: string);
 
   TNatsThread = class abstract(TThread)
   protected
@@ -98,6 +141,90 @@ type
   end;
 
 implementation
+
+{ TNatsCommandQueue }
+
+constructor TNatsCommandQueue.Create;
+begin
+  inherited Create;
+  FItems := TQueue<TNatsCommand>.Create;
+  FLock := TCriticalSection.Create;
+  FEvent := TLightweightEvent.Create;
+end;
+
+destructor TNatsCommandQueue.Destroy;
+begin
+  FEvent.Free;
+  FItems.Free;
+  FLock.Free;
+  inherited;
+end;
+
+procedure TNatsCommandQueue.Enqueue(const ACommand: TNatsCommand);
+begin
+  FLock.Enter;
+  try
+    FItems.Enqueue(ACommand);
+  finally
+    FLock.Leave;
+  end;
+  FEvent.SetEvent;
+end;
+
+function TNatsCommandQueue.Dequeue(out ACommand: TNatsCommand; ATimeoutMs: Cardinal): Boolean;
+
+  function TryTake: Boolean;
+  begin
+    FLock.Enter;
+    try
+      Result := FItems.Count > 0;
+      if Result then
+        ACommand := FItems.Dequeue;
+      { Reset while holding the lock: an Enqueue between here and the WaitFor
+        below signals the event again, so nothing is missed }
+      if FItems.Count = 0 then
+        FEvent.ResetEvent;
+    finally
+      FLock.Leave;
+    end;
+  end;
+
+begin
+  Result := TryTake;
+  if Result then
+    Exit;
+
+  if FEvent.WaitFor(ATimeoutMs) <> TWaitResult.wrSignaled then
+    Exit(False);
+
+  Result := TryTake;
+end;
+
+procedure TNatsCommandQueue.Wake;
+begin
+  FEvent.SetEvent;
+end;
+
+procedure TNatsCommandQueue.Clear;
+begin
+  FLock.Enter;
+  try
+    FItems.Clear;
+    FEvent.ResetEvent;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TNatsCommandQueue.Count: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FItems.Count;
+  finally
+    FLock.Leave;
+  end;
+end;
 
 { TNatsThread }
 constructor TNatsThread.Create;
@@ -129,6 +256,13 @@ begin
   Result := Arguments.AsType<TNatsArgsMSG>;
 end;
 
+function TNatsCommand.GetArgAsErr: string;
+begin
+  if Arguments.IsEmpty or not Arguments.IsType<string> then
+    Exit('');
+  Result := Arguments.AsString;
+end;
+
 { TNatsArgsINFO }
 procedure TNatsArgsINFO.SetInfoStr(const Value: string);
 begin
@@ -139,8 +273,14 @@ end;
 { TNatsHeadersHelper }
 
 procedure TNatsHeadersHelper.Add(const AName, AValue: string);
+var
+  LIndex: Integer;
 begin
-  Self := Self + [TNatsHeader.Create(AName, AValue)];
+  { Grow in place. "Self := Self + [...]" builds a one-element temporary array
+    and then a whole new array on every single call }
+  LIndex := Length(Self);
+  SetLength(Self, LIndex + 1);
+  Self[LIndex] := TNatsHeader.Create(AName, AValue);
 end;
 
 procedure TNatsHeadersHelper.CopyHeaders(const AHeaders: TNatsHeaders);
@@ -193,8 +333,10 @@ end;
 function TNatsHeadersHelper.Text: string;
 begin
   Result := '';
+  { NATS headers use the HTTP form "Key: Value", the same form TNatsParser reads }
   for var pair in Self do
-    Result := Result + pair.Key + '=' + pair.Value + NatsConstants.CR_LF;
+    Result := Result + pair.Key + NatsConstants.COL + NatsConstants.SPC +
+      pair.Value + NatsConstants.CR_LF;
 end;
 
 end.

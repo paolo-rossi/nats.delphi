@@ -41,10 +41,13 @@ type
         constructor Create;
         // Parse the initial command line (e.g., "MSG subject sid len")
         function Parse(const ACommand: string): TNatsCommand;
-        // Parse headers from a raw string block
-        procedure ParseHeaders(const AHeaderBlock: string; ADestHeaders: TNatsHeaders);
-        // Set payload for a command (used after headers and payload are read separately)
-        function SetCommandPayload(var ACmd: TNatsCommand; const APayload: string): TNatsCommand;
+        // Parse headers from a raw string block into ADestHeaders (which is
+        // overwritten, hence "var": TNatsHeaders is a dynamic array)
+        procedure ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
+        // Attach the payload to a command, once it has been read off the wire.
+        // A procedure, not a function that also takes a var parameter: the old
+        // signature let a caller do both and left it unclear which one mattered
+        procedure SetCommandPayload(var ACommand: TNatsCommand; const APayload: TBytes);
       end;
 
     implementation
@@ -96,13 +99,17 @@ type
       if LTrimmedCmd.StartsWith(NatsConstants.Protocol.ERR) then
       begin
         Result.CommandType := TNatsCommandServer.ERR;
+        { keep the reason - 'Authorization Violation' and 'Permissions
+          Violation' need to reach the application, not be thrown away }
+        Result.Arguments := TValue.From<string>(
+          Trim(LTrimmedCmd.Substring(Length(NatsConstants.Protocol.ERR))).DeQuotedString(''''));
         Exit(Result);
       end;
 
-      raise ENatsException.Create('Parsing error or NATS command not supported: ' + ACommand);
+      raise ENatsProtocolError.Create('Parsing error or NATS command not supported: ' + ACommand);
     end;
 
-    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; ADestHeaders: TNatsHeaders);
+    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
     var
       Lines: TArray<string>;
       S: string;
@@ -141,21 +148,34 @@ type
       end;
     end;
 
-    function TNatsParser.SetCommandPayload(var ACmd: TNatsCommand; const APayload: string): TNatsCommand;
+    procedure TNatsParser.SetCommandPayload(var ACommand: TNatsCommand; const APayload: TBytes);
     var
       LArg: TNatsArgsMSG;
     begin
-      if (ACmd.CommandType = TNatsCommandServer.MSG) or (ACmd.CommandType = TNatsCommandServer.HMSG) then
-      begin
-        LArg := ACmd.Arguments.AsType<TNatsArgsMSG>;
-        LArg.Payload := APayload;
-        // PayloadBytes should accurately reflect the bytes of the *actual* payload,
-        // not necessarily Length(APayload) if there are multi-byte UTF8 characters.
-        // The server sends the byte count, so we trust that.
-        // This method is more about associating the read payload string with the command.
-        ACmd.Arguments := TValue.From<TNatsArgsMSG>(LArg);
+      if (ACommand.CommandType <> TNatsCommandServer.MSG) and
+         (ACommand.CommandType <> TNatsCommandServer.HMSG) then
+        Exit;
+
+      LArg := ACommand.Arguments.AsType<TNatsArgsMSG>;
+
+      { Keep the bytes as they arrived - decoding to a string is lossy for
+        anything that is not text - and offer the UTF-8 reading alongside.
+        PayloadBytes stays the count the server declared: it is authoritative,
+        and Length(Payload) is not, because a character is not a byte. }
+      LArg.PayloadData := APayload;
+
+      { GetString RAISES on bytes that are not valid UTF-8. Letting that
+        propagate would take the whole connection down over one binary
+        message, so a payload that is not text simply has no string form -
+        PayloadData still holds every byte of it. }
+      try
+        LArg.Payload := TEncoding.UTF8.GetString(APayload);
+      except
+        on E: Exception do
+          LArg.Payload := '';
       end;
-      Result := ACmd;
+
+      ACommand.Arguments := TValue.From<TNatsArgsMSG>(LArg);
     end;
 
     function TNatsParser.ParseINFO(const ACommand: string): TNatsCommand;
@@ -168,7 +188,7 @@ type
       // Example: "INFO {...}"
       LJsonInfoPart := Trim(Copy(ACommand, Length(NatsConstants.Protocol.INFO) + 2, MaxInt));
       if LJsonInfoPart = '' then
-        raise ENatsException.Create('Malformed NATS command received (INFO): Missing JSON payload. Command: ' + ACommand);
+        raise ENatsProtocolError.Create('Malformed NATS command received (INFO): Missing JSON payload. Command: ' + ACommand);
 
       LArg.InfoStr := LJsonInfoPart;
       Result.Arguments := TValue.From<TNatsArgsINFO>(LArg);
@@ -184,23 +204,23 @@ type
       LSplit := ACommand.Split([NatsConstants.SPC]);
       // MSG <subject> <sid> [reply-to] <#bytes>
       if (Length(LSplit) < 4) or (Length(LSplit) > 5) then
-         raise ENatsException.Create('Malformed NATS command received (MSG): Incorrect number of arguments. Command: ' + ACommand);
+         raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Incorrect number of arguments. Command: ' + ACommand);
 
       LArg.Subject := LSplit[1];
       LArg.Id := StrToIntDef(LSplit[2], -1);
-      if LArg.Id = -1 then raise ENatsException.Create('Malformed NATS command received (MSG): Invalid SID. Command: ' + ACommand);
+      if LArg.Id = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Invalid SID. Command: ' + ACommand);
 
       if Length(LSplit) = 4 then // MSG <subject> <sid> <#bytes>
       begin
         LArg.ReplyTo := '';
         LArg.PayloadBytes := StrToIntDef(LSplit[3], -1);
-        if LArg.PayloadBytes = -1 then raise ENatsException.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
+        if LArg.PayloadBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
       end
       else // Length(LSplit) = 5 then // MSG <subject> <sid> <reply-to> <#bytes>
       begin
         LArg.ReplyTo := LSplit[3];
         LArg.PayloadBytes := StrToIntDef(LSplit[4], -1);
-         if LArg.PayloadBytes = -1 then raise ENatsException.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
+         if LArg.PayloadBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (MSG): Invalid payload bytes. Command: ' + ACommand);
       end;
 
       LArg.HeaderBytes := 0;
@@ -218,11 +238,11 @@ type
       LSplit := ACommand.Split([NatsConstants.SPC]);
       // HMSG <subject> <sid> [reply-to] <#header_bytes> <#total_bytes>
       if (Length(LSplit) < 5) or (Length(LSplit) > 6) then
-        raise ENatsException.Create('Malformed NATS command received (HMSG): Incorrect number of arguments. Command: ' + ACommand);
+        raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Incorrect number of arguments. Command: ' + ACommand);
 
       LArg.Subject := LSplit[1];
       LArg.Id := StrToIntDef(LSplit[2], -1);
-      if LArg.Id = -1 then raise ENatsException.Create('Malformed NATS command received (HMSG): Invalid SID. Command: ' + ACommand);
+      if LArg.Id = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Invalid SID. Command: ' + ACommand);
 
       if Length(LSplit) = 5 then // HMSG <subject> <sid> <#header_bytes> <#total_bytes>
       begin
@@ -237,12 +257,12 @@ type
         LArg.TotalMsgBytes := StrToIntDef(LSplit[5], -1);
       end;
 
-      if LArg.HeaderBytes = -1 then raise ENatsException.Create('Malformed NATS command received (HMSG): Invalid header bytes. Command: ' + ACommand);
-      if LArg.TotalMsgBytes = -1 then raise ENatsException.Create('Malformed NATS command received (HMSG): Invalid total bytes. Command: ' + ACommand);
+      if LArg.HeaderBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Invalid header bytes. Command: ' + ACommand);
+      if LArg.TotalMsgBytes = -1 then raise ENatsProtocolError.Create('Malformed NATS command received (HMSG): Invalid total bytes. Command: ' + ACommand);
 
       LArg.PayloadBytes := LArg.TotalMsgBytes - LArg.HeaderBytes;
       if LArg.PayloadBytes < 0 then
-        raise ENatsException.Create('Invalid byte counts in HMSG: HeaderBytes > TotalMsgBytes. Command: ' + ACommand);
+        raise ENatsProtocolError.Create('Invalid byte counts in HMSG: HeaderBytes > TotalMsgBytes. Command: ' + ACommand);
 
       Result.Arguments := TValue.From<TNatsArgsMSG>(LArg);
     end;

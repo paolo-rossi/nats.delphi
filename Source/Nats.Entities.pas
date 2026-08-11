@@ -64,6 +64,13 @@ type
     version: string;
     protocol: Integer;
     echo: Boolean;
+    /// <summary>
+    ///   Must be True to use message headers: a server will refuse HPUB from a
+    ///   client that has not declared header support (it closes the connection)
+    ///   and will strip headers from anything it delivers, sending MSG instead
+    ///   of HMSG
+    /// </summary>
+    headers: Boolean;
     sig: string;
     jwt: string;
 
@@ -74,7 +81,10 @@ type
 implementation
 
 uses
-  System.JSON, REST.Json;
+  { Serialization here is System.JSON.Serializers.TJsonSerializer only. REST.Json
+    used to be listed too and was never called - it was the sole reason the
+    package required RESTComponents }
+  System.JSON;
 
 { TNatsServerInfo }
 
