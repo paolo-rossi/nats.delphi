@@ -203,6 +203,7 @@ begin
   ConnectOptions.version := NatsConstants.CLIENT_VERSION;
   ConnectOptions.protocol := 1;
   ConnectOptions.echo := True;
+  ConnectOptions.headers := True;
 
   { TODO -opaolo -c : Remove the default behavior 31/05/2022 18:17:27 }
   FChannel := TNatsSocketRegistry.Get(String.Empty);
@@ -351,6 +352,7 @@ procedure TNatsConnection.PublishBytes(const ASubject: string; const AData: TByt
 var
   LHeaderBlock: string;
   LHeaderBlockBytes: TBytes;
+  LHeaderBytes, LTotalBytes: Integer;
   LPub: string;
 begin
   if ASubject.IsEmpty then
@@ -369,22 +371,28 @@ begin
 
   LHeaderBlockBytes := TEncoding.UTF8.GetBytes(LHeaderBlock);
 
+  { The header block must end with a blank line, and <#header bytes> must count
+    it. SendString below appends the CRLF that forms that blank line, so the
+    block on the wire is LHeaderBlockBytes + CRLF - which is what we declare.
+    <#total bytes> is the header block plus the payload, excluding the CRLF
+    that terminates the message itself. }
+  LHeaderBytes := Length(LHeaderBlockBytes) + NatsConstants.CR_LF_LEN;
+  LTotalBytes := LHeaderBytes + Length(AData);
+
   if AReplyTo.IsEmpty then
     LPub := Format('%s %s %d %d', [
       NatsConstants.Protocol.HPUB,
       ASubject,
-      Length(LHeaderBlockBytes),
-      Length(LHeaderBlockBytes) +
-      Length(AData)
+      LHeaderBytes,
+      LTotalBytes
     ])
   else
     LPub := Format('%s %s %s %d %d', [
       NatsConstants.Protocol.HPUB,
       ASubject,
       AReplyTo,
-      Length(LHeaderBlockBytes),
-      Length(LHeaderBlockBytes) +
-      Length(AData)
+      LHeaderBytes,
+      LTotalBytes
     ]);
 
   FLock.Enter;
@@ -602,11 +610,12 @@ begin
     else if LCommand.CommandType = TNatsCommandServer.HMSG then
     begin
       LMsgArgs := LCommand.GetArgAsMsg;
+      { <#header bytes> already covers the CRLFCRLF that terminates the header
+        block, so the next byte is the first payload byte: do NOT read a line here }
       if LMsgArgs.HeaderBytes > 0 then
         LHeaderBlockBytes := FChannel.ReceiveExactBytes(LMsgArgs.HeaderBytes)
       else
         SetLength(LHeaderBlockBytes, 0);
-      LRead := FChannel.ReceiveString; // Consume CRLF after header block
 
       FParser.ParseHeaders(TEncoding.UTF8.GetString(LHeaderBlockBytes), LMsgArgs.Headers);
       LCommand.Arguments := TValue.From<TNatsArgsMSG>(LMsgArgs);

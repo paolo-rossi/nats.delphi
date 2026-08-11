@@ -64,6 +64,13 @@ type
     version: string;
     protocol: Integer;
     echo: Boolean;
+    /// <summary>
+    ///   Must be True to use message headers: a server will refuse HPUB from a
+    ///   client that has not declared header support (it closes the connection)
+    ///   and will strip headers from anything it delivers, sending MSG instead
+    ///   of HMSG
+    /// </summary>
+    headers: Boolean;
     sig: string;
     jwt: string;
 

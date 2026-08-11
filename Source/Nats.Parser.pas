@@ -41,8 +41,9 @@ type
         constructor Create;
         // Parse the initial command line (e.g., "MSG subject sid len")
         function Parse(const ACommand: string): TNatsCommand;
-        // Parse headers from a raw string block
-        procedure ParseHeaders(const AHeaderBlock: string; ADestHeaders: TNatsHeaders);
+        // Parse headers from a raw string block into ADestHeaders (which is
+        // overwritten, hence "var": TNatsHeaders is a dynamic array)
+        procedure ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
         // Set payload for a command (used after headers and payload are read separately)
         function SetCommandPayload(var ACmd: TNatsCommand; const APayload: string): TNatsCommand;
       end;
@@ -102,7 +103,7 @@ type
       raise ENatsException.Create('Parsing error or NATS command not supported: ' + ACommand);
     end;
 
-    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; ADestHeaders: TNatsHeaders);
+    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
     var
       Lines: TArray<string>;
       S: string;

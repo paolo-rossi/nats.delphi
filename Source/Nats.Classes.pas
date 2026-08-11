@@ -193,8 +193,10 @@ end;
 function TNatsHeadersHelper.Text: string;
 begin
   Result := '';
+  { NATS headers use the HTTP form "Key: Value", the same form TNatsParser reads }
   for var pair in Self do
-    Result := Result + pair.Key + '=' + pair.Value + NatsConstants.CR_LF;
+    Result := Result + pair.Key + NatsConstants.COL + NatsConstants.SPC +
+      pair.Value + NatsConstants.CR_LF;
 end;
 
 end.
