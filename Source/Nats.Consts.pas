@@ -80,6 +80,14 @@ type
     /// </summary>
     DEFAULT_READ_TIMEOUT = 3*60*1000;
 
+    /// <summary>
+    ///   How long RequestSync waits for a reply. Unrelated to the read timeout:
+    ///   this bounds one request/reply exchange, not one socket read, and it is
+    ///   deliberately short because a request that gets no answer usually means
+    ///   nobody is serving the subject
+    /// </summary>
+    DEFAULT_REQUEST_TIMEOUT = 5*1000;
+
     CR_LF = #13#10;
     TAB = #9;
     CR_LF_LEN = 2;

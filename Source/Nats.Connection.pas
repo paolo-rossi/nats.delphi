@@ -30,6 +30,7 @@ uses
   System.Generics.Defaults, System.Generics.Collections,
 
   Nats.Classes,
+  Nats.Consts,
   Nats.Entities,
   Nats.Parser,
   Nats.Socket;
@@ -45,6 +46,44 @@ type
 
   TNatsConnection = class;
 
+  /// <summary>
+  ///   The handoff between the consumer thread, which receives a request's
+  ///   reply, and the caller blocked inside RequestSync
+  /// </summary>
+  /// <remarks>
+  ///   <para>
+  ///     Reference counted on purpose. The subscription handler closure holds
+  ///     one reference and the waiting caller holds another, so a reply that
+  ///     arrives after the caller has already given up still finds a live
+  ///     object to write into. A plain object owned by the caller's stack frame
+  ///     would be freed underneath the consumer thread on every single timeout.
+  ///   </para>
+  ///   <para>
+  ///     The reply is COPIED into the waiter, never handed over by reference:
+  ///     TNatsArgsMSG is a record and the consumer thread's copy goes out of
+  ///     scope as soon as the handler returns.
+  ///   </para>
+  /// </remarks>
+  INatsRequestWaiter = interface
+  ['{4F0D1C7A-9E3B-4A16-8D2F-1B7C6E5A9042}']
+    /// <summary>
+    ///   Delivers the reply. Runs on the consumer thread; the first reply wins
+    ///   and any later one is discarded
+    /// </summary>
+    procedure Signal(const AMsg: TNatsArgsMSG);
+    /// <summary>
+    ///   Releases the caller empty handed because the connection is going away.
+    ///   A reply that already landed is kept, so a race with Signal cannot lose
+    ///   a message that was genuinely received
+    /// </summary>
+    procedure Cancel;
+    /// <summary>
+    ///   Blocks for up to ATimeoutMs. False means the time ran out with no
+    ///   reply; a connection torn down while waiting raises instead, because
+    ///   that is not the same thing as a slow responder
+    /// </summary>
+    function WaitFor(ATimeoutMs: Cardinal; out AMsg: TNatsArgsMSG): Boolean;
+  end;
 
   /// <summary>
   ///   Simple Id generator for subscription and inbox
@@ -185,6 +224,10 @@ type
     FErrorHandler: TNatsErrorHandler;
     FWriteLock: TCriticalSection;
     FSubsLock: TCriticalSection;
+    { Guards FPendingRequests only, and is always a LEAF: no other lock may be
+      taken while it is held, and it is never taken while holding another }
+    FRequestsLock: TCriticalSection;
+    FPendingRequests: TList<INatsRequestWaiter>;
     FState: Integer;
     FPingOutstanding: Integer;
     FLastError: string;
@@ -213,6 +256,14 @@ type
     procedure JoinThreads;
     procedure CloseChannel;
     procedure ClearSubscriptions;
+    procedure AddPendingRequest(const AWaiter: INatsRequestWaiter);
+    procedure RemovePendingRequest(const AWaiter: INatsRequestWaiter);
+    /// <summary>
+    ///   Releases everyone blocked in RequestSync. Without it a connection that
+    ///   drops mid-request leaves each caller waiting out its full timeout for
+    ///   a reply that provably cannot arrive
+    /// </summary>
+    procedure CancelPendingRequests;
     procedure TearDown; overload;
     procedure TearDown(const AError: string); overload;
     procedure HandleInfo(const AInfo: TNatsServerInfo);
@@ -245,6 +296,37 @@ type
 
     function Request(const ASubject: string; AHandler: TNatsMsgHandler): Integer; overload;
     function Request(const ASubject, AMessage: string; AHandler: TNatsMsgHandler): Integer; overload;
+
+    /// <summary>
+    ///   Publishes to ASubject and BLOCKS until one reply arrives or ATimeoutMs
+    ///   elapses. False means it timed out; the connection being torn down while
+    ///   waiting raises, because that is a different outcome from silence
+    /// </summary>
+    /// <remarks>
+    ///   <para>
+    ///     Unlike Request, this cleans up on EVERY exit path. The inbox
+    ///     subscription is removed whether the reply arrived, the wait timed
+    ///     out, or the publish itself raised - a timeout used to leave the inbox
+    ///     subscribed on both sides and leak an entry from FSubscriptions.
+    ///   </para>
+    ///   <para>
+    ///     NEVER call this from a message, connect or disconnect handler. Those
+    ///     run on the consumer thread, which is the thread that has to deliver
+    ///     the reply, so it would block until the timeout and deadlock itself.
+    ///   </para>
+    /// </remarks>
+    function RequestSync(const ASubject, AMessage: string; out AReply: TNatsArgsMSG;
+      ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT): Boolean; overload;
+    function RequestSync(const ASubject: string; const AData: TBytes; out AReply: TNatsArgsMSG;
+      ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT): Boolean; overload;
+    /// <summary>
+    ///   The form JetStream needs: a binary payload and headers in the same
+    ///   call, because a JetStream publish carries Nats-Msg-Id / Nats-Expected-*
+    ///   and expects a PubAck back
+    /// </summary>
+    function RequestSync(const ASubject: string; const AData: TBytes; AHeaders: TNatsHeaders;
+      out AReply: TNatsArgsMSG;
+      ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT): Boolean; overload;
 
     function Subscribe(const ASubject: string; AHandler: TNatsMsgHandler): Integer; overload;
     function Subscribe(const ASubject, AQueue: string; AHandler: TNatsMsgHandler): Integer; overload;
@@ -295,13 +377,107 @@ type
 implementation
 
 uses
-  Nats.Consts,
   Nats.Nuid,
   Nats.Exceptions;
 
 const
   /// How long the consumer waits on the queue before re-checking Terminated
   QUEUE_WAIT_MS = 250;
+
+type
+  /// <summary>
+  ///   The only implementation of INatsRequestWaiter - private to this unit,
+  ///   because nothing outside RequestSync has any business creating one
+  /// </summary>
+  TNatsRequestWaiter = class(TInterfacedObject, INatsRequestWaiter)
+  private
+    FEvent: TLightweightEvent;
+    FLock: TCriticalSection;
+    FMsg: TNatsArgsMSG;
+    FHasMsg: Boolean;
+    FCancelled: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure Signal(const AMsg: TNatsArgsMSG);
+    procedure Cancel;
+    function WaitFor(ATimeoutMs: Cardinal; out AMsg: TNatsArgsMSG): Boolean;
+  end;
+
+{ TNatsRequestWaiter }
+
+constructor TNatsRequestWaiter.Create;
+begin
+  inherited Create;
+  FEvent := TLightweightEvent.Create;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TNatsRequestWaiter.Destroy;
+begin
+  FLock.Free;
+  FEvent.Free;
+  inherited;
+end;
+
+procedure TNatsRequestWaiter.Signal(const AMsg: TNatsArgsMSG);
+begin
+  FLock.Enter;
+  try
+    { First reply wins. A second one is possible in principle - the server was
+      told UNSUB <sid> 1, but that only bounds what it delivers AFTER it reads
+      the UNSUB - and overwriting a message the caller may already be reading
+      would be a data race for no benefit }
+    if FHasMsg or FCancelled then
+      Exit;
+
+    FMsg := AMsg;   // a record copy: the handler's own copy dies on return
+    FHasMsg := True;
+  finally
+    FLock.Leave;
+  end;
+
+  FEvent.SetEvent;
+end;
+
+procedure TNatsRequestWaiter.Cancel;
+begin
+  FLock.Enter;
+  try
+    { A reply that already arrived is still a valid answer, even though the
+      connection is now going away - do not turn it into a failure }
+    if FHasMsg then
+      Exit;
+
+    FCancelled := True;
+  finally
+    FLock.Leave;
+  end;
+
+  FEvent.SetEvent;
+end;
+
+function TNatsRequestWaiter.WaitFor(ATimeoutMs: Cardinal; out AMsg: TNatsArgsMSG): Boolean;
+begin
+  { The result of the wait itself is deliberately ignored: a reply that lands in
+    the same instant the timeout expires is still a reply, so what counts is
+    what is in the waiter afterwards, not which of the two got there first }
+  FEvent.WaitFor(ATimeoutMs);
+
+  FLock.Enter;
+  try
+    if FCancelled then
+      raise ENatsException.Create(
+        'The connection was closed while waiting for a reply');
+
+    Result := FHasMsg;
+    if Result then
+      AMsg := FMsg;
+  finally
+    FLock.Leave;
+  end;
+end;
 
 { TNatsConnection }
 
@@ -311,16 +487,18 @@ begin
 
   FWriteLock := TCriticalSection.Create;
   FSubsLock := TCriticalSection.Create;
+  FRequestsLock := TCriticalSection.Create;
+  FPendingRequests := TList<INatsRequestWaiter>.Create;
   FState := STATE_CLOSED;
   FReadQueue := TNatsCommandQueue.Create;
   FGenerator := TNatsGenerator.Create;
   FSubscriptions := TNatsSubscriptions.Create([doOwnsValues]);
 
-  ConnectOptions.lang := 'Delphi';
-  ConnectOptions.version := NatsConstants.CLIENT_VERSION;
-  ConnectOptions.protocol := 1;
-  ConnectOptions.echo := True;
-  ConnectOptions.headers := True;
+  ConnectOptions.Lang := 'Delphi';
+  ConnectOptions.Version := NatsConstants.CLIENT_VERSION;
+  ConnectOptions.Protocol := 1;
+  ConnectOptions.Echo := True;
+  ConnectOptions.Headers := True;
 
   { TODO -opaolo -c : Remove the default behavior 31/05/2022 18:17:27 }
   FChannel := TNatsSocketRegistry.Get(String.Empty);
@@ -333,6 +511,9 @@ begin
   FSubscriptions.Free;
   FGenerator.Free;
   FReadQueue.Free;
+  { Close has already cancelled and released every waiter }
+  FPendingRequests.Free;
+  FRequestsLock.Free;
   FSubsLock.Free;
   FWriteLock.Free;
   inherited;
@@ -491,6 +672,49 @@ begin
   end;
 end;
 
+procedure TNatsConnection.AddPendingRequest(const AWaiter: INatsRequestWaiter);
+begin
+  FRequestsLock.Enter;
+  try
+    FPendingRequests.Add(AWaiter);
+  finally
+    FRequestsLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.RemovePendingRequest(const AWaiter: INatsRequestWaiter);
+begin
+  FRequestsLock.Enter;
+  try
+    { Remove of something already gone is a no-op, which is what makes this safe
+      to call unconditionally after CancelPendingRequests has emptied the list }
+    FPendingRequests.Remove(AWaiter);
+  finally
+    FRequestsLock.Leave;
+  end;
+end;
+
+procedure TNatsConnection.CancelPendingRequests;
+var
+  LWaiters: TArray<INatsRequestWaiter>;
+  LWaiter: INatsRequestWaiter;
+begin
+  { Snapshot under the lock, cancel outside it: Cancel signals an event, and no
+    lock in this class is ever held across a wait or a signal to another thread.
+    The array holds interface references, so every waiter stays alive for the
+    duration even if its caller returns and releases its own reference. }
+  FRequestsLock.Enter;
+  try
+    LWaiters := FPendingRequests.ToArray;
+    FPendingRequests.Clear;
+  finally
+    FRequestsLock.Leave;
+  end;
+
+  for LWaiter in LWaiters do
+    LWaiter.Cancel;
+end;
+
 procedure TNatsConnection.TearDown;
 begin
   TearDown('');
@@ -508,6 +732,10 @@ begin
   SignalStop;
   CloseChannel;
   ClearSubscriptions;
+  { After ClearSubscriptions, because that is what makes a reply impossible:
+    the inbox handlers are gone, so anyone still blocked in RequestSync would
+    otherwise sit there until its timeout waiting for nothing }
+  CancelPendingRequests;
 
   { Everything below happens once per connection. Tearing down an already
     closed connection is a no-op: in particular it must not overwrite the
@@ -537,8 +765,8 @@ end;
 procedure TNatsConnection.HandleInfo(const AInfo: TNatsServerInfo);
 begin
   if FChannel.MaxLineLength > 0 then
-    if AInfo.max_payload > 0 then
-      FChannel.MaxLineLength := AInfo.max_payload * 2;
+    if AInfo.MaxPayload > 0 then
+      FChannel.MaxLineLength := AInfo.MaxPayload * 2;
 
   { A server sends INFO again during the session - a cluster topology change,
     or lame duck mode. Answering those with a second CONNECT is a protocol
@@ -546,7 +774,7 @@ begin
   if FState <> STATE_CONNECTING then
     Exit;
 
-  if AInfo.tls_required then
+  if AInfo.TlsRequired then
   begin
     { Carrying on in plaintext just gets the connection dropped by the server
       with no explanation }
@@ -724,6 +952,79 @@ begin
   Unsubscribe(Result, 1);
 
   Publish(ASubject, AMessage, LInbox);
+end;
+
+function TNatsConnection.RequestSync(const ASubject, AMessage: string;
+  out AReply: TNatsArgsMSG; ATimeoutMs: Cardinal): Boolean;
+begin
+  Result := RequestSync(ASubject, TEncoding.UTF8.GetBytes(AMessage), nil, AReply, ATimeoutMs);
+end;
+
+function TNatsConnection.RequestSync(const ASubject: string; const AData: TBytes;
+  out AReply: TNatsArgsMSG; ATimeoutMs: Cardinal): Boolean;
+begin
+  Result := RequestSync(ASubject, AData, nil, AReply, ATimeoutMs);
+end;
+
+function TNatsConnection.RequestSync(const ASubject: string; const AData: TBytes;
+  AHeaders: TNatsHeaders; out AReply: TNatsArgsMSG; ATimeoutMs: Cardinal): Boolean;
+var
+  LWaiter: INatsRequestWaiter;
+  LInbox: string;
+  LId: Integer;
+begin
+  { Before anything is allocated or sent: a bad subject should not leave a
+    subscription behind, and a dead connection should say so rather than
+    surface as whatever error the socket layer happens to raise }
+  CheckSubject(ASubject);
+
+  if not Connected then
+    raise ENatsException.Create(
+      'Cannot send a request: the connection is not ready. Open it and wait ' +
+      'for WaitForReady before requesting');
+
+  if ATimeoutMs = 0 then
+    raise ENatsException.Create('A request timeout of 0 would wait forever');
+
+  LWaiter := TNatsRequestWaiter.Create;
+  LInbox := FGenerator.GetNewInbox;
+
+  { Registered before the subscription exists, so a connection torn down at any
+    point from here on releases this caller instead of stranding it }
+  AddPendingRequest(LWaiter);
+  try
+    { Subscribe before publishing: a fast responder can have the reply on the
+      wire before Publish has even returned }
+    LId := Subscribe(LInbox,
+      procedure (const AMsg: TNatsArgsMSG)
+      begin
+        { Runs on the consumer thread. LWaiter is an interface, so this closure
+          holds a reference of its own and the waiter cannot be freed while
+          this is executing - even if the caller below has long since timed
+          out, returned, and released its reference }
+        LWaiter.Signal(AMsg);
+      end);
+    try
+      { Exactly one reply is expected, so let the server drop the subscription
+        by itself the moment it delivers - the success path then needs no UNSUB
+        at all, on either side }
+      Unsubscribe(LId, 1);
+
+      PublishBytes(ASubject, AData, LInbox, AHeaders);
+
+      Result := LWaiter.WaitFor(ATimeoutMs, AReply);
+    finally
+      { EVERY exit path, including the timeout, a cancel, and an exception out
+        of Publish. On success this finds nothing and sends nothing, because
+        TakeMessageHandler already removed the subscription when Remaining hit
+        zero. On a timeout it is the only thing that ever removes the inbox -
+        without it each timed-out request leaks one entry from FSubscriptions
+        and leaves the inbox subscribed on the server. }
+      Unsubscribe(LId, 0);
+    end;
+  finally
+    RemovePendingRequest(LWaiter);
+  end;
 end;
 
 procedure TNatsConnection.Unsubscribe(AId: Integer; AMaxMsg: Integer = 0);

@@ -37,14 +37,14 @@
 
 - RAD Studio 12 Athens or 13. Developed and tested against **13**, Win32.
 - **Indy** (ships with RAD Studio) for the default socket adapter.
+- **[Neon](https://github.com/paolo-rossi/delphi-neon)** for JSON serialization, expected in `Libs\Neon`.
 - **DUnitX** to build and run the test suite.
 
-No other dependencies: the library needs only `rtl`, `IndySystem` and `IndyCore`.
+The runtime package requires `rtl`, `IndySystem`, `IndyCore` and `Neon`.
 
 ## Installation
 
-Nothing to build if you just want to use the client — add the `Source` folder to
-your project's search path and `uses` what you need:
+Add both `Source` and `Libs\Neon\Source` to your project's search path, then `uses` what you need:
 
 ```pascal
 uses
@@ -59,14 +59,18 @@ uses
 again: it registers the Indy socket adapter from its `initialization` section,
 and without it a connection has no transport to use.
 
-To build the runtime package instead, open `Packages\NatsLibrary.dproj` in the
-IDE, or from a command prompt (`rsvars.bat` lives in the RAD Studio `bin`
-folder and puts MSBuild and the compiler on the path):
+To build the runtime package instead, build Neon's package first
+(`Libs\Neon\Packages\11AndLater\Neon.dproj`) so that `Neon.dcp` exists, then
+`Packages\NatsLibrary.dproj`. From a command prompt — `rsvars.bat` lives in the
+RAD Studio `bin` folder and puts MSBuild and the compiler on the path:
 
 ```
 call "C:\Program Files (x86)\Embarcadero\Studio\37.0\bin\rsvars.bat"
+msbuild Libs\Neon\Packages\11AndLater\Neon.dproj /t:Build /p:Config=Release /p:Platform=Win32
 msbuild Packages\NatsLibrary.dproj /t:Build /p:Config=Release /p:Platform=Win32
 ```
+
+An application that links `NatsLibrary` as a runtime package has to deploy `Neon*.bpl` and `dbrtl*.bpl` alongside it.
 
 ## Quick start
 
@@ -79,7 +83,7 @@ try
       procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
       begin
         // optional: amend the options the client is about to send
-        AConnectOptions.name := 'my-app';
+        AConnectOptions.Name := 'my-app';
       end);
 
   // Open only starts the handshake - wait for it before using the connection
@@ -120,10 +124,10 @@ establishing the TCP connection may take. It is *not* a read timeout; see
 LConnection.Open(
   procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
   begin
-    // AInfo is the server's INFO: name, version, max_payload, auth_required...
+    // AInfo is the server's INFO: ServerName, Version, MaxPayload, AuthRequired...
     // AConnectOptions is passed by var, so credentials can be set here
-    AConnectOptions.user := 'joe';
-    AConnectOptions.pass := 'secret';
+    AConnectOptions.User := 'joe';
+    AConnectOptions.Pass := 'secret';
   end,
   procedure
   begin
@@ -250,7 +254,7 @@ begin
 end
 ```
 
-Header support is negotiated during the handshake: `ConnectOptions.headers`
+Header support is negotiated during the handshake: `ConnectOptions.Headers`
 defaults to `True`, and a server will refuse `HPUB` outright from a client that
 has not declared it. Leave it on unless you know otherwise.
 
@@ -362,12 +366,9 @@ keep-alive and disconnect reporting.
 
 Not implemented yet:
 
-- **Automatic reconnect.** A dropped connection is reported, not re-established;
-  `connect_urls` from the server's `INFO` is ignored.
-- **TLS.** A server whose `INFO` says `tls_required` is refused with a clear
-  error rather than being talked to in plaintext.
-- **NKey / JWT authentication.** `user`, `pass` and `auth_token` work; nothing
-  signs the server's nonce.
+- **Automatic reconnect.** A dropped connection is reported, not re-established; `connect_urls` from the server's `INFO` is ignored.
+- **TLS.** A server whose `INFO` says `tls_required` is refused with a clear error rather than being talked to in plaintext.
+- **NKey / JWT authentication.** `User`, `Pass` and `AuthToken` work; nothing signs the server's nonce.
 - **Request timeouts.**
 
 `Docs\Core-Protocol-Review.md` is a detailed protocol and concurrency review of

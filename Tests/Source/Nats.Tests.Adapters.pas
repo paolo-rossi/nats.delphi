@@ -104,8 +104,14 @@ type
                              // "a message arrived" is never satisfied by the
                              // handshake
     FConnectUser: string;
+    /// <summary>
+    ///   Drives the "server" side of a RequestSync, which blocks the test
+    ///   thread. Joined in TearDown so it can never outlive the mock socket
+    /// </summary>
+    FServerThread: TThread;
     procedure OpenAndHandshake;
     function LogHandler: TNatsMsgHandler;
+    procedure ReplyWhenSubscribed(const APayload: string);
   public
     [Setup]
     procedure Setup;
@@ -210,6 +216,32 @@ type
     procedure Request_SubscriptionIsDroppedAfterTheReply;
     [Test]
     procedure NewInbox_IsUniqueAcrossConnections;
+
+    { synchronous request - §1 of Docs\JetStream-Plan.md }
+
+    [Test]
+    procedure RequestSync_WritesSubArmUnsubThenPublish;
+    [Test]
+    procedure RequestSync_ReturnsTheReply;
+    [Test]
+    procedure RequestSync_Reply_LeavesNoSubscription;
+    [Test]
+    procedure RequestSync_Timeout_ReturnsFalse;
+    // the leak §1 exists to close: a reply that never comes used to leave the
+    // inbox subscribed on both sides, one entry per call
+    [Test]
+    procedure RequestSync_Timeout_RemovesTheSubscription;
+    [Test]
+    procedure RequestSync_Timeout_UnsubscribesOnTheWire;
+    // the form JetStream publish needs: binary payload plus headers
+    [Test]
+    procedure RequestSync_WithHeaders_WritesHpub;
+    [Test]
+    procedure RequestSync_ConnectionClosedWhileWaiting_Raises;
+    [Test]
+    procedure RequestSync_NotConnected_Raises;
+    [Test]
+    procedure RequestSync_ZeroTimeout_Raises;
   end;
 
 implementation
@@ -221,6 +253,13 @@ const
     '"jetstream":true,"client_id":7,"client_ip":"127.0.0.1"}';
 
   MOCK_TIMEOUT = 200;
+
+  /// <summary>
+  ///   Request timeout for the tests that mean to hit it. Short on purpose, and
+  ///   unrelated to the socket read timeout - the mock's is 30 s, so nothing
+  ///   here trips a keep-alive PING and pollutes the captured wire bytes
+  /// </summary>
+  REQUEST_TIMEOUT = 150;
 
 { TNatsSocketRegistryTests }
 
@@ -407,9 +446,48 @@ end;
 
 procedure TNatsConnectionProtocolTests.TearDown;
 begin
+  { Joined BEFORE the connection goes, because the mock socket is reference
+    counted and dies with it - a server thread still running would be touching
+    freed memory }
+  if Assigned(FServerThread) then
+  begin
+    FServerThread.WaitFor;
+    FreeAndNil(FServerThread);
+  end;
+
   FConn.Free;   // may fire the disconnect handler, which writes to FLog
   FMsgLog.Free;
   FLog.Free;
+end;
+
+procedure TNatsConnectionProtocolTests.ReplyWhenSubscribed(const APayload: string);
+var
+  LSocket: TNatsMockSocket;
+begin
+  LSocket := FSocket;
+
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LLines, LParts: TArray<string>;
+    begin
+      { Wait for the SUB to actually reach the wire. Replying earlier would
+        deliver a message for a sid that does not exist yet, and the consumer
+        would drop it }
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      // first line written by RequestSync is "SUB <inbox> <sid>"
+      LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+      LParts := LLines[0].Split([NatsConstants.SPC]);
+
+      LSocket.ServerSend(Format('MSG %s %s %d'#13#10'%s'#13#10,
+        [LParts[1], LParts[2], Length(TEncoding.UTF8.GetBytes(APayload)), APayload]));
+    end);
+
+  FServerThread.FreeOnTerminate := False;   // TearDown joins and frees it
+  FServerThread.Start;
 end;
 
 function TNatsConnectionProtocolTests.LogHandler: TNatsMsgHandler;
@@ -427,9 +505,9 @@ begin
   FConn.Open(
     procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
     begin
-      FLog.Add('CONNECT:' + AInfo.server_name);
+      FLog.Add('CONNECT:' + AInfo.ServerName);
       if FConnectUser <> '' then
-        AConnectOptions.user := FConnectUser;
+        AConnectOptions.User := FConnectUser;
     end,
     procedure
     begin
@@ -483,7 +561,7 @@ begin
 
   // ConnectOptions is passed to the handler as var, so what the handler sets
   // must end up in the CONNECT payload
-  Assert.IsTrue(FConn.ConnectOptions.user = 'joe', 'the handler must be able to set ConnectOptions');
+  Assert.IsTrue(FConn.ConnectOptions.User = 'joe', 'the handler must be able to set ConnectOptions');
 end;
 
 procedure TNatsConnectionProtocolTests.Connect_DeclaresHeaderSupport;
@@ -1109,6 +1187,180 @@ begin
   finally
     LOther.Free;
   end;
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_WritesSubArmUnsubThenPublish;
+var
+  LReply: TNatsArgsMSG;
+  LInbox, LSid: string;
+  LLines, LParts: TArray<string>;
+begin
+  OpenAndHandshake;
+
+  FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+  LParts := LLines[0].Split([NatsConstants.SPC]);   // SUB <inbox> <sid>
+
+  Assert.AreEqual(NatsConstants.Protocol.SUB, LParts[0],
+    'the inbox must be subscribed first: a fast responder can reply before Publish returns');
+  LInbox := LParts[1];
+  LSid := LParts[2];
+  Assert.IsTrue(LInbox.StartsWith(NatsConstants.INBOX_PREFIX), 'unexpected SUB line: ' + LLines[0]);
+
+  Assert.AreEqual(Format('%s %s 1', [NatsConstants.Protocol.UNSUB, LSid]), LLines[1],
+    'the one-reply auto-unsubscribe must be armed before the request goes out');
+  Assert.AreEqual(Format('%s svc.time %s 4', [NatsConstants.Protocol.PUB, LInbox]), LLines[2],
+    'the request must be published with the inbox as reply-to');
+  Assert.AreEqual('ping', LLines[3]);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_ReturnsTheReply;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+  ReplyWhenSubscribed('pong');
+
+  Assert.IsTrue(FConn.RequestSync('svc.time', 'ping', LReply),
+    'RequestSync must report that a reply arrived');
+  Assert.AreEqual('pong', LReply.Payload,
+    'the reply must be copied out of the consumer thread intact');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Reply_LeavesNoSubscription;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+  ReplyWhenSubscribed('pong');
+
+  Assert.IsTrue(FConn.RequestSync('svc.time', 'ping', LReply));
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'the inbox subscription must be gone once the reply has arrived');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Timeout_ReturnsFalse;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+
+  Assert.IsFalse(FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT),
+    'a request nobody answers must time out, not succeed');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Timeout_RemovesTheSubscription;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+
+  FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'a timed-out request must not leave its inbox subscribed - that leak is one ' +
+    'entry per call, and every JetStream operation is a request');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Timeout_UnsubscribesOnTheWire;
+var
+  LReply: TNatsArgsMSG;
+  LText: string;
+  LLines, LParts: TArray<string>;
+begin
+  OpenAndHandshake;
+
+  FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+
+  LText := FSocket.ClientText;
+  LLines := LText.Split([NatsConstants.CR_LF]);
+  LParts := LLines[0].Split([NatsConstants.SPC]);   // SUB <inbox> <sid>
+
+  { The server delivered none of the one message the auto-unsubscribe allowed,
+    so it still holds the subscription and has to be told explicitly. Note this
+    is the bare "UNSUB <sid>", which the armed "UNSUB <sid> 1" does not match }
+  Assert.IsTrue(LText.Contains(Format('%s %s%s',
+    [NatsConstants.Protocol.UNSUB, LParts[2], NatsConstants.CR_LF])),
+    'a timed-out request must unsubscribe its inbox on the server too, wrote: ' + LText);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_WithHeaders_WritesHpub;
+var
+  LReply: TNatsArgsMSG;
+  LHeaders: TNatsHeaders;
+  LText: string;
+begin
+  OpenAndHandshake;
+
+  LHeaders := nil;
+  LHeaders.Add('Nats-Msg-Id', 'abc');
+
+  FConn.RequestSync('foo', TEncoding.UTF8.GetBytes('hello'), LHeaders, LReply, REQUEST_TIMEOUT);
+
+  LText := FSocket.ClientText;
+  Assert.IsTrue(LText.Contains(NatsConstants.Protocol.HPUB + ' foo ' + NatsConstants.INBOX_PREFIX),
+    'a request carrying headers must go out as HPUB with the inbox as reply-to, wrote: ' + LText);
+  Assert.IsTrue(LText.Contains('Nats-Msg-Id: abc'),
+    'the header must reach the wire, wrote: ' + LText);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_ConnectionClosedWhileWaiting_Raises;
+var
+  LReply: TNatsArgsMSG;
+  LSocket: TNatsMockSocket;
+begin
+  OpenAndHandshake;
+
+  LSocket := FSocket;
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      // drop the connection instead of answering
+      if LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        LSocket.Close;
+    end);
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+
+  { A connection that goes away is not the same outcome as a responder that is
+    slow, and the caller must not have to sit out the whole timeout to find out }
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.RequestSync('svc.time', 'ping', LReply, 3000);
+    end,
+    ENatsException,
+    'a connection lost mid-request must raise, not look like a timeout');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_NotConnected_Raises;
+var
+  LReply: TNatsArgsMSG;
+begin
+  // no handshake at all: the socket was never opened
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+    end,
+    ENatsException);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_ZeroTimeout_Raises;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.RequestSync('svc.time', 'ping', LReply, 0);
+    end,
+    ENatsException,
+    'a zero timeout would block forever, which is never what the caller meant');
 end;
 
 initialization

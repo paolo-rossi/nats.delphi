@@ -337,16 +337,16 @@ begin
           TThread.Queue(TThread.Current,
             procedure
             begin
-              Log('Connected to server ' + AInfo.server_name);
+              Log('Connected to server ' + AInfo.ServerName);
 
-              lstServerInfo.Strings.Values['Server ID'] := AInfo.server_id;
-              lstServerInfo.Strings.Values['Server Name'] := AInfo.server_name;
-              lstServerInfo.Strings.Values['Server Version'] := AInfo.version;
-              lstServerInfo.Strings.Values['Protocol'] := AInfo.proto.ToString;
-              lstServerInfo.Strings.Values['Host'] := AInfo.host;
-              lstServerInfo.Strings.Values['Port'] := AInfo.port.ToString;
-              lstServerInfo.Strings.Values['Client ID'] := AInfo.client_id.ToString;
-              lstServerInfo.Strings.Values['Client IP'] := AInfo.client_ip;
+              lstServerInfo.Strings.Values['Server ID'] := AInfo.ServerId;
+              lstServerInfo.Strings.Values['Server Name'] := AInfo.ServerName;
+              lstServerInfo.Strings.Values['Server Version'] := AInfo.Version;
+              lstServerInfo.Strings.Values['Protocol'] := AInfo.Proto.ToString;
+              lstServerInfo.Strings.Values['Host'] := AInfo.Host;
+              lstServerInfo.Strings.Values['Port'] := AInfo.Port.ToString;
+              lstServerInfo.Strings.Values['Client ID'] := AInfo.ClientId.ToString;
+              lstServerInfo.Strings.Values['Client IP'] := AInfo.ClientIp;
             end
           );
         end,

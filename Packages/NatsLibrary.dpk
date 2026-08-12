@@ -33,7 +33,8 @@ package NatsLibrary;
 requires
   rtl,
   IndySystem,
-  IndyCore;
+  IndyCore,
+  Neon;
 
 contains
   Nats.Classes in '..\Source\Nats.Classes.pas',

@@ -81,6 +81,10 @@ type
     procedure Wildcard_Subscription_ReceivesMatchingSubjects;
     [Test]
     procedure Request_ReceivesTheResponderReply;
+    [Test]
+    procedure RequestSync_ReceivesTheResponderReply;
+    [Test]
+    procedure RequestSync_NoResponder_TimesOutAndCleansUp;
 
     // Covers §1, §2, §3, §4 and §19 together: publishing headers and getting
     // them back is only possible if all five are right
@@ -139,8 +143,8 @@ begin
   FConn.Open(
     procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
     begin
-      FServerName := AInfo.server_name;
-      FServerVersion := AInfo.version;
+      FServerName := AInfo.ServerName;
+      FServerVersion := AInfo.Version;
       FHandshakeDone := True;
     end);
 
@@ -343,6 +347,48 @@ begin
     WAIT_MS),
     'a ">" subscription must receive matching subjects');
   Assert.AreEqual(FSubject + '.one.two', FMsgLog.Item(0));
+end;
+
+procedure TNatsLiveServerTests.RequestSync_ReceivesTheResponderReply;
+var
+  LConn: TNatsConnection;
+  LReply: TNatsArgsMSG;
+begin
+  Connect;
+  LConn := FConn;
+
+  // responder: echo back on the reply subject
+  FConn.Subscribe(FSubject,
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      if AMsg.ReplyTo <> '' then
+        LConn.Publish(AMsg.ReplyTo, 'pong:' + AMsg.Payload);
+    end);
+
+  { Safe even though the responder shares this connection: RequestSync blocks
+    the CALLING thread, never the consumer thread that has to deliver both the
+    request and the reply, and it holds no lock while waiting }
+  Assert.IsTrue(FConn.RequestSync(FSubject, 'ping', LReply, WAIT_MS),
+    'the synchronous request never got a reply from a real server');
+  Assert.AreEqual('pong:ping', LReply.Payload);
+
+  { By the time RequestSync returns, the inbox is already gone: the consumer
+    removes it before invoking the handler that releases the caller }
+  Assert.AreEqual(1, Length(FConn.GetSubscriptionList),
+    'only the responder subscription should be left, the inbox must not linger');
+end;
+
+procedure TNatsLiveServerTests.RequestSync_NoResponder_TimesOutAndCleansUp;
+var
+  LReply: TNatsArgsMSG;
+begin
+  Connect;
+
+  // nobody is subscribed to FSubject, so the server has nowhere to route this
+  Assert.IsFalse(FConn.RequestSync(FSubject, 'ping', LReply, 300),
+    'a request with no responder must time out');
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'a timed-out request must leave no subscription behind');
 end;
 
 procedure TNatsLiveServerTests.Request_ReceivesTheResponderReply;

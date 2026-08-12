@@ -112,10 +112,10 @@ type
     [Test]
     procedure CopyHeaders_AppendsAllPairs;
 
-    // [KNOWN BUG §3] Text emits "Key=Value"; NATS headers are "Key: Value"
+    // §3: Text must emit "Key: Value", not "Key=Value"
     [Test]
     procedure Text_UsesColonSeparator;
-    // [KNOWN BUG §3 + §4] what we write must be readable by what we read
+    // §3 + §4: what we write must be readable by what we read
     [Test]
     procedure Text_RoundTripsThroughParseHeaders;
   end;
@@ -184,14 +184,14 @@ begin
   Assert.IsTrue(LCommand.CommandType = TNatsCommandServer.INFO, 'command type must be INFO');
 
   LInfo := LCommand.GetArgAsInfo.Info;
-  Assert.AreEqual('nats-1', LInfo.server_name);
-  Assert.AreEqual('2.10.11', LInfo.version);
-  Assert.AreEqual(1, LInfo.proto);
-  Assert.AreEqual(4222, LInfo.port);
-  Assert.AreEqual(1048576, LInfo.max_payload);
-  Assert.IsTrue(LInfo.headers, 'headers must be True');
-  Assert.IsTrue(LInfo.jetstream, 'jetstream must be True');
-  Assert.IsFalse(LInfo.tls_required, 'tls_required must be False');
+  Assert.AreEqual('nats-1', LInfo.ServerName);
+  Assert.AreEqual('2.10.11', LInfo.Version);
+  Assert.AreEqual(1, LInfo.Proto);
+  Assert.AreEqual(4222, LInfo.Port);
+  Assert.AreEqual(1048576, LInfo.MaxPayload);
+  Assert.IsTrue(LInfo.Headers, 'headers must be True');
+  Assert.IsTrue(LInfo.Jetstream, 'jetstream must be True');
+  Assert.IsFalse(LInfo.TlsRequired, 'tls_required must be False');
 end;
 
 procedure TNatsParserTests.Parse_INFO_WithoutPayload_Raises;
@@ -359,7 +359,7 @@ begin
   LHeaders := nil;
   FParser.ParseHeaders(HEADER_BLOCK, LHeaders);
 
-  // [KNOWN BUG §4] ParseHeaders takes ADestHeaders by value
+  // §4: ADestHeaders is a var parameter, so the parsed headers reach the caller
   Assert.AreEqual(1, LHeaders.Count, 'the parsed headers must reach the caller');
   Assert.AreEqual('V', LHeaders.GetHeader('K'));
 end;
@@ -487,7 +487,6 @@ begin
   LHeaders := nil;
   LHeaders.Add('Nats-Msg-Id', 'abc');
 
-  // [KNOWN BUG §3] Text currently emits "Nats-Msg-Id=abc"
   Assert.AreEqual('Nats-Msg-Id: abc'#13#10, LHeaders.Text,
     'NATS headers use the HTTP "Key: Value" form');
 end;
@@ -524,10 +523,10 @@ var
 begin
   LInfo := TNatsServerInfo.FromJSONString(INFO_JSON);
 
-  Assert.AreEqual('NDHJZQZ4YQXQ', LInfo.server_id);
-  Assert.AreEqual('127.0.0.1', LInfo.client_ip);
-  Assert.AreEqual(7, LInfo.client_id);
-  Assert.AreEqual(1048576, LInfo.max_payload);
+  Assert.AreEqual('NDHJZQZ4YQXQ', LInfo.ServerId);
+  Assert.AreEqual('127.0.0.1', LInfo.ClientIp);
+  Assert.AreEqual(7, LInfo.ClientId);
+  Assert.AreEqual(1048576, LInfo.MaxPayload);
 end;
 
 procedure TNatsEntitiesTests.ServerInfo_FromJSONString_IgnoresUnknownFields;
@@ -538,7 +537,7 @@ begin
   LInfo := TNatsServerInfo.FromJSONString(
     '{"server_name":"nats-1","cluster":"c1","connect_urls":["10.0.0.1:4222"],"ldm":false}');
 
-  Assert.AreEqual('nats-1', LInfo.server_name);
+  Assert.AreEqual('nats-1', LInfo.ServerName);
 end;
 
 procedure TNatsEntitiesTests.ConnectOptions_ToJSONString_UsesProtocolFieldNames;
@@ -547,15 +546,16 @@ var
   LJson: string;
 begin
   LOptions := Default(TNatsConnectOptions);
-  LOptions.lang := 'Delphi';
-  LOptions.version := NatsConstants.CLIENT_VERSION;
-  LOptions.protocol := 1;
-  LOptions.echo := True;
-  LOptions.user := 'joe';
+  LOptions.Lang := 'Delphi';
+  LOptions.Version := NatsConstants.CLIENT_VERSION;
+  LOptions.Protocol := 1;
+  LOptions.Echo := True;
+  LOptions.User := 'joe';
 
   LJson := LOptions.ToJSONString;
 
-  // the wire format is lowercase snake_case, matching the record fields verbatim
+  // the wire format is lowercase snake_case; Neon derives it from the PascalCase
+  // field names through TNeonCase.SnakeCase (see NatsJSONConfig)
   Assert.IsTrue(LJson.Contains('"lang":"Delphi"'), 'missing lang in ' + LJson);
   Assert.IsTrue(LJson.Contains('"protocol":1'), 'missing protocol in ' + LJson);
   Assert.IsTrue(LJson.Contains('"user":"joe"'), 'missing user in ' + LJson);
@@ -567,15 +567,15 @@ var
   LSource, LParsed: TNatsConnectOptions;
 begin
   LSource := Default(TNatsConnectOptions);
-  LSource.verbose := True;
-  LSource.name := 'client-1';
-  LSource.protocol := 1;
+  LSource.Verbose := True;
+  LSource.Name := 'client-1';
+  LSource.Protocol := 1;
 
   LParsed := TNatsConnectOptions.FromJSONString(LSource.ToJSONString);
 
-  Assert.IsTrue(LParsed.verbose, 'verbose must survive the round trip');
-  Assert.AreEqual('client-1', LParsed.name);
-  Assert.AreEqual(1, LParsed.protocol);
+  Assert.IsTrue(LParsed.Verbose, 'verbose must survive the round trip');
+  Assert.AreEqual('client-1', LParsed.Name);
+  Assert.AreEqual(1, LParsed.Protocol);
 end;
 
 procedure TNatsEntitiesTests.ConnectOptions_HeaderSupportFlagSerializes;
@@ -588,11 +588,11 @@ begin
   // That the connection turns this on by default is asserted by
   // TNatsConnectionProtocolTests.Connect_DeclaresHeaderSupport.
   LOptions := Default(TNatsConnectOptions);
-  LOptions.headers := True;
+  LOptions.Headers := True;
 
   Assert.IsTrue(LOptions.ToJSONString.Contains('"headers":true'),
     'the header support flag must reach the CONNECT payload');
-  Assert.IsTrue(TNatsConnectOptions.FromJSONString(LOptions.ToJSONString).headers,
+  Assert.IsTrue(TNatsConnectOptions.FromJSONString(LOptions.ToJSONString).Headers,
     'the header support flag must survive a round trip');
 end;
 
