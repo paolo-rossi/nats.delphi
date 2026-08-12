@@ -85,6 +85,9 @@ type
     procedure RequestSync_ReceivesTheResponderReply;
     [Test]
     procedure RequestSync_NoResponder_TimesOutAndCleansUp;
+    // §5: the whole point of the client-side check is that the connection lives
+    [Test]
+    procedure Publish_OversizedPayload_IsRefusedAndTheConnectionSurvives;
 
     // Covers §1, §2, §3, §4 and §19 together: publishing headers and getting
     // them back is only possible if all five are right
@@ -347,6 +350,47 @@ begin
     WAIT_MS),
     'a ">" subscription must receive matching subjects');
   Assert.AreEqual(FSubject + '.one.two', FMsgLog.Item(0));
+end;
+
+procedure TNatsLiveServerTests.Publish_OversizedPayload_IsRefusedAndTheConnectionSurvives;
+var
+  LTooBig: string;
+begin
+  Connect;
+
+  Assert.IsTrue(FConn.MaxPayload > 0,
+    'a real server always declares max_payload in INFO');
+  LTooBig := StringOfChar('x', FConn.MaxPayload + 1);
+
+  FConn.Subscribe(FSubject,
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      FMsgLog.AddFmt('%s|%s', [AMsg.Subject, AMsg.Payload]);
+    end);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish(FSubject, LTooBig);
+    end,
+    ENatsMaxPayloadError,
+    'one byte over the server''s own declared limit must be refused');
+
+  { This is what §5 is FOR. Left to the server, an oversized publish is answered
+    with -ERR 'Maximum Payload Violation' and the connection is closed, taking
+    this subscription down with it. Refusing at the call site costs one
+    exception and keeps everything else working }
+  Assert.IsTrue(FConn.Connected, 'the connection must survive a refused publish');
+
+  FConn.Publish(FSubject, 'still here');
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := ReceivedCount > 0;
+    end,
+    WAIT_MS),
+    'the subscription must still be delivering after a refused publish');
+  Assert.AreEqual(FSubject + '|still here', FMsgLog.Item(0));
 end;
 
 procedure TNatsLiveServerTests.RequestSync_ReceivesTheResponderReply;

@@ -230,6 +230,12 @@ type
     FPendingRequests: TList<INatsRequestWaiter>;
     FState: Integer;
     FPingOutstanding: Integer;
+    /// <summary>
+    ///   The server's declared max_payload, or 0 before INFO has arrived. Read
+    ///   from the caller's thread and written from the consumer's, so writes go
+    ///   through TInterlocked - the plain read matches how FState is handled
+    /// </summary>
+    FMaxPayload: Integer;
     FLastError: string;
 
     { every write to the channel goes through one of these }
@@ -248,6 +254,13 @@ type
     ///   is far harder to diagnose than an exception at the call site
     /// </summary>
     procedure CheckSubject(const ASubject: string);
+    /// <summary>
+    ///   Raises if ASize exceeds the server's max_payload. ASize is what the
+    ///   server counts: the payload for PUB, and the header block PLUS the
+    ///   payload for HPUB
+    /// </summary>
+    procedure CheckPayloadSize(ASize: Integer);
+    function GetMaxPayload: Integer;
     function GetConnected: Boolean;
     function GetReady: Boolean;
     function GetLastError: string;
@@ -354,6 +367,12 @@ type
     /// </summary>
     property Connected: Boolean read GetConnected;
     property Ready: Boolean read GetReady;
+    /// <summary>
+    ///   The largest message this server accepts, from INFO, or 0 before the
+    ///   handshake. Publishing more than this raises ENatsMaxPayloadError
+    ///   rather than letting the server close the connection over it
+    /// </summary>
+    property MaxPayload: Integer read GetMaxPayload;
     /// <summary>
     ///   Why the connection last failed; empty after a clean Close
     /// </summary>
@@ -543,6 +562,9 @@ begin
 
     FLastError := '';
     FPingOutstanding := 0;
+    { A previous session's limit must not be applied to this one - the INFO for
+      this connection has not arrived yet }
+    FMaxPayload := 0;
     FReadQueue.Clear;
 
     FChannel.Open;
@@ -571,6 +593,29 @@ begin
     if (LChar = ' ') or (LChar = #9) or (LChar = #13) or (LChar = #10) then
       raise ENatsException.CreateFmt(
         'The subject [%s] cannot contain whitespace or a line break', [ASubject]);
+end;
+
+procedure TNatsConnection.CheckPayloadSize(ASize: Integer);
+var
+  LMax: Integer;
+begin
+  LMax := FMaxPayload;
+
+  { Zero means the server has not told us yet, so there is nothing to check
+    against - publishing before the handshake fails on the socket anyway }
+  if (LMax <= 0) or (ASize <= LMax) then
+    Exit;
+
+  raise ENatsMaxPayloadError.CreateFmt(
+    'The message is %d bytes, more than the server''s max_payload of %d. ' +
+    'Sending it would be answered with -ERR ''Maximum Payload Violation'' and ' +
+    'the connection closed, taking every subscription on it down',
+    [ASize, LMax]);
+end;
+
+function TNatsConnection.GetMaxPayload: Integer;
+begin
+  Result := FMaxPayload;
 end;
 
 function TNatsConnection.GetConnected: Boolean;
@@ -768,6 +813,11 @@ begin
     if AInfo.MaxPayload > 0 then
       FChannel.MaxLineLength := AInfo.MaxPayload * 2;
 
+  { Remembered for CheckPayloadSize. Updated on EVERY INFO, not just the first:
+    a cluster reconfiguration can change the limit mid-session, and the handshake
+    guard below would skip it }
+  TInterlocked.Exchange(FMaxPayload, AInfo.MaxPayload);
+
   { A server sends INFO again during the session - a cluster topology change,
     or lame duck mode. Answering those with a second CONNECT is a protocol
     violation, so only the first one drives the handshake. }
@@ -853,6 +903,8 @@ begin
   CheckSubject(ASubject);
 
   LMessageBytes := TEncoding.UTF8.GetBytes(AMessage);
+  CheckPayloadSize(Length(LMessageBytes));
+
   if AReplyTo.IsEmpty then
     LPub := Format('%s %s %d', [NatsConstants.Protocol.PUB, ASubject, Length(LMessageBytes)])
   else
@@ -866,6 +918,7 @@ var
   LPub: string;
 begin
   CheckSubject(ASubject);
+  CheckPayloadSize(Length(AData));
 
   if AReplyTo.IsEmpty then
     LPub := Format('%s %s %d', [NatsConstants.Protocol.PUB, ASubject, Length(AData)])
@@ -912,6 +965,11 @@ begin
     that terminates the message itself. }
   LHeaderBytes := Length(LHeaderBlockBytes) + NatsConstants.CR_LF_LEN;
   LTotalBytes := LHeaderBytes + Length(AData);
+
+  { The server checks HPUB's <#total bytes> against max_payload, not the payload
+    alone, so headers count towards the limit. Checking only the payload here
+    would let a large header block through and still lose the connection }
+  CheckPayloadSize(LTotalBytes);
 
   if AReplyTo.IsEmpty then
     LPub := Format('%s %s %d %d', [

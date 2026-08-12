@@ -43,6 +43,19 @@ type
   /// </summary>
   ENatsProtocolError = class(ENatsException);
 
+  /// <summary>
+  ///   A message was refused before it was sent because it is larger than the
+  ///   max_payload the server declared in INFO
+  /// </summary>
+  /// <remarks>
+  ///   Its own type because it is the one publish failure a caller can do
+  ///   something about - chunk the message, or compress it - and because the
+  ///   alternative is far worse than an exception: the server answers an
+  ///   oversized message with -ERR 'Maximum Payload Violation' and closes the
+  ///   connection, so one bad publish takes down every subscription on it.
+  /// </remarks>
+  ENatsMaxPayloadError = class(ENatsException);
+
 implementation
 
 end.

@@ -109,7 +109,8 @@ type
     ///   thread. Joined in TearDown so it can never outlive the mock socket
     /// </summary>
     FServerThread: TThread;
-    procedure OpenAndHandshake;
+    procedure OpenAndHandshake; overload;
+    procedure OpenAndHandshake(const AInfoJson: string); overload;
     function LogHandler: TNatsMsgHandler;
     procedure ReplyWhenSubscribed(const APayload: string);
   public
@@ -253,6 +254,27 @@ type
     procedure RequestSync_NotConnected_Raises;
     [Test]
     procedure RequestSync_ZeroTimeout_Raises;
+
+    { max_payload - §5 of Docs\JetStream-Plan.md. Oversized publishes get the
+      connection closed by the server, so they must be refused at the call site }
+
+    [Test]
+    procedure MaxPayload_IsTakenFromInfo;
+    [Test]
+    procedure Publish_OversizedPayload_Raises;
+    [Test]
+    procedure Publish_OversizedPayload_WritesNothing;
+    [Test]
+    procedure Publish_ExactlyMaxPayload_IsAllowed;
+    [Test]
+    procedure PublishBytes_OversizedPayload_Raises;
+    // the server counts HPUB's <#total bytes>, so headers count too
+    [Test]
+    procedure Hpub_OversizedTotal_Raises;
+    [Test]
+    procedure Publish_BeforeInfo_IsNotSizeChecked;
+    [Test]
+    procedure MaxPayload_LaterInfo_UpdatesTheLimit;
   end;
 
 implementation
@@ -271,6 +293,16 @@ const
   ///   here trips a keep-alive PING and pollutes the captured wire bytes
   /// </summary>
   REQUEST_TIMEOUT = 150;
+
+  /// <summary>
+  ///   The same server, declaring a tiny max_payload. Lets the size checks be
+  ///   exercised exactly at the boundary without allocating megabytes
+  /// </summary>
+  SMALL_MAX_PAYLOAD = 32;
+  INFO_JSON_SMALL =
+    '{"server_id":"NDHJZQZ4YQXQ","server_name":"nats-1","version":"2.10.11",' +
+    '"proto":1,"host":"0.0.0.0","port":4222,"headers":true,"max_payload":32,' +
+    '"jetstream":true,"client_id":7,"client_ip":"127.0.0.1"}';
 
 { TNatsSocketRegistryTests }
 
@@ -513,6 +545,11 @@ end;
 
 procedure TNatsConnectionProtocolTests.OpenAndHandshake;
 begin
+  OpenAndHandshake(INFO_JSON);
+end;
+
+procedure TNatsConnectionProtocolTests.OpenAndHandshake(const AInfoJson: string);
+begin
   FConn.Open(
     procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
     begin
@@ -525,7 +562,7 @@ begin
       FLog.Add('DISCONNECT');
     end);
 
-  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON);
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + AInfoJson);
 
   Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.CONNECT),
     'the client never sent CONNECT in response to INFO');
@@ -1458,6 +1495,131 @@ begin
     end,
     ENatsException,
     'a zero timeout would block forever, which is never what the caller meant');
+end;
+
+procedure TNatsConnectionProtocolTests.MaxPayload_IsTakenFromInfo;
+begin
+  Assert.AreEqual(0, FConn.MaxPayload, 'nothing is known before the handshake');
+
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  Assert.AreEqual(SMALL_MAX_PAYLOAD, FConn.MaxPayload,
+    'the limit must be taken from the server''s INFO');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_OversizedPayload_Raises;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('foo', StringOfChar('x', SMALL_MAX_PAYLOAD + 1));
+    end,
+    ENatsMaxPayloadError,
+    'the server would answer this with -ERR and close the connection');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_OversizedPayload_WritesNothing;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  try
+    FConn.Publish('foo', StringOfChar('x', SMALL_MAX_PAYLOAD + 1));
+  except
+    on E: ENatsMaxPayloadError do ;   // expected, asserted by the test above
+  end;
+
+  { Nothing may reach the wire: a half-written PUB would desynchronise the
+    stream, which is worse than the violation it is avoiding }
+  Assert.AreEqual('', FSocket.ClientText,
+    'a refused publish must not put a single byte on the wire');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_ExactlyMaxPayload_IsAllowed;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  // the limit is inclusive: max_payload bytes is legal, one more is not
+  FConn.Publish('foo', StringOfChar('x', SMALL_MAX_PAYLOAD));
+
+  Assert.AreEqual(Format('PUB foo %d'#13#10'%s'#13#10,
+    [SMALL_MAX_PAYLOAD, StringOfChar('x', SMALL_MAX_PAYLOAD)]), FSocket.ClientText);
+end;
+
+procedure TNatsConnectionProtocolTests.PublishBytes_OversizedPayload_Raises;
+var
+  LData: TBytes;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  SetLength(LData, SMALL_MAX_PAYLOAD + 1);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.PublishBytes('foo', LData);
+    end,
+    ENatsMaxPayloadError,
+    'the binary path must be checked too, not just the string one');
+end;
+
+procedure TNatsConnectionProtocolTests.Hpub_OversizedTotal_Raises;
+var
+  LHeaders: TNatsHeaders;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  LHeaders := nil;
+  LHeaders.Add('K', 'V');
+
+  { The payload alone is 20 bytes, under the limit of 32. The header block adds
+    18, so <#total bytes> is 38 - and that total is what the server measures.
+    Checking only the payload here would let this through and lose the
+    connection anyway }
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('foo', StringOfChar('x', 20), '', LHeaders);
+    end,
+    ENatsMaxPayloadError,
+    'headers count towards max_payload, because HPUB declares a total');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_BeforeInfo_IsNotSizeChecked;
+begin
+  { No handshake, so no limit is known. Refusing here would be guessing, and
+    the publish fails on the socket anyway }
+  Assert.AreEqual(0, FConn.MaxPayload);
+  Assert.WillNotRaise(
+    procedure
+    begin
+      try
+        FConn.Publish('foo', StringOfChar('x', 10000));
+      except
+        on E: ENatsMaxPayloadError do
+          raise;              // the only failure this test cares about
+        on E: Exception do ;  // the socket is not open - not our concern here
+      end;
+    end,
+    ENatsMaxPayloadError);
+end;
+
+procedure TNatsConnectionProtocolTests.MaxPayload_LaterInfo_UpdatesTheLimit;
+begin
+  OpenAndHandshake(INFO_JSON);
+  Assert.AreEqual(1048576, FConn.MaxPayload, 'guard: the first INFO set the limit');
+
+  { A second INFO - a cluster reconfiguration - must not drive a second CONNECT,
+    but it must still update the limit }
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON_SMALL);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FConn.MaxPayload = SMALL_MAX_PAYLOAD;
+    end),
+    'a later INFO must update max_payload, not be ignored with the handshake');
 end;
 
 initialization
