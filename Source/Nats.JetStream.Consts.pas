@@ -19,6 +19,56 @@ type
   JetStreamConstants = class
   public type
     /// <summary>
+    ///   The reserved subjects the JetStream API answers on. Every one is a
+    ///   plain core NATS request/reply carrying JSON - JetStream adds no wire
+    ///   protocol of its own
+    /// </summary>
+    Api = class
+    const
+      /// <summary>
+      ///   Without a domain. A domain moves the whole API under
+      ///   $JS.&lt;domain&gt;.API instead, which is how a leaf node reaches the
+      ///   hub's JetStream rather than its own
+      /// </summary>
+      PREFIX = '$JS.API.';
+      PREFIX_DOMAIN = '$JS.%s.API.';
+
+      /// Account usage and limits - the cheapest call, so also a liveness check
+      INFO = 'INFO';
+
+      STREAM_CREATE = 'STREAM.CREATE.%s';
+      STREAM_UPDATE = 'STREAM.UPDATE.%s';
+      STREAM_DELETE = 'STREAM.DELETE.%s';
+      STREAM_INFO   = 'STREAM.INFO.%s';
+      STREAM_PURGE  = 'STREAM.PURGE.%s';
+      STREAM_LIST   = 'STREAM.LIST';
+      STREAM_NAMES  = 'STREAM.NAMES';
+
+      /// <summary>
+      ///   Ephemeral form - the server picks the name. A named or durable
+      ///   consumer uses CONSUMER_CREATE_NAMED instead
+      /// </summary>
+      CONSUMER_CREATE       = 'CONSUMER.CREATE.%s';
+      CONSUMER_CREATE_NAMED = 'CONSUMER.CREATE.%s.%s';
+      CONSUMER_DELETE       = 'CONSUMER.DELETE.%s.%s';
+      CONSUMER_INFO         = 'CONSUMER.INFO.%s.%s';
+      CONSUMER_LIST         = 'CONSUMER.LIST.%s';
+      CONSUMER_NAMES        = 'CONSUMER.NAMES.%s';
+      /// Pull consumption (Phase 4), listed here because it is an API subject
+      CONSUMER_MSG_NEXT     = 'CONSUMER.MSG.NEXT.%s.%s';
+    end;
+
+    /// <summary>
+    ///   Characters a stream or consumer name may not contain. A name goes into
+    ///   the API subject verbatim, so a dot would silently add a token and
+    ///   address a different endpoint entirely
+    /// </summary>
+    Naming = class
+    const
+      INVALID_CHARS = '.* >' + #9#13#10;
+    end;
+
+    /// <summary>
     ///   The reply-to subject of a message delivered by a JetStream consumer.
     ///   It is not an inbox: it carries the message's metadata in its tokens
     ///   AND is the subject an acknowledgement is published to

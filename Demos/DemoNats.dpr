@@ -35,7 +35,9 @@ uses
   Nats.Monitor in '..\Source\Nats.Monitor.pas',
   Nats.Classes in '..\Source\Nats.Classes.pas',
   Nats.Json.Utils in '..\Source\Nats.Json.Utils.pas',
+  Nats.JetStream.Client in '..\Source\Nats.JetStream.Client.pas',
   Nats.JetStream.Consts in '..\Source\Nats.JetStream.Consts.pas',
+  Nats.JetStream.Entities in '..\Source\Nats.JetStream.Entities.pas',
   Nats.JetStream.Message in '..\Source\Nats.JetStream.Message.pas',
   Nats.Nuid in '..\Source\Nats.Nuid.pas';
 

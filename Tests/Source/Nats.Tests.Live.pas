@@ -41,6 +41,8 @@ uses
   Nats.Connection,
   Nats.Nuid,
   Nats.Exceptions,
+  Nats.JetStream.Client,
+  Nats.JetStream.Entities,
 
   Nats.Tests.Mocks;
 
@@ -93,6 +95,51 @@ type
     // them back is only possible if all five are right
     [Test]
     procedure Headers_RoundTripThroughTheServer;
+  end;
+
+  /// <summary>
+  ///   The JetStream management API against a real server with JetStream
+  ///   enabled
+  /// </summary>
+  /// <remarks>
+  ///   These are the tests the mock cannot write. The mock proves the client
+  ///   sends what this library THINKS the API expects; only a real server
+  ///   proves that is what the API actually expects - a misspelled field is
+  ///   accepted and ignored, and comes back as the server's default.
+  /// </remarks>
+  [TestFixture]
+  [Category('Live')]
+  TJetStreamLiveTests = class
+  private
+    FConn: TNatsConnection;
+    FJs: TJetStreamContext;
+    /// Unique per test, so a crashed run never blocks the next one
+    FStream: string;
+    procedure Connect;
+    /// Deletes FStream, ignoring "it was not there"
+    procedure DropStream;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    [Test]
+    procedure AccountInfo_AnswersOnARealServer;
+    [Test]
+    procedure Stream_CreateInfoNamesDelete;
+    // the one that catches a misspelled field: the server echoes the config
+    // back, so anything it did not understand returns as ITS default
+    [Test]
+    procedure StreamConfig_SurvivesTheServerUnchanged;
+    [Test]
+    procedure Stream_CapturesPublishedMessages;
+    [Test]
+    procedure PurgeStream_EmptiesIt;
+    [Test]
+    procedure Consumer_CreateInfoNamesDelete;
+    [Test]
+    procedure StreamInfo_UnknownStream_RaisesNotFound;
   end;
 
 implementation
@@ -506,7 +553,285 @@ begin
   Assert.AreEqual('hello|1|delphi', FMsgLog.Item(0), 'headers must survive the round trip');
 end;
 
+{ TJetStreamLiveTests }
+
+procedure TJetStreamLiveTests.Setup;
+begin
+  UseIndySocket;
+
+  { Uppercase and NUID-suffixed: a stream name goes into the API subject
+    verbatim, and NUID is base62 so it can never contain a dot }
+  FStream := 'DELPHI_TEST_' + TNUID.NextNuid;
+
+  FConn := TNatsConnection.Create;
+  FConn.Name := 'JsLiveConn';
+  FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
+
+  FJs := TJetStreamContext.Create(FConn);
+end;
+
+procedure TJetStreamLiveTests.TearDown;
+begin
+  { Best effort: a test that never created the stream, or that already deleted
+    it, must not fail here }
+  if Assigned(FConn) and FConn.Connected then
+    DropStream;
+
+  FJs.Free;
+  FConn.Free;
+end;
+
+procedure TJetStreamLiveTests.Connect;
+begin
+  FConn.Open(nil);
+  Assert.IsTrue(FConn.WaitForReady(WAIT_MS),
+    Format('handshake with nats-server at %s:%d did not complete: %s',
+      [LIVE_HOST, NatsConstants.DEFAULT_PORT, FConn.LastError]));
+end;
+
+procedure TJetStreamLiveTests.DropStream;
+begin
+  try
+    FJs.DeleteStream(FStream);
+  except
+    on E: EJetStreamApiError do ;   // already gone, or never created
+    on E: EJetStreamTimeout do ;    // JetStream not enabled - the test says so
+  end;
+end;
+
+procedure TJetStreamLiveTests.AccountInfo_AnswersOnARealServer;
+var
+  LInfo: TJetStreamAccountInfo;
+begin
+  Connect;
+
+  { The cheapest possible JetStream call, and the one that fails outright if
+    JetStream is not enabled - so it doubles as the guard for everything below }
+  LInfo := FJs.AccountInfo;
+
+  Assert.IsTrue(LInfo.Limits.MaxMemory <> 0,
+    'a real account reports a memory limit, -1 meaning unlimited');
+end;
+
+procedure TJetStreamLiveTests.Stream_CreateInfoNamesDelete;
+var
+  LConfig: TJetStreamStreamConfig;
+  LInfo: TJetStreamStreamInfo;
+  LNames: TArray<string>;
+  LFound: Boolean;
+  LName: string;
+begin
+  Connect;
+
+  LConfig := Default(TJetStreamStreamConfig);
+  LConfig.Name := FStream;
+  LConfig.Subjects := [FStream + '.>'];
+  LConfig.Storage := TJetStreamStorage.Memory;   // no files left behind
+
+  LInfo := FJs.AddStream(LConfig);
+  Assert.AreEqual(FStream, LInfo.Config.Name, 'the server must echo the stream back');
+
+  LInfo := FJs.StreamInfo(FStream);
+  Assert.AreEqual(FStream, LInfo.Config.Name);
+  Assert.AreEqual(UInt64(0), LInfo.State.Messages, 'a fresh stream is empty');
+
+  LNames := FJs.StreamNames;
+  LFound := False;
+  for LName in LNames do
+    if LName = FStream then
+      LFound := True;
+  Assert.IsTrue(LFound, 'the new stream must appear in STREAM.NAMES');
+
+  Assert.IsTrue(FJs.DeleteStream(FStream));
+
+  // and it must really be gone
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.StreamInfo(FStream);
+    end,
+    EJetStreamApiError);
+end;
+
+procedure TJetStreamLiveTests.StreamConfig_SurvivesTheServerUnchanged;
+var
+  LConfig: TJetStreamStreamConfig;
+  LInfo: TJetStreamStreamInfo;
+begin
+  Connect;
+
+  LConfig := Default(TJetStreamStreamConfig);
+  LConfig.Name := FStream;
+  LConfig.Subjects := [FStream + '.>'];
+  LConfig.Storage := TJetStreamStorage.Memory;
+  LConfig.Retention := TJetStreamRetention.WorkQueue;
+  LConfig.Discard := TJetStreamDiscard.New;
+  LConfig.MaxMsgs := 500;
+  LConfig.MaxMsgsPerSubject := 50;
+  LConfig.MaxMsgSize := 4096;
+  LConfig.MaxAge := TJetStreamDuration.FromMinutes(30);
+  LConfig.DuplicateWindow := TJetStreamDuration.FromSeconds(90);
+  LConfig.DenyDelete := True;
+
+  LInfo := FJs.AddStream(LConfig);
+
+  { This is what the mock cannot check. A field whose JSON name the server does
+    not recognise is silently ignored, and comes back as the server's own
+    default - so every assertion here is really testing that the snake_case
+    name Neon derived is the one nats-server reads }
+  Assert.IsTrue(LInfo.Config.Retention = TJetStreamRetention.WorkQueue, 'retention');
+  Assert.IsTrue(LInfo.Config.Storage = TJetStreamStorage.Memory, 'storage');
+  Assert.IsTrue(LInfo.Config.Discard = TJetStreamDiscard.New, 'discard');
+  Assert.AreEqual(Int64(500), LInfo.Config.MaxMsgs, 'max_msgs');
+  Assert.AreEqual(Int64(50), LInfo.Config.MaxMsgsPerSubject, 'max_msgs_per_subject');
+  Assert.AreEqual(4096, LInfo.Config.MaxMsgSize, 'max_msg_size');
+  Assert.AreEqual(Int64(TJetStreamDuration.FromMinutes(30)), Int64(LInfo.Config.MaxAge),
+    'max_age - and that it is nanoseconds, not millis');
+  Assert.AreEqual(Int64(TJetStreamDuration.FromSeconds(90)), Int64(LInfo.Config.DuplicateWindow),
+    'duplicate_window');
+  Assert.IsTrue(LInfo.Config.DenyDelete, 'deny_delete');
+end;
+
+procedure TJetStreamLiveTests.Stream_CapturesPublishedMessages;
+var
+  LConfig: TJetStreamStreamConfig;
+  LConn: TNatsConnection;
+  LJs: TJetStreamContext;
+  LStream: string;
+begin
+  Connect;
+
+  LConfig := Default(TJetStreamStreamConfig);
+  LConfig.Name := FStream;
+  LConfig.Subjects := [FStream + '.>'];
+  LConfig.Storage := TJetStreamStorage.Memory;
+  FJs.AddStream(LConfig);
+
+  // an ordinary core publish: the stream captures it because its filter matches
+  FConn.Publish(FStream + '.one', 'first');
+  FConn.Publish(FStream + '.two', 'second');
+
+  { A core publish has no ack, so the store happens asynchronously from this
+    thread's point of view - poll rather than sleep. Phase 3's publish-with-ack
+    is what removes this race for real code }
+  LJs := FJs;
+  LConn := FConn;
+  LStream := FStream;
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := LConn.Connected and (LJs.StreamInfo(LStream).State.Messages >= 2);
+    end,
+    WAIT_MS),
+    'the stream never captured the published messages');
+end;
+
+procedure TJetStreamLiveTests.PurgeStream_EmptiesIt;
+var
+  LConfig: TJetStreamStreamConfig;
+  LJs: TJetStreamContext;
+  LStream: string;
+  LPurged: UInt64;
+begin
+  Connect;
+
+  LConfig := Default(TJetStreamStreamConfig);
+  LConfig.Name := FStream;
+  LConfig.Subjects := [FStream + '.>'];
+  LConfig.Storage := TJetStreamStorage.Memory;
+  FJs.AddStream(LConfig);
+
+  FConn.Publish(FStream + '.one', 'first');
+
+  LJs := FJs;
+  LStream := FStream;
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := LJs.StreamInfo(LStream).State.Messages >= 1;
+    end,
+    WAIT_MS),
+    'nothing was stored to purge');
+
+  LPurged := FJs.PurgeStream(FStream);
+
+  Assert.IsTrue(LPurged >= 1, 'purge must report how many it removed');
+  Assert.AreEqual(UInt64(0), FJs.StreamInfo(FStream).State.Messages,
+    'the stream must be empty afterwards, but still exist');
+end;
+
+procedure TJetStreamLiveTests.Consumer_CreateInfoNamesDelete;
+var
+  LStreamCfg: TJetStreamStreamConfig;
+  LConsumerCfg: TJetStreamConsumerConfig;
+  LInfo: TJetStreamConsumerInfo;
+  LNames: TArray<string>;
+  LFound: Boolean;
+  LName: string;
+begin
+  Connect;
+
+  LStreamCfg := Default(TJetStreamStreamConfig);
+  LStreamCfg.Name := FStream;
+  LStreamCfg.Subjects := [FStream + '.>'];
+  LStreamCfg.Storage := TJetStreamStorage.Memory;
+  FJs.AddStream(LStreamCfg);
+
+  { A durable PULL consumer: DeliverSubject stays empty, which is what makes it
+    pull rather than push - and the server rejects an empty one, so this also
+    proves the field really was omitted rather than sent blank }
+  LConsumerCfg := Default(TJetStreamConsumerConfig);
+  LConsumerCfg.DurableName := 'workers';
+  LConsumerCfg.AckPolicy := TJetStreamAckPolicy.Explicit;
+  LConsumerCfg.AckWait := TJetStreamDuration.FromSeconds(20);
+  LConsumerCfg.MaxDeliver := 3;
+
+  LInfo := FJs.AddConsumer(FStream, LConsumerCfg);
+  Assert.AreEqual('workers', LInfo.Name);
+  Assert.AreEqual(FStream, LInfo.StreamName);
+  Assert.IsTrue(LInfo.Config.AckPolicy = TJetStreamAckPolicy.Explicit, 'ack_policy');
+  Assert.AreEqual(Int64(TJetStreamDuration.FromSeconds(20)), Int64(LInfo.Config.AckWait),
+    'ack_wait must survive as nanoseconds');
+  Assert.AreEqual(3, LInfo.Config.MaxDeliver, 'max_deliver');
+
+  LInfo := FJs.ConsumerInfo(FStream, 'workers');
+  Assert.AreEqual('workers', LInfo.Name);
+
+  LNames := FJs.ConsumerNames(FStream);
+  LFound := False;
+  for LName in LNames do
+    if LName = 'workers' then
+      LFound := True;
+  Assert.IsTrue(LFound, 'the consumer must appear in CONSUMER.NAMES');
+
+  Assert.IsTrue(FJs.DeleteConsumer(FStream, 'workers'));
+end;
+
+procedure TJetStreamLiveTests.StreamInfo_UnknownStream_RaisesNotFound;
+var
+  LRaised: Boolean;
+begin
+  Connect;
+
+  { The error path against the real error table, not one this repo made up }
+  LRaised := False;
+  try
+    FJs.StreamInfo('DELPHI_NO_SUCH_STREAM_' + TNUID.NextNuid);
+  except
+    on E: EJetStreamApiError do
+    begin
+      LRaised := True;
+      Assert.AreEqual(404, E.Code, 'a missing stream is a 404');
+      Assert.IsTrue(E.IsNotFound);
+      Assert.IsTrue(E.ErrCode > 0, 'the server always sets a specific err_code');
+    end;
+  end;
+
+  Assert.IsTrue(LRaised, 'asking for a stream that does not exist must raise');
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TNatsLiveServerTests);
+  TDUnitX.RegisterTestFixture(TJetStreamLiveTests);
 
 end.
