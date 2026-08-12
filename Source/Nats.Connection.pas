@@ -1350,7 +1350,11 @@ begin
     else
       SetLength(LHeaderBlockBytes, 0);
 
-    FParser.ParseHeaders(TEncoding.UTF8.GetString(LHeaderBlockBytes), LMsgArgs.Headers);
+    { The status comes out of the same block as the headers - it is the tail of
+      its NATS/1.0 line - and has to be carried on the message, because a status
+      message has an empty body and would otherwise look like an empty message }
+    FParser.ParseHeaders(TEncoding.UTF8.GetString(LHeaderBlockBytes), LMsgArgs.Headers,
+      LMsgArgs.Status, LMsgArgs.Description);
     ACommand.Arguments := TValue.From<TNatsArgsMSG>(LMsgArgs);
 
     if LMsgArgs.PayloadBytes > 0 then

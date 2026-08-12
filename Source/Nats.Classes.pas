@@ -79,6 +79,30 @@ type
     HeaderBytes: Integer;   // Length of the header block (for HMSG)
     TotalMsgBytes: Integer; // Total bytes for HMSG (HeaderBytes + PayloadBytes)
     Headers: TNatsHeaders;  // Parsed NATS headers
+    /// <summary>
+    ///   The code from the header block's status line - "NATS/1.0 404 No
+    ///   Messages" gives 404 - or 0 when the message carries no status, which
+    ///   is the case for every ordinary message
+    /// </summary>
+    /// <remarks>
+    ///   A status message is control flow, not data: its body is always empty.
+    ///   Without this field a "404 No Messages" is indistinguishable from a
+    ///   legitimate empty message, which is what makes pull consumers
+    ///   impossible to implement. See NatsConstants.Status for the codes.
+    /// </remarks>
+    Status: Integer;
+    /// <summary>
+    ///   The human-readable part of the status line ('No Messages'), empty when
+    ///   the server sent a bare code or no status at all. Informational only -
+    ///   branch on Status, never on this
+    /// </summary>
+    Description: string;
+
+    /// <summary>
+    ///   True when the server sent a status line instead of data. The payload
+    ///   of such a message is meaningless and must not be delivered onwards
+    /// </summary>
+    function HasStatus: Boolean;
   end;
 
   TNatsCommand = record
@@ -261,6 +285,15 @@ begin
   if Arguments.IsEmpty or not Arguments.IsType<string> then
     Exit('');
   Result := Arguments.AsString;
+end;
+
+{ TNatsArgsMSG }
+
+function TNatsArgsMSG.HasStatus: Boolean;
+begin
+  { Codes are three digits, so zero cannot collide with a real one - it simply
+    means the header block had no status line, or there was no header block }
+  Result := Status > 0;
 end;
 
 { TNatsArgsINFO }

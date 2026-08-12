@@ -203,6 +203,17 @@ type
     [Test]
     procedure Hmsg_HeadersAreDeliveredToTheHandler;
 
+    { status line - §2 of Docs\JetStream-Plan.md }
+
+    // the whole point: a "404 No Messages" and a legitimate empty message are
+    // the same bytes apart from the status line
+    [Test]
+    procedure Hmsg_StatusMessage_CarriesTheStatusCode;
+    [Test]
+    procedure Hmsg_EmptyMessage_HasNoStatus;
+    [Test]
+    procedure Msg_WithoutHeaderBlock_HasNoStatus;
+
     { request / inbox }
 
     [Test]
@@ -1187,6 +1198,92 @@ begin
   finally
     LOther.Free;
   end;
+end;
+
+procedure TNatsConnectionProtocolTests.Hmsg_StatusMessage_CarriesTheStatusCode;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('foo',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d|%s|%s|%d', [AMsg.Status, AMsg.Description, AMsg.Payload,
+        Ord(AMsg.HasStatus)]);
+    end);
+
+  { 'NATS/1.0 404 No Messages'#13#10 is 26 bytes, + the blank line = 28, and a
+    status message has no payload at all, so total = 28 }
+  FSocket.ServerSend(Format('HMSG foo %d 28 28'#13#10, [LSid]) +
+    'NATS/1.0 404 No Messages'#13#10#13#10 + #13#10);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the status message was never dispatched');
+  Assert.AreEqual('404|No Messages||1', FMsgLog.Item(0),
+    'a pull consumer cannot work until 404 reaches it as a status, not as an empty message');
+end;
+
+procedure TNatsConnectionProtocolTests.Hmsg_EmptyMessage_HasNoStatus;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('foo',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d|%s|%s|%d', [AMsg.Status, AMsg.Description, AMsg.Payload,
+        Ord(AMsg.HasStatus)]);
+    end);
+
+  // a real message that happens to have headers and an empty body: 18-byte
+  // header block, no payload
+  FSocket.ServerSend(Format('HMSG foo %d 18 18'#13#10, [LSid]) +
+    'NATS/1.0'#13#10'K: V'#13#10#13#10 + #13#10);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the empty message was never dispatched');
+  Assert.AreEqual('0|||0', FMsgLog.Item(0),
+    'an empty message must NOT look like a status - that is the distinction §2 exists for');
+end;
+
+procedure TNatsConnectionProtocolTests.Msg_WithoutHeaderBlock_HasNoStatus;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('foo',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d|%d', [AMsg.Status, Ord(AMsg.HasStatus)]);
+    end);
+
+  FSocket.ServerSend(Format('MSG foo %d 5'#13#10'hello'#13#10, [LSid]));
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the message was never dispatched');
+  Assert.AreEqual('0|0', FMsgLog.Item(0),
+    'a plain MSG has no header block, so it can never carry a status');
 end;
 
 procedure TNatsConnectionProtocolTests.RequestSync_WritesSubArmUnsubThenPublish;

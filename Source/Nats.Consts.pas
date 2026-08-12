@@ -122,6 +122,29 @@ type
       UNKNOWN = 'UNKNOWN'; // For parser if command is not recognized
     end;
 
+    /// <summary>
+    ///   Codes that can appear on the header block's status line, as in
+    ///   "NATS/1.0 404 No Messages". A status message has an EMPTY body: it is
+    ///   control flow, not data, and a consumer that treats it as a message
+    ///   hands the application a phantom empty payload
+    /// </summary>
+    Status = class
+    const
+      /// A pull consumer's batch produced nothing before it gave up
+      NO_MESSAGES = 404;
+      /// The pull request's own expiry elapsed
+      REQUEST_TIMEOUT = 408;
+      /// Consumer deleted, or the request exceeded MaxWaiting
+      CONFLICT = 409;
+      /// Keep-alive on an idle push consumer or pull batch
+      IDLE_HEARTBEAT = 100;
+      /// <summary>
+      ///   Nobody is subscribed to the requested subject. Only ever sent to a
+      ///   client that asked for it in CONNECT, which this one does not do yet
+      /// </summary>
+      NO_RESPONDERS = 503;
+    end;
+
     class function DEFAULT_URI: string; static;
   end;
 

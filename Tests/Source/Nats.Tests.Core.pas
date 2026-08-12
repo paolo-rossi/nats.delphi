@@ -88,6 +88,22 @@ type
     procedure ParseHeaders_FillsTheDestinationArray;
     [Test]
     procedure ParseHeaders_SkipsTheVersionLine;
+
+    { status line - §2 of Docs\JetStream-Plan.md. Pull consumers signal all
+      their control flow this way, so a status must never read as data }
+
+    [Test]
+    procedure ParseHeaders_StatusLine_YieldsCodeAndDescription;
+    [Test]
+    procedure ParseHeaders_StatusLine_IsNotAHeaderPair;
+    [Test]
+    procedure ParseHeaders_PlainVersionLine_YieldsNoStatus;
+    [Test]
+    procedure ParseHeaders_StatusWithoutDescription_YieldsCodeOnly;
+    [Test]
+    procedure ParseHeaders_StatusLineAndHeaders_BothParse;
+    [Test]
+    procedure ParseHeaders_StatusLineNotFirst_IsNotAStatus;
   end;
 
   [TestFixture]
@@ -362,6 +378,94 @@ begin
   // §4: ADestHeaders is a var parameter, so the parsed headers reach the caller
   Assert.AreEqual(1, LHeaders.Count, 'the parsed headers must reach the caller');
   Assert.AreEqual('V', LHeaders.GetHeader('K'));
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLine_YieldsCodeAndDescription;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0 404 No Messages'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(NatsConstants.Status.NO_MESSAGES, LStatus, 'the status code must survive');
+  Assert.AreEqual('No Messages', LDescription);
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLine_IsNotAHeaderPair;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0 404 No Messages'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(0, LHeaders.Count,
+    'the status line is control flow, not a header pair');
+end;
+
+procedure TNatsParserTests.ParseHeaders_PlainVersionLine_YieldsNoStatus;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0'#13#10'K: V'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(0, LStatus, 'an ordinary header block carries no status');
+  Assert.AreEqual('', LDescription);
+  Assert.AreEqual(1, LHeaders.Count, 'and its headers must still parse');
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusWithoutDescription_YieldsCodeOnly;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0 100'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(NatsConstants.Status.IDLE_HEARTBEAT, LStatus);
+  Assert.AreEqual('', LDescription, 'a bare code has no description to invent');
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLineAndHeaders_BothParse;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  // an idle heartbeat carries both a status and real headers
+  FParser.ParseHeaders(
+    'NATS/1.0 100 Idle Heartbeat'#13#10 +
+    'Nats-Last-Consumer: 5'#13#10 +
+    'Nats-Last-Stream: 12'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(NatsConstants.Status.IDLE_HEARTBEAT, LStatus);
+  Assert.AreEqual('Idle Heartbeat', LDescription,
+    'a multi-word description must not be truncated at the first space');
+  Assert.AreEqual(2, LHeaders.Count);
+  Assert.AreEqual('5', LHeaders.GetHeader('Nats-Last-Consumer'));
+  Assert.AreEqual('12', LHeaders.GetHeader('Nats-Last-Stream'));
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLineNotFirst_IsNotAStatus;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  // only the FIRST line can be a status; anything later is just a header
+  FParser.ParseHeaders('NATS/1.0'#13#10'K: V'#13#10'NATS/1.0 404 No Messages'#13#10#13#10,
+    LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(0, LStatus, 'a status line can only be the first line of the block');
 end;
 
 procedure TNatsParserTests.ParseHeaders_SkipsTheVersionLine;

@@ -43,7 +43,14 @@ type
         function Parse(const ACommand: string): TNatsCommand;
         // Parse headers from a raw string block into ADestHeaders (which is
         // overwritten, hence "var": TNatsHeaders is a dynamic array)
-        procedure ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
+        procedure ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders); overload;
+        /// <summary>
+        ///   The full form. A header block's first line may carry a status -
+        ///   "NATS/1.0 404 No Messages" - which is NOT a header pair and has no
+        ///   place to live in ADestHeaders. AStatus is 0 when there is none
+        /// </summary>
+        procedure ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders;
+          out AStatus: Integer; out ADescription: string); overload;
         // Attach the payload to a command, once it has been read off the wire.
         // A procedure, not a function that also takes a var parameter: the old
         // signature let a caller do both and left it unclear which one mattered
@@ -111,40 +118,70 @@ type
 
     procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders);
     var
-      Lines: TArray<string>;
-      S: string;
-      P: Integer;
-      LKey, LValue: string;
-      IsFirstLine: Boolean;
+      LStatus: Integer;
+      LDescription: string;
+    begin
+      { For callers that only want the pairs. There is one implementation, so
+        the two forms can never drift apart }
+      ParseHeaders(AHeaderBlock, ADestHeaders, LStatus, LDescription);
+    end;
+
+    procedure TNatsParser.ParseHeaders(const AHeaderBlock: string; var ADestHeaders: TNatsHeaders;
+      out AStatus: Integer; out ADescription: string);
+    var
+      LLines: TArray<string>;
+      LLine, LKey, LValue, LRest: string;
+      LPos, LSpace: Integer;
+      LIsFirstLine: Boolean;
     begin
       ADestHeaders := [];
-      Lines := AHeaderBlock.Split([NatsConstants.CR_LF]);
-      IsFirstLine := True;
+      AStatus := 0;
+      ADescription := '';
 
-      for S in Lines do
+      LLines := AHeaderBlock.Split([NatsConstants.CR_LF]);
+      LIsFirstLine := True;
+
+      for LLine in LLines do
       begin
-        if Trim(S) = '' then
+        if Trim(LLine) = '' then
           Continue; // Skip empty lines
 
-        if IsFirstLine and S.StartsWith(NatsConstants.CLIENT_HEADER_VERSION) then // Check for NATS/1.0
+        if LIsFirstLine and LLine.StartsWith(NatsConstants.CLIENT_HEADER_VERSION) then // NATS/1.0
         begin
-          IsFirstLine := False;
-          Continue; // Skip the version line itself from being parsed as a Key:Value
-        end;
-        IsFirstLine := False; // No longer the first line after one iteration
+          LIsFirstLine := False;
 
-        P := Pos(':', S);
-        if P > 0 then
-        begin
-          LKey := Trim(Copy(S, 1, P - 1));
-          LValue := Trim(Copy(S, P + 1, Length(S)));
-          ADestHeaders := ADestHeaders + [TNatsHeader.Create(LKey, LValue)];
-        end
-        else
-        begin
-          // This might be a malformed header or the NATS/1.0 line if not handled above
-          // For robustness, one might log this or handle it based on strictness
+          { The version line is never a header pair, but it is not always just a
+            version either: anything after "NATS/1.0" is a status, the code
+            first and then an optional description. Discarding it - which is
+            what this used to do - makes "404 No Messages" arrive as an empty
+            message with no headers, indistinguishable from a real one }
+          LRest := Trim(LLine.Substring(Length(NatsConstants.CLIENT_HEADER_VERSION)));
+          if LRest <> '' then
+          begin
+            LSpace := Pos(NatsConstants.SPC, LRest);
+            if LSpace > 0 then
+            begin
+              AStatus := StrToIntDef(Copy(LRest, 1, LSpace - 1), 0);
+              ADescription := Trim(Copy(LRest, LSpace + 1, MaxInt));
+            end
+            else
+              AStatus := StrToIntDef(LRest, 0);   // a bare code, no description
+          end;
+
+          Continue;
         end;
+        LIsFirstLine := False; // No longer the first line after one iteration
+
+        LPos := Pos(NatsConstants.COL, LLine);
+        if LPos > 0 then
+        begin
+          LKey := Trim(Copy(LLine, 1, LPos - 1));
+          LValue := Trim(Copy(LLine, LPos + 1, Length(LLine)));
+          ADestHeaders := ADestHeaders + [TNatsHeader.Create(LKey, LValue)];
+        end;
+        { A line with no colon is malformed. Dropping it is deliberate: the
+          alternative is failing the whole message over one bad header, and the
+          byte counts have already told us where the block ends }
       end;
     end;
 
@@ -201,6 +238,12 @@ type
     begin
       Result.CommandType := TNatsCommandServer.MSG;
 
+      { Zero the whole record first. A local record's unmanaged fields are
+        whatever was on the stack, and a plain MSG never touches Status - which
+        made HasStatus true at random. Default() also covers any field added
+        here later }
+      LArg := Default(TNatsArgsMSG);
+
       LSplit := ACommand.Split([NatsConstants.SPC]);
       // MSG <subject> <sid> [reply-to] <#bytes>
       if (Length(LSplit) < 4) or (Length(LSplit) > 5) then
@@ -234,6 +277,10 @@ type
       LArg: TNatsArgsMSG;
     begin
       Result.CommandType := TNatsCommandServer.HMSG;
+
+      { See ParseMSG: a local record starts as stack garbage. Status is filled
+        in later by ParseHeaders, but only if there is a header block to read }
+      LArg := Default(TNatsArgsMSG);
 
       LSplit := ACommand.Split([NatsConstants.SPC]);
       // HMSG <subject> <sid> [reply-to] <#header_bytes> <#total_bytes>
