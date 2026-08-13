@@ -23,6 +23,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.DateUtils, System.JSON,
+  System.Diagnostics,
 
   DUnitX.TestFramework,
 
@@ -180,10 +181,26 @@ type
     procedure CaptureRequest(const AProc: TProc);
     /// Plays the server: waits for the inbox SUB, then answers with AJson
     procedure ReplyWith(const AJson: string);
+    /// <summary>
+    ///   As ReplyWith, but the answer is a header status line and no body -
+    ///   which is what a status message always is
+    /// </summary>
+    procedure ReplyWithStatus(AStatus: Integer; const ADescription: string);
+    /// <summary>
+    ///   Plays the server for a PULL batch: waits for the inbox SUB, delivers
+    ///   one message per payload with a real $JS.ACK reply-to, then closes the
+    ///   batch with AStatus - which is how the server always ends one
+    /// </summary>
+    procedure ReplyWithBatch(const APayloads: TArray<string>; AStatus: Integer;
+      const ADescription: string; ALeadingStatus: Integer = 0);
     /// The subject of the PUB the client wrote
     function RequestSubject: string;
     /// The body of the PUB the client wrote
     function RequestBody: string;
+    /// The whole control line the client wrote for AVerb, or '' if it wrote none
+    function ControlLine(const AVerb: string): string;
+    /// The header block of the HPUB the client wrote, blank line excluded
+    function RequestHeaders: string;
   public
     [Setup]
     procedure Setup;
@@ -239,6 +256,165 @@ type
     procedure ApiError_NotFound_IsRecognised;
     [Test]
     procedure NoReply_RaisesTimeout;
+    [Test]
+    procedure EmptyReply_Raises;
+    [Test]
+    procedure StatusReply_RaisesInsteadOfAnEmptyRecord;
+
+    { publishing with an ack - Phase 3 }
+
+    [Test]
+    procedure Publish_WithoutOptions_UsesPub;
+    [Test]
+    procedure Publish_WithOptions_UsesHpub;
+    [Test]
+    procedure Publish_SendsThePayloadAndAnInboxReplyTo;
+    [Test]
+    procedure Publish_ParsesThePubAck;
+    [Test]
+    procedure Publish_Duplicate_IsReported;
+    [Test]
+    procedure Publish_MsgId_IsOnTheWire;
+    [Test]
+    procedure Publish_ExpectedLastSeqZero_IsOnTheWire;
+    [Test]
+    procedure Publish_FailedExpectation_RaisesApiError;
+    [Test]
+    procedure Publish_NoStream_RaisesTimeoutNotSilence;
+    [Test]
+    procedure PublishBytes_SendsTheBytesUnchanged;
+
+    { pull consumption - Phase 4 }
+
+    [Test]
+    procedure Fetch_AsksTheMsgNextSubject;
+    [Test]
+    procedure Fetch_SendsTheBatchSize;
+    [Test]
+    procedure Fetch_ExpiryIsShorterThanTheCallersWait;
+    [Test]
+    procedure Fetch_CollectsTheWholeBatch;
+    [Test]
+    procedure Fetch_MessagesCarryTheirMetadata;
+    [Test]
+    procedure Fetch_StatusClosesTheBatchEarly;
+    [Test]
+    procedure Fetch_IdleHeartbeat_DoesNotCloseTheBatch;
+    [Test]
+    procedure Fetch_NothingThere_ReturnsAnEmptyArray;
+    [Test]
+    procedure Fetch_UnsubscribesTheInbox;
+    [Test]
+    procedure Fetch_EmptyBatch_Raises;
+    [Test]
+    procedure FetchNoWait_SetsNoWaitAndNoExpiry;
+    [Test]
+    procedure Next_ReturnsTheFirstMessage;
+    [Test]
+    procedure Next_NothingThere_ReturnsFalse;
+
+    { push consumption - Phase 4 }
+
+    [Test]
+    procedure SubscribePush_SubscribesToTheDeliverSubject;
+    [Test]
+    procedure SubscribePush_PullConsumer_Raises;
+    [Test]
+    procedure SubscribePush_DeliversWrappedMessages;
+    [Test]
+    procedure SubscribePush_FlowControl_IsAnswered;
+    [Test]
+    procedure SubscribePush_StatusNeverReachesTheHandler;
+  end;
+
+  /// <summary>
+  ///   The message wrapper: what a delivered message can answer for itself.
+  ///   Needs a connection, because acking means publishing
+  /// </summary>
+  [TestFixture]
+  TJetStreamMsgTests = class
+  private
+    FConn: TNatsConnection;
+    FSocket: TNatsMockSocket;
+
+    procedure OpenAndHandshake;
+    /// A delivered message with AAckSubject as its reply-to
+    function Delivery(const AAckSubject: string): TNatsArgsMSG;
+    /// What the client wrote to the ack subject, payload included
+    function AckPayload: string;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    { what can be wrapped at all }
+
+    [Test]
+    procedure TryWrap_JetStreamDelivery_Succeeds;
+    [Test]
+    procedure TryWrap_OrdinaryCoreReply_Fails;
+    [Test]
+    procedure TryWrap_StatusMessage_Fails;
+    [Test]
+    procedure TryWrap_NoReplyTo_Fails;
+    [Test]
+    procedure Create_NonJetStreamMessage_Raises;
+
+    { the message itself }
+
+    [Test]
+    procedure Msg_ExposesPayloadSubjectAndMetadata;
+
+    { acking }
+
+    [Test]
+    procedure Ack_PublishesPlusAckToTheAckSubject;
+    [Test]
+    procedure Nak_PublishesMinusNak;
+    [Test]
+    procedure Nak_WithDelay_CarriesNanoseconds;
+    [Test]
+    procedure Term_PublishesPlusTerm;
+    [Test]
+    procedure InProgress_PublishesPlusWpi;
+    [Test]
+    procedure Ack_MarksTheMessageAcknowledged;
+    [Test]
+    procedure Ack_Twice_Raises;
+    [Test]
+    procedure Nak_AfterAck_Raises;
+    [Test]
+    procedure InProgress_DoesNotSettleTheMessage;
+    [Test]
+    procedure InProgress_MayRepeatAndStillBeAcked;
+  end;
+
+  /// <summary>
+  ///   TJetStreamPubOptions on its own. Pure: it only builds headers, so none
+  ///   of this needs a connection
+  /// </summary>
+  [TestFixture]
+  TJetStreamPubOptionsTests = class
+  public
+    [Test]
+    procedure Empty_HasNoHeaders;
+    [Test]
+    procedure MsgId_UsesTheSpecHeaderName;
+    [Test]
+    procedure Expectations_UseTheSpecHeaderNames;
+    [Test]
+    procedure ExpectedLastSeq_Zero_IsStillEmitted;
+    [Test]
+    procedure SameOptionTwice_ReplacesRatherThanDuplicates;
+    [Test]
+    procedure Chaining_KeepsEveryOption;
+    [Test]
+    procedure BranchingFromAnOptionsValue_DoesNotShareState;
+    [Test]
+    procedure BranchingAndReplacingAnOption_DoesNotShareState;
+    [Test]
+    procedure CustomHeader_IsAppended;
   end;
 
 implementation
@@ -286,6 +462,18 @@ const
   MOCK_TIMEOUT = 200;
   /// Short, so the tests that only care what was WRITTEN do not sit out a wait
   API_TIMEOUT = 200;
+  /// <summary>
+  ///   Deliberately LONG, for the fetch tests that assert the wait was cut
+  ///   short. The margin between "the status ended it" and "the whole wait
+  ///   elapsed" is the assertion, so it has to be wide enough to be unambiguous
+  /// </summary>
+  LONG_WAIT = 3000;
+  /// <summary>
+  ///   How long ReplyWithBatch pauses after a leading status before sending any
+  ///   data. Long enough that a fetch which wrongly ended on the status is back
+  ///   with nothing before the message is even sent
+  /// </summary>
+  HEARTBEAT_GAP = 300;
 
   JS_INFO_JSON =
     '{"server_id":"NDHJZQZ4YQXQ","server_name":"nats-1","version":"2.10.11",' +
@@ -296,6 +484,37 @@ const
   ERROR_RESPONSE_JSON =
     '{"type":"io.nats.jetstream.api.v1.stream_info_response",' +
     '"error":{"code":404,"err_code":10059,"description":"stream not found"}}';
+
+  { publishing - captured from nats-server 2.10 }
+
+  PUB_ACK_JSON =
+    '{"stream":"ORDERS","seq":42,"domain":"hub"}';
+
+  /// Same Nats-Msg-Id inside the duplicate window: stored once, acked twice
+  PUB_ACK_DUPLICATE_JSON =
+    '{"stream":"ORDERS","seq":7,"duplicate":true}';
+
+  /// Nats-Expected-Last-Sequence did not hold
+  PUB_ACK_ERROR_JSON =
+    '{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 5"}}';
+
+  { consuming }
+
+  /// The same consumer as CONSUMER_INFO_JSON but PUSH: it has a deliver_subject
+  CONSUMER_INFO_PUSH_JSON =
+    '{"type":"io.nats.jetstream.api.v1.consumer_info_response",' +
+    '"stream_name":"ORDERS","name":"pushers","created":"2023-11-14T22:13:25Z",' +
+    '"config":{"durable_name":"pushers","name":"pushers","deliver_policy":"all",' +
+    '"ack_policy":"explicit","deliver_subject":"deliver.pushers",' +
+    '"max_deliver":-1,"replay_policy":"instant"},' +
+    '"delivered":{"consumer_seq":0,"stream_seq":0},' +
+    '"ack_floor":{"consumer_seq":0,"stream_seq":0},' +
+    '"num_pending":0,"push_bound":true}';
+
+  /// A well-formed V2 ack subject for stream ORDERS, consumer workers, seq 42
+  ACK_SUBJECT =
+    '$JS.ACK.hub.ACCHASH.ORDERS.workers.1.42.7.1700000000123456789.0.rnd01';
 
 { TJetStreamMetadataTests }
 
@@ -946,6 +1165,126 @@ begin
   FServerThread.Start;
 end;
 
+procedure TJetStreamContextTests.ReplyWithStatus(AStatus: Integer; const ADescription: string);
+var
+  LSocket: TNatsMockSocket;
+  LBlock: string;
+begin
+  LSocket := FSocket;
+  LBlock := Format('%s %d %s'#13#10,
+    [NatsConstants.CLIENT_HEADER_VERSION, AStatus, ADescription]);
+
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LLines, LParts: TArray<string>;
+      LLen: Integer;
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+      LParts := LLines[0].Split([NatsConstants.SPC]);
+
+      { <#header bytes> counts the blank line that closes the block, and a
+        status message has no payload at all - so <#total bytes> is the same }
+      LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+      LSocket.ServerSend(Format('%s %s %s %d %d'#13#10,
+        [NatsConstants.Protocol.HMSG, LParts[1], LParts[2], LLen, LLen]) +
+        LBlock + #13#10 + #13#10);
+    end);
+
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+end;
+
+/// <summary>
+///   One HMSG carrying nothing but a status line, ready to hand to ServerSend.
+///   Unit level rather than nested: an anonymous method cannot capture a local
+///   function, and every caller here is inside one
+/// </summary>
+function StatusFrame(const AInbox, ASid: string; ACode: Integer;
+  const AText: string): string;
+var
+  LBlock: string;
+  LLen: Integer;
+begin
+  LBlock := Format('%s %d %s'#13#10,
+    [NatsConstants.CLIENT_HEADER_VERSION, ACode, AText]);
+
+  { <#header bytes> counts the blank line that closes the block, and a status
+    message has no payload at all - so <#total bytes> is the same }
+  LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+  Result := Format('%s %s %s %d %d'#13#10,
+    [NatsConstants.Protocol.HMSG, AInbox, ASid, LLen, LLen]) +
+    LBlock + #13#10 + #13#10;
+end;
+
+procedure TJetStreamContextTests.ReplyWithBatch(const APayloads: TArray<string>;
+  AStatus: Integer; const ADescription: string; ALeadingStatus: Integer);
+var
+  LSocket: TNatsMockSocket;
+  LPayloads: TArray<string>;
+  LStatus, LLeading: Integer;
+  LDescription: string;
+begin
+  LSocket := FSocket;
+  LPayloads := APayloads;
+  LStatus := AStatus;
+  LLeading := ALeadingStatus;
+  LDescription := ADescription;
+
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LLines, LParts: TArray<string>;
+      LInbox, LSid, LAckSubject: string;
+      LIndex: Integer;
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+      LParts := LLines[0].Split([NatsConstants.SPC]);
+      LInbox := LParts[1];
+      LSid := LParts[2];
+
+      { Sent BEFORE any data, and then a real pause. Both halves are needed to
+        tell a status that closes the batch from one that is swallowed: without
+        the pause the message follows so closely that the batch fills either
+        way, and the test cannot fail. The pause IS the experiment }
+      if LLeading > 0 then
+      begin
+        LSocket.ServerSend(StatusFrame(LInbox, LSid, LLeading, 'Idle Heartbeat'));
+        Sleep(HEARTBEAT_GAP);
+      end;
+
+      for LIndex := 0 to High(LPayloads) do
+      begin
+        { Every delivery carries a $JS.ACK reply-to - that IS the metadata, and
+          without one the message is not a JetStream delivery at all }
+        LAckSubject := Format(
+          '$JS.ACK.hub.ACCHASH.ORDERS.workers.1.%d.%d.1700000000123456789.%d.rnd',
+          [LIndex + 1, LIndex + 1, High(LPayloads) - LIndex]);
+
+        LSocket.ServerSend(Format('%s %s %s %s %d'#13#10'%s'#13#10,
+          [NatsConstants.Protocol.MSG, LInbox, LSid, LAckSubject,
+           Length(TEncoding.UTF8.GetBytes(LPayloads[LIndex])), LPayloads[LIndex]]));
+      end;
+
+      { The server always closes a batch out with a status, even a full one }
+      if LStatus > 0 then
+        LSocket.ServerSend(StatusFrame(LInbox, LSid, LStatus, LDescription));
+    end);
+
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+end;
+
 function TJetStreamContextTests.RequestSubject: string;
 var
   LLine: string;
@@ -954,6 +1293,39 @@ begin
   for LLine in FSocket.ClientText.Split([NatsConstants.CR_LF]) do
     if LLine.StartsWith(NatsConstants.Protocol.PUB + ' ') then
       Exit(LLine.Split([NatsConstants.SPC])[1]);
+end;
+
+function TJetStreamContextTests.ControlLine(const AVerb: string): string;
+var
+  LLine: string;
+begin
+  Result := '';
+  for LLine in FSocket.ClientText.Split([NatsConstants.CR_LF]) do
+    if LLine.StartsWith(AVerb + NatsConstants.SPC) then
+      Exit(LLine);
+end;
+
+function TJetStreamContextTests.RequestHeaders: string;
+var
+  LLines: TArray<string>;
+  LIndex, LNext: Integer;
+begin
+  Result := '';
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+
+  for LIndex := 0 to High(LLines) do
+    if LLines[LIndex].StartsWith(NatsConstants.Protocol.HPUB + NatsConstants.SPC) then
+    begin
+      { the block runs from the line after the control line to the blank line
+        that closes it }
+      for LNext := LIndex + 1 to High(LLines) do
+      begin
+        if LLines[LNext].IsEmpty then
+          Exit;
+        Result := Result + LLines[LNext] + NatsConstants.CR_LF;
+      end;
+      Exit;
+    end;
 end;
 
 function TJetStreamContextTests.RequestBody: string;
@@ -1281,9 +1653,1031 @@ begin
     EJetStreamTimeout);
 end;
 
+procedure TJetStreamContextTests.EmptyReply_Raises;
+begin
+  OpenAndHandshake;
+  ReplyWith('');
+
+  { An empty body deserializes into a record of zeroes, which reads exactly
+    like a stream whose every field happens to be a default. Better to say so }
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.StreamInfo('ORDERS');
+    end,
+    ENatsException);
+end;
+
+procedure TJetStreamContextTests.StatusReply_RaisesInsteadOfAnEmptyRecord;
+var
+  LRaised: EJetStreamStatusError;
+begin
+  OpenAndHandshake;
+  ReplyWithStatus(NatsConstants.Status.NO_RESPONDERS, 'No Responders');
+
+  LRaised := nil;
+  try
+    try
+      FJs.StreamInfo('ORDERS');
+      Assert.Fail('a status line is not a response body and must not be parsed as one');
+    except
+      on E: EJetStreamStatusError do
+        LRaised := EJetStreamStatusError(AcquireExceptionObject);
+    end;
+
+    Assert.IsNotNull(LRaised, 'the status must surface as EJetStreamStatusError');
+    Assert.AreEqual(NatsConstants.Status.NO_RESPONDERS, LRaised.Status);
+    Assert.AreEqual('No Responders', LRaised.Description);
+  finally
+    LRaised.Free;
+  end;
+end;
+
+{ publishing with an ack }
+
+procedure TJetStreamContextTests.Publish_WithoutOptions_UsesPub;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Publish('orders.new', '{"id":1}');
+    end);
+
+  { Nothing about a plain JetStream publish needs headers, and HPUB with an
+    empty block would only cost bytes against max_payload }
+  Assert.AreEqual('orders.new', RequestSubject, 'a publish goes to the subject, not to $JS.API');
+  Assert.AreEqual('', ControlLine(NatsConstants.Protocol.HPUB), 'no options means no headers, so PUB');
+end;
+
+procedure TJetStreamContextTests.Publish_WithOptions_UsesHpub;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Publish('orders.new', '{"id":1}', TJetStreamPubOptions.New.WithMsgId('order-1'));
+    end);
+
+  Assert.IsTrue(ControlLine(NatsConstants.Protocol.HPUB).StartsWith('HPUB orders.new '),
+    'options are headers, and headers mean HPUB, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.Publish_SendsThePayloadAndAnInboxReplyTo;
+var
+  LParts: TArray<string>;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Publish('orders.new', '{"id":1}');
+    end);
+
+  { PUB <subject> <reply-to> <#bytes>. The reply-to is what makes this a
+    JetStream publish rather than a fire-and-forget one }
+  LParts := ControlLine(NatsConstants.Protocol.PUB).Split([NatsConstants.SPC]);
+  Assert.AreEqual(4, Length(LParts), 'a JetStream publish must carry a reply-to');
+  Assert.IsTrue(LParts[2].StartsWith(NatsConstants.INBOX_PREFIX),
+    'the reply-to must be an inbox, was: ' + LParts[2]);
+  Assert.AreEqual('{"id":1}', RequestBody);
+end;
+
+procedure TJetStreamContextTests.Publish_ParsesThePubAck;
+var
+  LAck: TJetStreamPubAck;
+begin
+  OpenAndHandshake;
+  ReplyWith(PUB_ACK_JSON);
+
+  LAck := FJs.Publish('orders.new', '{"id":1}');
+
+  Assert.AreEqual('ORDERS', LAck.Stream, 'the ack names the stream that captured it');
+  Assert.AreEqual(UInt64(42), LAck.Seq);
+  Assert.AreEqual('hub', LAck.Domain);
+  Assert.IsFalse(LAck.Duplicate);
+end;
+
+procedure TJetStreamContextTests.Publish_Duplicate_IsReported;
+var
+  LAck: TJetStreamPubAck;
+begin
+  OpenAndHandshake;
+  ReplyWith(PUB_ACK_DUPLICATE_JSON);
+
+  LAck := FJs.Publish('orders.new', '{"id":1}',
+    TJetStreamPubOptions.New.WithMsgId('order-1'));
+
+  { The publish SUCCEEDED and stored nothing. Without this flag the caller
+    cannot tell that from a first-time store, and Seq points at the original }
+  Assert.IsTrue(LAck.Duplicate, 'a deduplicated publish must say so');
+  Assert.AreEqual(UInt64(7), LAck.Seq, 'Seq points at the message already stored');
+end;
+
+procedure TJetStreamContextTests.Publish_MsgId_IsOnTheWire;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Publish('orders.new', '{"id":1}', TJetStreamPubOptions.New.WithMsgId('order-1'));
+    end);
+
+  { The server reads this header by its exact name - a misspelling silently
+    turns deduplication off rather than failing }
+  Assert.IsTrue(RequestHeaders.Contains('Nats-Msg-Id: order-1'),
+    'the dedup id must be on the wire under its spec name, block was: ' + RequestHeaders);
+end;
+
+procedure TJetStreamContextTests.Publish_ExpectedLastSeqZero_IsOnTheWire;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Publish('orders.new', '{"id":1}',
+        TJetStreamPubOptions.New.WithExpectedLastSeq(0));
+    end);
+
+  { Zero is an assertion that the stream is EMPTY, which is how a caller
+    publishes the first message of a sequence and no other. A record of plain
+    UInt64s could not tell that apart from "left alone", which is why the
+    options are fluent }
+  Assert.IsTrue(RequestHeaders.Contains('Nats-Expected-Last-Sequence: 0'),
+    'an expectation of zero is still an expectation, block was: ' + RequestHeaders);
+end;
+
+procedure TJetStreamContextTests.Publish_FailedExpectation_RaisesApiError;
+var
+  LRaised: EJetStreamApiError;
+begin
+  OpenAndHandshake;
+  ReplyWith(PUB_ACK_ERROR_JSON);
+
+  LRaised := nil;
+  try
+    try
+      FJs.Publish('orders.new', '{"id":1}',
+        TJetStreamPubOptions.New.WithExpectedLastSeq(3));
+      Assert.Fail('a rejected publish must raise, not return an ack of zeroes');
+    except
+      on E: EJetStreamApiError do
+        LRaised := EJetStreamApiError(AcquireExceptionObject);
+    end;
+
+    Assert.IsNotNull(LRaised);
+    Assert.AreEqual(10071, LRaised.ErrCode, 'err_code identifies the failed expectation');
+    Assert.AreEqual(400, LRaised.Code);
+  finally
+    LRaised.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.Publish_NoStream_RaisesTimeoutNotSilence;
+begin
+  OpenAndHandshake;
+
+  { This is the whole point of publishing through JetStream: core NATS would
+    have accepted the same publish, dropped it and told nobody. Nothing answers
+    a subject no stream captures, so the timeout IS the diagnosis }
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Publish('nowhere.at.all', 'x');
+    end,
+    EJetStreamTimeout);
+end;
+
+procedure TJetStreamContextTests.PublishBytes_SendsTheBytesUnchanged;
+var
+  LData, LWire: TBytes;
+  LIndex, LPayloadAt: Integer;
+  LControl: string;
+begin
+  OpenAndHandshake;
+
+  { Not valid UTF-8: a byte sequence a string round trip would destroy. That is
+    also why this test never touches ClientText - decoding these bytes raises }
+  LData := [$00, $FF, $FE, $41];
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.PublishBytes('orders.blob', LData);
+    end);
+
+  LWire := FSocket.ClientBytes;
+
+  LPayloadAt := -1;
+  for LIndex := 0 to Length(LWire) - Length(LData) do
+    if CompareMem(@LWire[LIndex], @LData[0], Length(LData)) then
+    begin
+      LPayloadAt := LIndex;
+      Break;
+    end;
+
+  Assert.IsTrue(LPayloadAt > 0, 'the payload bytes must reach the wire untouched');
+
+  { The control line is ASCII even when the payload is not, so it can be read
+    on its own - and it must declare 4, the BYTE count }
+  LControl := TEncoding.ASCII.GetString(LWire, 0, LPayloadAt);
+  Assert.IsTrue(LControl.Contains(NatsConstants.Protocol.PUB + ' orders.blob '),
+    'the publish must go to the subject, wrote: ' + LControl);
+  Assert.IsTrue(LControl.TrimRight.EndsWith(' 4'),
+    'the declared length must be the byte count, wrote: ' + LControl);
+end;
+
+{ pull consumption }
+
+procedure TJetStreamContextTests.Fetch_AsksTheMsgNextSubject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers');
+    end);
+
+  Assert.AreEqual('$JS.API.CONSUMER.MSG.NEXT.ORDERS.workers', RequestSubject);
+end;
+
+procedure TJetStreamContextTests.Fetch_SendsTheBatchSize;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10);
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    Assert.AreEqual(10, LBody.GetValue<Integer>('batch'));
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.Fetch_ExpiryIsShorterThanTheCallersWait;
+var
+  LBody: TJSONObject;
+  LExpiresNanos: Int64;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 1, 1000);
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    LExpiresNanos := LBody.GetValue<Int64>('expires');
+
+    { The SERVER has to give up first. If it does not, an empty consumer leaves
+      the client timing out blind and the request pending against MaxWaiting }
+    Assert.IsTrue(LExpiresNanos > 0, 'a batch request must carry an expiry');
+    Assert.IsTrue(LExpiresNanos < TJetStreamDuration.FromMillis(1000),
+      'the expiry must be shorter than the caller''s own wait');
+
+    { and nanoseconds, not milliseconds - a factor of a million }
+    Assert.AreEqual(Int64(TJetStreamDuration.FromMillis(900)), LExpiresNanos);
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.Fetch_CollectsTheWholeBatch;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  OpenAndHandshake;
+  ReplyWithBatch(['one', 'two', 'three'], 0, '');
+
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 3);
+
+  Assert.AreEqual(3, Length(LMsgs), 'a full batch must return as soon as it is full');
+  Assert.AreEqual('one', LMsgs[0].Payload);
+  Assert.AreEqual('three', LMsgs[2].Payload);
+end;
+
+procedure TJetStreamContextTests.Fetch_MessagesCarryTheirMetadata;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  OpenAndHandshake;
+  ReplyWithBatch(['one'], 0, '');
+
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 1);
+
+  Assert.AreEqual(1, Length(LMsgs));
+
+  { The reply-to is both the metadata and the ack address, so a fetched message
+    that lost it could not be acked either }
+  Assert.AreEqual('ORDERS', LMsgs[0].Metadata.Stream);
+  Assert.AreEqual('workers', LMsgs[0].Metadata.Consumer);
+  Assert.AreEqual(UInt64(1), LMsgs[0].Metadata.StreamSeq);
+  Assert.IsTrue(LMsgs[0].AckSubject.StartsWith(JetStreamConstants.Ack.PREFIX));
+end;
+
+procedure TJetStreamContextTests.Fetch_StatusClosesTheBatchEarly;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+  LClock: TStopwatch;
+begin
+  OpenAndHandshake;
+
+  { Two of the three asked for, then the server gives up. This is the normal
+    shape of a pull against a nearly empty stream }
+  ReplyWithBatch(['one', 'two'], NatsConstants.Status.REQUEST_TIMEOUT, 'Request Timeout');
+
+  LClock := TStopwatch.StartNew;
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 3, LONG_WAIT);
+  LClock.Stop;
+
+  Assert.AreEqual(2, Length(LMsgs), 'the status must close the batch, keeping what arrived');
+
+  { The count alone proves nothing - a fetch that ignored the status would
+    return the same two messages, just LONG_WAIT later. The point of the status
+    is that it ends the wait }
+  Assert.IsTrue(LClock.ElapsedMilliseconds < LONG_WAIT div 2,
+    Format('the status must end the wait, but the fetch took %d ms of %d',
+      [LClock.ElapsedMilliseconds, LONG_WAIT]));
+end;
+
+procedure TJetStreamContextTests.Fetch_IdleHeartbeat_DoesNotCloseTheBatch;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  OpenAndHandshake;
+
+  { The heartbeat arrives BEFORE any data, which is the only ordering that can
+    tell the two behaviours apart: swallowed, the batch stays open and the
+    message that follows is collected; treated like a 404, the fetch is already
+    over and comes back empty }
+  ReplyWithBatch(['one'], 0, '', NatsConstants.Status.IDLE_HEARTBEAT);
+
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 1, LONG_WAIT);
+
+  Assert.AreEqual(1, Length(LMsgs),
+    'a 100 says "still here" - it must not end the batch');
+end;
+
+procedure TJetStreamContextTests.Fetch_NothingThere_ReturnsAnEmptyArray;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+  LClock: TStopwatch;
+begin
+  OpenAndHandshake;
+  ReplyWithBatch([], NatsConstants.Status.NO_MESSAGES, 'No Messages');
+
+  LClock := TStopwatch.StartNew;
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 5, LONG_WAIT);
+  LClock.Stop;
+
+  { An empty consumer is an ordinary thing, not an error. Raising here would
+    make every polling loop an exception handler }
+  Assert.AreEqual(0, Length(LMsgs));
+  Assert.IsTrue(LClock.ElapsedMilliseconds < LONG_WAIT div 2,
+    Format('a 404 must end the wait, but the fetch took %d ms of %d',
+      [LClock.ElapsedMilliseconds, LONG_WAIT]));
+end;
+
+procedure TJetStreamContextTests.Fetch_UnsubscribesTheInbox;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 1, 200);
+    end);
+
+  { Same defect RequestSync exists to avoid: without this every fetch leaves an
+    inbox subscribed here and on the server }
+  Assert.IsTrue(FSocket.ClientText.Contains(NatsConstants.Protocol.UNSUB + ' '),
+    'a fetch must tear its inbox down on every path, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.Fetch_EmptyBatch_Raises;
+begin
+  OpenAndHandshake;
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 0);
+    end,
+    ENatsException, 'a batch of zero asks the server for nothing');
+end;
+
+procedure TJetStreamContextTests.FetchNoWait_SetsNoWaitAndNoExpiry;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.FetchNoWait('ORDERS', 'workers', 5);
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    Assert.IsTrue(LBody.GetValue<Boolean>('no_wait'), 'no_wait must be set');
+
+    { Nothing is held open, so there is nothing to expire }
+    Assert.IsNull(LBody.GetValue('expires'), 'a no-wait request needs no expiry');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.Next_ReturnsTheFirstMessage;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  ReplyWithBatch(['only'], 0, '');
+
+  Assert.IsTrue(FJs.Next('ORDERS', 'workers', LMsg));
+  Assert.IsNotNull(LMsg);
+  Assert.AreEqual('only', LMsg.Payload);
+end;
+
+procedure TJetStreamContextTests.Next_NothingThere_ReturnsFalse;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  ReplyWithBatch([], NatsConstants.Status.NO_MESSAGES, 'No Messages');
+
+  { False, not an exception: "nothing waiting" is the expected answer half the
+    time in a polling loop }
+  Assert.IsFalse(FJs.Next('ORDERS', 'workers', LMsg, 5000));
+  Assert.IsNull(LMsg);
+end;
+
+{ push consumption }
+
+procedure TJetStreamContextTests.SubscribePush_SubscribesToTheDeliverSubject;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  FJs.SubscribePush('ORDERS', 'pushers',
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+    end);
+
+  { The delivery subject is the server's to choose, so it has to be read from
+    ConsumerInfo rather than guessed }
+  Assert.IsTrue(FSocket.ClientText.Contains(
+    NatsConstants.Protocol.SUB + ' deliver.pushers '),
+    'the push subscription must go to the consumer''s own deliver subject, wrote: ' +
+    FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_PullConsumer_Raises;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_JSON);   // a pull consumer: no deliver_subject
+
+  { Silently subscribing to nothing would look like a consumer that never
+    receives anything, which is a miserable thing to debug }
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.SubscribePush('ORDERS', 'workers',
+        procedure (const AMsg: IJetStreamMsg)
+        begin
+        end);
+    end,
+    ENatsException);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_DeliversWrappedMessages;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSeen := TNatsTestLog.Create;
+  try
+    LSid := FJs.SubscribePush('ORDERS', 'pushers',
+      procedure (const AMsg: IJetStreamMsg)
+      begin
+        LSeen.AddFmt('%s|%d', [AMsg.Payload, AMsg.Metadata.StreamSeq]);
+      end);
+
+    FSocket.ServerSend(Format('%s deliver.pushers %d %s %d'#13#10'%s'#13#10,
+      [NatsConstants.Protocol.MSG, LSid, ACK_SUBJECT, 5, 'hello']));
+
+    Assert.IsTrue(WaitForCondition(
+      function: Boolean
+      begin
+        Result := LSeen.Count > 0;
+      end),
+      'the push delivery never reached the handler');
+
+    Assert.AreEqual('hello|42', LSeen.Item(0));
+  finally
+    LSeen.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.SubscribePush_FlowControl_IsAnswered;
+var
+  LSid: Integer;
+  LBlock: string;
+  LLen: Integer;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSid := FJs.SubscribePush('ORDERS', 'pushers',
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+    end);
+
+  FSocket.ClearClientData;
+
+  { A flow-control request is a status message WITH a reply-to, and the server
+    stops sending until it is answered - so ignoring it stalls the consumer }
+  LBlock := NatsConstants.CLIENT_HEADER_VERSION + ' 100 FlowControl Request'#13#10;
+  LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+  FSocket.ServerSend(Format('%s deliver.pushers %d $JS.FC.token %d %d'#13#10,
+    [NatsConstants.Protocol.HMSG, LSid, LLen, LLen]) + LBlock + #13#10 + #13#10);
+
+  Assert.IsTrue(FSocket.WaitForClientText(
+    NatsConstants.Protocol.PUB + ' $JS.FC.token'),
+    'a flow-control request must be answered, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_StatusNeverReachesTheHandler;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+  LBlock: string;
+  LLen: Integer;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSeen := TNatsTestLog.Create;
+  try
+    LSid := FJs.SubscribePush('ORDERS', 'pushers',
+      procedure (const AMsg: IJetStreamMsg)
+      begin
+        LSeen.AddFmt('%s', [AMsg.Payload]);
+      end);
+
+    { An idle heartbeat: no reply-to, no body. Handing it on would give the
+      application a phantom empty message with no ack subject }
+    LBlock := NatsConstants.CLIENT_HEADER_VERSION + ' 100 Idle Heartbeat'#13#10;
+    LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+    FSocket.ServerSend(Format('%s deliver.pushers %d %d %d'#13#10,
+      [NatsConstants.Protocol.HMSG, LSid, LLen, LLen]) + LBlock + #13#10 + #13#10);
+
+    { then a real one, so the assertion is not just "nothing happened yet" }
+    FSocket.ServerSend(Format('%s deliver.pushers %d %s %d'#13#10'%s'#13#10,
+      [NatsConstants.Protocol.MSG, LSid, ACK_SUBJECT, 4, 'real']));
+
+    Assert.IsTrue(WaitForCondition(
+      function: Boolean
+      begin
+        Result := LSeen.Count > 0;
+      end),
+      'the real message never arrived');
+
+    Assert.AreEqual(1, LSeen.Count, 'only the real message may reach the handler');
+    Assert.AreEqual('real', LSeen.Item(0));
+  finally
+    LSeen.Free;
+  end;
+end;
+
+{ TJetStreamMsgTests }
+
+procedure TJetStreamMsgTests.Setup;
+begin
+  UseMockSocket;
+
+  FConn := TNatsConnection.Create;
+  FSocket := TNatsMockSocket.LastInstance;
+  Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
+
+  FConn.Name := 'JsMsgConn';
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
+end;
+
+procedure TJetStreamMsgTests.TearDown;
+begin
+  FConn.Free;
+end;
+
+procedure TJetStreamMsgTests.OpenAndHandshake;
+begin
+  FConn.Open(nil, nil);
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + JS_INFO_JSON);
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.CONNECT),
+    'the client never sent CONNECT in response to INFO');
+  FSocket.ClearClientData;
+end;
+
+function TJetStreamMsgTests.Delivery(const AAckSubject: string): TNatsArgsMSG;
+begin
+  Result := Default(TNatsArgsMSG);
+  Result.Subject := 'orders.new';
+  Result.ReplyTo := AAckSubject;
+  Result.Payload := '{"id":1}';
+  Result.PayloadData := TEncoding.UTF8.GetBytes('{"id":1}');
+  Result.PayloadBytes := Length(Result.PayloadData);
+end;
+
+function TJetStreamMsgTests.AckPayload: string;
+var
+  LLines: TArray<string>;
+  LIndex: Integer;
+begin
+  Result := '';
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+
+  for LIndex := 0 to High(LLines) - 1 do
+    if LLines[LIndex].StartsWith(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT) then
+      Exit(LLines[LIndex + 1]);
+end;
+
+procedure TJetStreamMsgTests.TryWrap_JetStreamDelivery_Succeeds;
+var
+  LMsg: IJetStreamMsg;
+begin
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+  Assert.IsNotNull(LMsg);
+  Assert.AreEqual(ACK_SUBJECT, LMsg.AckSubject);
+end;
+
+procedure TJetStreamMsgTests.TryWrap_OrdinaryCoreReply_Fails;
+var
+  LMsg: IJetStreamMsg;
+begin
+  { A core request/reply message has an inbox as its reply-to, which is a
+    perfectly good subject and an utterly wrong thing to ack to }
+  Assert.IsFalse(TJetStreamMsg.TryWrap(FConn, Delivery('_INBOX.abc.1'), LMsg));
+  Assert.IsNull(LMsg);
+end;
+
+procedure TJetStreamMsgTests.TryWrap_StatusMessage_Fails;
+var
+  LData: TNatsArgsMSG;
+  LMsg: IJetStreamMsg;
+begin
+  LData := Delivery(ACK_SUBJECT);
+  LData.Status := NatsConstants.Status.NO_MESSAGES;
+
+  { Even with a plausible reply-to: a status is control flow with an empty
+    body, so wrapping it would hand the application a phantom message }
+  Assert.IsFalse(TJetStreamMsg.TryWrap(FConn, LData, LMsg));
+end;
+
+procedure TJetStreamMsgTests.TryWrap_NoReplyTo_Fails;
+var
+  LMsg: IJetStreamMsg;
+begin
+  Assert.IsFalse(TJetStreamMsg.TryWrap(FConn, Delivery(''), LMsg));
+end;
+
+procedure TJetStreamMsgTests.Create_NonJetStreamMessage_Raises;
+begin
+  { TryWrap reports, the constructor raises - the difference is whether the
+    caller already knows this is a JetStream delivery }
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamMsg.Create(FConn, Delivery('_INBOX.abc.1'));
+    end,
+    EJetStreamAckError);
+end;
+
+procedure TJetStreamMsgTests.Msg_ExposesPayloadSubjectAndMetadata;
+var
+  LMsg: IJetStreamMsg;
+begin
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  Assert.AreEqual('orders.new', LMsg.Subject, 'the subject is the message''s own, not the ack''s');
+  Assert.AreEqual('{"id":1}', LMsg.Payload);
+  Assert.AreEqual('ORDERS', LMsg.Metadata.Stream);
+  Assert.AreEqual(UInt64(42), LMsg.Metadata.StreamSeq);
+  Assert.IsFalse(LMsg.Acknowledged, 'a freshly delivered message is not acked');
+end;
+
+procedure TJetStreamMsgTests.Ack_PublishesPlusAckToTheAckSubject;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Ack;
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT),
+    'the ack must go to the message''s own reply-to, wrote: ' + FSocket.ClientText);
+  Assert.AreEqual('+ACK', AckPayload);
+end;
+
+procedure TJetStreamMsgTests.Nak_PublishesMinusNak;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Nak;
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT));
+  Assert.AreEqual('-NAK', AckPayload);
+end;
+
+procedure TJetStreamMsgTests.Nak_WithDelay_CarriesNanoseconds;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Nak(TJetStreamDuration.FromSeconds(30));
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT));
+
+  { Nanoseconds like every other duration here: 30 seconds is 3e10, and sending
+    30000 would ask for a redelivery a million times sooner than meant }
+  Assert.AreEqual('-NAK {"delay":30000000000}', AckPayload);
+end;
+
+procedure TJetStreamMsgTests.Term_PublishesPlusTerm;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Term;
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT));
+  Assert.AreEqual('+TERM', AckPayload);
+end;
+
+procedure TJetStreamMsgTests.InProgress_PublishesPlusWpi;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.InProgress;
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT));
+  Assert.AreEqual('+WPI', AckPayload);
+end;
+
+procedure TJetStreamMsgTests.Ack_MarksTheMessageAcknowledged;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Ack;
+
+  Assert.IsTrue(LMsg.Acknowledged);
+end;
+
+procedure TJetStreamMsgTests.Ack_Twice_Raises;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Ack;
+
+  { The second ack lands on a subject the server has already retired, so it
+    does nothing at all - and the code that sent it goes on believing it
+    settled something }
+  Assert.WillRaise(
+    procedure
+    begin
+      LMsg.Ack;
+    end,
+    EJetStreamAckError);
+end;
+
+procedure TJetStreamMsgTests.Nak_AfterAck_Raises;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.Ack;
+
+  { Not just the same call twice: any second settlement is the same mistake }
+  Assert.WillRaise(
+    procedure
+    begin
+      LMsg.Nak;
+    end,
+    EJetStreamAckError);
+end;
+
+procedure TJetStreamMsgTests.InProgress_DoesNotSettleTheMessage;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  LMsg.InProgress;
+
+  { It says "not yet", which settles nothing }
+  Assert.IsFalse(LMsg.Acknowledged);
+end;
+
+procedure TJetStreamMsgTests.InProgress_MayRepeatAndStillBeAcked;
+var
+  LMsg: IJetStreamMsg;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  { The point of +WPI: long work keeps resetting AckWait, then acks once }
+  LMsg.InProgress;
+  LMsg.InProgress;
+  LMsg.InProgress;
+
+  LMsg.Ack;
+
+  Assert.IsTrue(LMsg.Acknowledged);
+end;
+
+{ TJetStreamPubOptionsTests }
+
+procedure TJetStreamPubOptionsTests.Empty_HasNoHeaders;
+var
+  LHeaders: TNatsHeaders;
+begin
+  { No options must mean no header block at all, so the publish stays a PUB }
+  LHeaders := TJetStreamPubOptions.New.Headers;
+  Assert.AreEqual(0, LHeaders.Count);
+end;
+
+procedure TJetStreamPubOptionsTests.MsgId_UsesTheSpecHeaderName;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := TJetStreamPubOptions.New.WithMsgId('order-1').Headers;
+
+  Assert.AreEqual(1, LHeaders.Count);
+  Assert.AreEqual('Nats-Msg-Id', LHeaders[0].Key);
+  Assert.AreEqual('order-1', LHeaders[0].Value);
+end;
+
+procedure TJetStreamPubOptionsTests.Expectations_UseTheSpecHeaderNames;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := TJetStreamPubOptions.New
+    .WithExpectedStream('ORDERS')
+    .WithExpectedLastSeq(9)
+    .WithExpectedLastSubjectSeq(4)
+    .WithExpectedLastMsgId('order-0')
+    .Headers;
+
+  { Spelled out rather than read back from the constants: a test that uses the
+    same constant as the code cannot catch the constant being wrong }
+  Assert.AreEqual('ORDERS', LHeaders.GetHeader('Nats-Expected-Stream'));
+  Assert.AreEqual('9', LHeaders.GetHeader('Nats-Expected-Last-Sequence'));
+  Assert.AreEqual('4', LHeaders.GetHeader('Nats-Expected-Last-Subject-Sequence'));
+  Assert.AreEqual('order-0', LHeaders.GetHeader('Nats-Expected-Last-Msg-Id'));
+end;
+
+procedure TJetStreamPubOptionsTests.ExpectedLastSeq_Zero_IsStillEmitted;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := TJetStreamPubOptions.New.WithExpectedLastSeq(0).Headers;
+
+  { The reason this record is fluent at all. Zero asserts the stream is empty,
+    so it can never be treated as "unset" }
+  Assert.AreEqual(1, LHeaders.Count, 'an expectation of zero must survive');
+  Assert.AreEqual('0', LHeaders.GetHeader('Nats-Expected-Last-Sequence'));
+end;
+
+procedure TJetStreamPubOptionsTests.SameOptionTwice_ReplacesRatherThanDuplicates;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := TJetStreamPubOptions.New.WithMsgId('first').WithMsgId('second').Headers;
+
+  Assert.AreEqual(1, LHeaders.Count, 'one header, not two');
+  Assert.AreEqual('second', LHeaders.GetHeader('Nats-Msg-Id'), 'the last call wins');
+end;
+
+procedure TJetStreamPubOptionsTests.Chaining_KeepsEveryOption;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := TJetStreamPubOptions.New
+    .WithMsgId('order-1')
+    .WithExpectedStream('ORDERS')
+    .WithHeader('X-Trace', 'abc')
+    .Headers;
+
+  Assert.AreEqual(3, LHeaders.Count);
+end;
+
+procedure TJetStreamPubOptionsTests.BranchingFromAnOptionsValue_DoesNotShareState;
+var
+  LBase, LLeft, LRight: TJetStreamPubOptions;
+  LBaseHeaders, LLeftHeaders, LRightHeaders: TNatsHeaders;
+begin
+  LBase := TJetStreamPubOptions.New.WithExpectedStream('ORDERS');
+
+  LLeft := LBase.WithMsgId('left');
+  LRight := LBase.WithMsgId('right');
+
+  LLeftHeaders := LLeft.Headers;
+  LRightHeaders := LRight.Headers;
+  LBaseHeaders := LBase.Headers;
+
+  { A record wrapping a dynamic array is a value only because SetLength
+    uniquifies the array before writing to it. Get that wrong and the two
+    branches quietly share one header list }
+  Assert.AreEqual('left', LLeftHeaders.GetHeader('Nats-Msg-Id'));
+  Assert.AreEqual('right', LRightHeaders.GetHeader('Nats-Msg-Id'));
+  Assert.AreEqual(1, LBaseHeaders.Count, 'the base must be untouched by either branch');
+end;
+
+procedure TJetStreamPubOptionsTests.BranchingAndReplacingAnOption_DoesNotShareState;
+var
+  LBase, LLeft, LRight: TJetStreamPubOptions;
+  LBaseHeaders, LLeftHeaders, LRightHeaders: TNatsHeaders;
+begin
+  { The nastier half of the same problem, and the one appending hides. Here the
+    branches REPLACE a value the base already carries, and replacing writes
+    into the array in place - it never goes near SetLength, so it never
+    uniquifies the way appending does }
+  LBase := TJetStreamPubOptions.New.WithMsgId('base');
+
+  LLeft := LBase.WithMsgId('left');
+  LRight := LBase.WithMsgId('right');
+
+  LLeftHeaders := LLeft.Headers;
+  LRightHeaders := LRight.Headers;
+  LBaseHeaders := LBase.Headers;
+
+  Assert.AreEqual('left', LLeftHeaders.GetHeader('Nats-Msg-Id'));
+  Assert.AreEqual('right', LRightHeaders.GetHeader('Nats-Msg-Id'));
+  Assert.AreEqual('base', LBaseHeaders.GetHeader('Nats-Msg-Id'),
+    'the base must still say what it said');
+end;
+
+procedure TJetStreamPubOptionsTests.CustomHeader_IsAppended;
+var
+  LHeaders: TNatsHeaders;
+begin
+  { Unlike the JetStream options, an application header may legitimately
+    repeat: NATS headers are multi-value }
+  LHeaders := TJetStreamPubOptions.New
+    .WithHeader('X-Tag', 'a')
+    .WithHeader('X-Tag', 'b')
+    .Headers;
+
+  Assert.AreEqual(2, LHeaders.Count);
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TJetStreamMetadataTests);
   TDUnitX.RegisterTestFixture(TJetStreamEntityTests);
   TDUnitX.RegisterTestFixture(TJetStreamContextTests);
+  TDUnitX.RegisterTestFixture(TJetStreamPubOptionsTests);
+  TDUnitX.RegisterTestFixture(TJetStreamMsgTests);
 
 end.

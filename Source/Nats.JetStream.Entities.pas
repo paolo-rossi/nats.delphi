@@ -384,6 +384,47 @@ type
   end;
 
   /// <summary>
+  ///   A pull consumer's batch request - the body published to
+  ///   $JS.API.CONSUMER.MSG.NEXT.&lt;stream&gt;.&lt;consumer&gt;
+  /// </summary>
+  /// <remarks>
+  ///   <para>
+  ///     This is not a request/reply in the RequestSync sense. The server
+  ///     answers with up to Batch SEPARATE messages on the reply-to inbox, and
+  ///     then a status message (404 / 408) to close the batch out. A partial
+  ///     batch is a perfectly normal result.
+  ///   </para>
+  ///   <para>
+  ///     Expires is the SERVER's own deadline for the request, and setting it
+  ///     matters even when the client has its own timeout: without it the
+  ///     server holds the request open, and a client that has walked away
+  ///     leaves it counting against the consumer's MaxWaiting.
+  ///   </para>
+  /// </remarks>
+  TJetStreamNextRequest = record
+    /// How many messages at most. The server may send fewer, never more
+    [NeonInclude(IncludeIf.NotDefault)]
+    Batch: Integer;
+    /// The server's deadline, after which it sends 408 and gives up
+    [NeonInclude(IncludeIf.NotDefault)]
+    Expires: TJetStreamDuration;
+    /// A second ceiling, on total bytes rather than on count
+    [NeonInclude(IncludeIf.NotDefault)]
+    MaxBytes: Int64;
+    /// <summary>
+    ///   Answer straight away with whatever is there, 404 included, instead of
+    ///   waiting for the batch to fill
+    /// </summary>
+    NoWait: Boolean;
+    /// <summary>
+    ///   Ask the server to send a 100 status this often while the request is
+    ///   open, so a silent connection can be told from an empty stream
+    /// </summary>
+    [NeonInclude(IncludeIf.NotDefault)]
+    IdleHeartbeat: TJetStreamDuration;
+  end;
+
+  /// <summary>
   ///   What DELETE and PURGE answer with. Purged is only meaningful for a purge
   /// </summary>
   TJetStreamSuccessResponse = record

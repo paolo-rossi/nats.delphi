@@ -29,7 +29,7 @@ unit Nats.Tests.Live;
 interface
 
 uses
-  System.SysUtils, System.Classes,
+  System.SysUtils, System.Classes, System.Diagnostics,
 
   DUnitX.TestFramework,
 
@@ -43,6 +43,7 @@ uses
   Nats.Exceptions,
   Nats.JetStream.Client,
   Nats.JetStream.Entities,
+  Nats.JetStream.Message,
 
   Nats.Tests.Mocks;
 
@@ -116,6 +117,15 @@ type
     /// Unique per test, so a crashed run never blocks the next one
     FStream: string;
     procedure Connect;
+    /// A memory-backed stream named FStream, capturing FStream.>
+    procedure CreateTestStream;
+    /// <summary>
+    ///   As CreateTestStream but with work-queue retention, where an ACKED
+    ///   message is REMOVED - which is what makes an ack observable
+    /// </summary>
+    procedure CreateWorkQueueStream;
+    /// A durable pull consumer on FStream, with explicit acks
+    procedure CreatePullConsumer(const AName: string);
     /// Deletes FStream, ignoring "it was not there"
     procedure DropStream;
   public
@@ -140,6 +150,41 @@ type
     procedure Consumer_CreateInfoNamesDelete;
     [Test]
     procedure StreamInfo_UnknownStream_RaisesNotFound;
+
+    { publish with ack - Phase 3 }
+
+    [Test]
+    procedure Publish_ReturnsAnAckWithTheStreamAndSequence;
+    /// The one that proves Nats-Msg-Id is spelled the way the server reads it
+    [Test]
+    procedure Publish_SameMsgIdTwice_IsDeduplicated;
+    /// ...and the same for Nats-Expected-Last-Sequence
+    [Test]
+    procedure Publish_WrongExpectedLastSeq_IsRejected;
+    [Test]
+    procedure Publish_ExpectedLastSeqZero_HoldsOnlyWhileEmpty;
+    [Test]
+    procedure Publish_NoStreamForTheSubject_TimesOut;
+
+    { consuming - §4 and Phase 4 }
+
+    [Test]
+    procedure Fetch_ReturnsWhatWasPublished;
+    [Test]
+    procedure Fetch_EmptyConsumer_ComesBackEmptyAndOnTime;
+    [Test]
+    procedure FetchedMessage_CarriesTheServersOwnMetadata;
+    /// The one that proves '+ACK' is the payload the server acts on
+    [Test]
+    procedure Ack_RemovesTheMessageFromAWorkQueue;
+    /// ...and '-NAK'
+    [Test]
+    procedure Nak_CausesImmediateRedelivery;
+    /// ...and '+WPI', which must NOT be taken for an ack
+    [Test]
+    procedure InProgress_LeavesTheMessageUnacknowledged;
+    [Test]
+    procedure SubscribePush_ReceivesWhatWasPublished;
   end;
 
 implementation
@@ -148,6 +193,14 @@ const
   LIVE_HOST = '127.0.0.1';
   LIVE_TIMEOUT = 5000;
   WAIT_MS = 5000;
+
+  { InProgress_LeavesTheMessageUnacknowledged. The margin between the interval
+    and AckWait is what keeps the test from going red on a stalled machine:
+    every report has to land before the previous window runs out }
+  WPI_ACK_WAIT = 2000;
+  WPI_INTERVAL = 500;
+  /// Enough reports to outlast AckWait several times over
+  WPI_SENDS = 6;
 
 var
   GLiveSwitchCount: Integer = 0;
@@ -828,6 +881,383 @@ begin
   end;
 
   Assert.IsTrue(LRaised, 'asking for a stream that does not exist must raise');
+end;
+
+{ publish with ack }
+
+procedure TJetStreamLiveTests.CreateTestStream;
+var
+  LConfig: TJetStreamStreamConfig;
+begin
+  LConfig := Default(TJetStreamStreamConfig);
+  LConfig.Name := FStream;
+  LConfig.Subjects := [FStream + '.>'];
+  LConfig.Storage := TJetStreamStorage.Memory;   // no files left behind
+
+  FJs.AddStream(LConfig);
+end;
+
+procedure TJetStreamLiveTests.Publish_ReturnsAnAckWithTheStreamAndSequence;
+var
+  LAck: TJetStreamPubAck;
+begin
+  Connect;
+  CreateTestStream;
+
+  LAck := FJs.Publish(FStream + '.one', 'first');
+
+  { The ack is what makes this different from a core publish: no polling, no
+    race - the call does not return until the message is stored }
+  Assert.AreEqual(FStream, LAck.Stream, 'the ack names the stream that captured it');
+  Assert.AreEqual(UInt64(1), LAck.Seq, 'the first message of a fresh stream is seq 1');
+  Assert.IsFalse(LAck.Duplicate);
+
+  LAck := FJs.Publish(FStream + '.two', 'second');
+  Assert.AreEqual(UInt64(2), LAck.Seq, 'sequences run on');
+
+  Assert.AreEqual(UInt64(2), FJs.StreamInfo(FStream).State.Messages,
+    'both messages must already be stored by the time the ack came back');
+end;
+
+procedure TJetStreamLiveTests.Publish_SameMsgIdTwice_IsDeduplicated;
+var
+  LFirst, LSecond: TJetStreamPubAck;
+  LMsgId: string;
+begin
+  Connect;
+  CreateTestStream;
+
+  LMsgId := 'delphi-' + TNUID.NextNuid;
+
+  LFirst := FJs.Publish(FStream + '.one', 'first',
+    TJetStreamPubOptions.New.WithMsgId(LMsgId));
+  LSecond := FJs.Publish(FStream + '.one', 'first again',
+    TJetStreamPubOptions.New.WithMsgId(LMsgId));
+
+  { What the mock cannot prove: the server reads Nats-Msg-Id by that exact
+    name. Misspell it and both publishes succeed, both are stored, and every
+    offline test still passes }
+  Assert.IsTrue(LSecond.Duplicate, 'the second publish must be recognised as a duplicate');
+  Assert.AreEqual(LFirst.Seq, LSecond.Seq, 'the ack points back at the message already stored');
+
+  Assert.AreEqual(UInt64(1), FJs.StreamInfo(FStream).State.Messages,
+    'a duplicate must not be stored a second time');
+end;
+
+procedure TJetStreamLiveTests.Publish_WrongExpectedLastSeq_IsRejected;
+var
+  LRaised: Boolean;
+begin
+  Connect;
+  CreateTestStream;
+
+  FJs.Publish(FStream + '.one', 'first');
+
+  LRaised := False;
+  try
+    { The stream is at 1, so this expectation cannot hold. As with the msg id,
+      a misspelled header would make the server ignore it and ACCEPT the
+      publish - the test would then fail here rather than pass quietly }
+    FJs.Publish(FStream + '.one', 'second',
+      TJetStreamPubOptions.New.WithExpectedLastSeq(99));
+  except
+    on E: EJetStreamApiError do
+    begin
+      LRaised := True;
+      Assert.IsTrue(E.ErrCode > 0, 'the server sets a specific err_code for a failed expectation');
+    end;
+  end;
+
+  Assert.IsTrue(LRaised, 'a violated Nats-Expected-Last-Sequence must be rejected');
+  Assert.AreEqual(UInt64(1), FJs.StreamInfo(FStream).State.Messages,
+    'a rejected publish must not be stored');
+end;
+
+procedure TJetStreamLiveTests.Publish_ExpectedLastSeqZero_HoldsOnlyWhileEmpty;
+var
+  LAck: TJetStreamPubAck;
+begin
+  Connect;
+  CreateTestStream;
+
+  { Zero is a real assertion - "the stream is still empty" - and is why the
+    options are fluent rather than a record of numbers where 0 means "unset".
+    If it were dropped as unset this first publish would still succeed and the
+    second one would too, so only the pair of them proves it went out }
+  LAck := FJs.Publish(FStream + '.one', 'first',
+    TJetStreamPubOptions.New.WithExpectedLastSeq(0));
+  Assert.AreEqual(UInt64(1), LAck.Seq, 'it holds on an empty stream');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Publish(FStream + '.one', 'second',
+        TJetStreamPubOptions.New.WithExpectedLastSeq(0));
+    end,
+    EJetStreamApiError,
+    'the same expectation must fail once the stream is no longer empty');
+end;
+
+procedure TJetStreamLiveTests.Publish_NoStreamForTheSubject_TimesOut;
+begin
+  Connect;
+
+  { No stream captures this subject, so nothing acks. Core NATS would have
+    accepted the publish, dropped it and told nobody - waiting for the ack is
+    the only thing that tells the two apart }
+  FJs.Timeout := 1000;   // no point sitting out the full default
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Publish('delphi.no.stream.' + TNUID.NextNuid, 'x');
+    end,
+    EJetStreamTimeout);
+end;
+
+{ consuming }
+
+procedure TJetStreamLiveTests.CreateWorkQueueStream;
+var
+  LConfig: TJetStreamStreamConfig;
+begin
+  LConfig := Default(TJetStreamStreamConfig);
+  LConfig.Name := FStream;
+  LConfig.Subjects := [FStream + '.>'];
+  LConfig.Storage := TJetStreamStorage.Memory;
+  LConfig.Retention := TJetStreamRetention.WorkQueue;
+
+  FJs.AddStream(LConfig);
+end;
+
+procedure TJetStreamLiveTests.CreatePullConsumer(const AName: string);
+var
+  LConfig: TJetStreamConsumerConfig;
+begin
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.DurableName := AName;
+  LConfig.AckPolicy := TJetStreamAckPolicy.Explicit;
+  LConfig.AckWait := TJetStreamDuration.FromSeconds(30);
+
+  { DeliverSubject left empty is what makes it a PULL consumer }
+  FJs.AddConsumer(FStream, LConfig);
+end;
+
+procedure TJetStreamLiveTests.Fetch_ReturnsWhatWasPublished;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  Connect;
+  CreateTestStream;
+  CreatePullConsumer('workers');
+
+  FJs.Publish(FStream + '.one', 'first');
+  FJs.Publish(FStream + '.two', 'second');
+
+  LMsgs := FJs.Fetch(FStream, 'workers', 2, WAIT_MS);
+
+  { Every field name in the batch request has to be right for this to work at
+    all: a misspelled "batch" means the server sends its default of one }
+  Assert.AreEqual(2, Length(LMsgs), 'both published messages must come back');
+  Assert.AreEqual('first', LMsgs[0].Payload);
+  Assert.AreEqual('second', LMsgs[1].Payload);
+end;
+
+procedure TJetStreamLiveTests.Fetch_EmptyConsumer_ComesBackEmptyAndOnTime;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+  LClock: TStopwatch;
+begin
+  Connect;
+  CreateTestStream;
+  CreatePullConsumer('workers');
+
+  LClock := TStopwatch.StartNew;
+  LMsgs := FJs.Fetch(FStream, 'workers', 5, 1000);
+  LClock.Stop;
+
+  Assert.AreEqual(0, Length(LMsgs), 'an empty consumer is not an error');
+
+  { The expiry we send has to be in NANOSECONDS and shorter than our own wait.
+    Send milliseconds by mistake and it is a million times too small, so the
+    server gives up instantly; leave it out and the request hangs on and counts
+    against MaxWaiting. Both show up here as the wrong elapsed time }
+  Assert.IsTrue(LClock.ElapsedMilliseconds > 500,
+    Format('the server gave up after only %d ms - is the expiry in the right unit?',
+      [LClock.ElapsedMilliseconds]));
+  Assert.IsTrue(LClock.ElapsedMilliseconds < 2500,
+    Format('the fetch overran its own timeout at %d ms', [LClock.ElapsedMilliseconds]));
+end;
+
+procedure TJetStreamLiveTests.FetchedMessage_CarriesTheServersOwnMetadata;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  Connect;
+  CreateTestStream;
+  CreatePullConsumer('workers');
+
+  FJs.Publish(FStream + '.one', 'first');
+
+  LMsgs := FJs.Fetch(FStream, 'workers', 1, WAIT_MS);
+  Assert.AreEqual(1, Length(LMsgs));
+
+  { The $JS.ACK layout parsed against a subject a real server built, not one
+    this repo wrote out by hand }
+  Assert.AreEqual(FStream, LMsgs[0].Metadata.Stream);
+  Assert.AreEqual('workers', LMsgs[0].Metadata.Consumer);
+  Assert.AreEqual(UInt64(1), LMsgs[0].Metadata.StreamSeq);
+  Assert.AreEqual(UInt64(1), LMsgs[0].Metadata.NumDelivered, 'delivery counting starts at 1');
+  Assert.IsFalse(LMsgs[0].Metadata.IsRedelivery);
+  Assert.IsTrue(LMsgs[0].Metadata.TimestampNanos > 0, 'the server stamps every delivery');
+end;
+
+procedure TJetStreamLiveTests.Ack_RemovesTheMessageFromAWorkQueue;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  Connect;
+  CreateWorkQueueStream;
+  CreatePullConsumer('workers');
+
+  FJs.Publish(FStream + '.one', 'first');
+  Assert.AreEqual(UInt64(1), FJs.StreamInfo(FStream).State.Messages);
+
+  LMsgs := FJs.Fetch(FStream, 'workers', 1, WAIT_MS);
+  Assert.AreEqual(1, Length(LMsgs));
+
+  LMsgs[0].AckSync(WAIT_MS);
+
+  { A work queue DELETES what has been acknowledged, which is the only way to
+    see from the client side that the ack was understood. AckSync means the
+    server has recorded it by the time this returns, so there is no poll here }
+  Assert.AreEqual(UInt64(0), FJs.StreamInfo(FStream).State.Messages,
+    'an acked message must leave a work queue');
+end;
+
+procedure TJetStreamLiveTests.Nak_CausesImmediateRedelivery;
+var
+  LFirst, LSecond: TArray<IJetStreamMsg>;
+begin
+  Connect;
+  CreateTestStream;
+  CreatePullConsumer('workers');
+
+  FJs.Publish(FStream + '.one', 'first');
+
+  LFirst := FJs.Fetch(FStream, 'workers', 1, WAIT_MS);
+  Assert.AreEqual(1, Length(LFirst));
+  Assert.AreEqual(UInt64(1), LFirst[0].Metadata.NumDelivered);
+
+  LFirst[0].Nak;
+
+  { AckWait is 30 seconds, so anything arriving now got there because of the
+    NAK and nothing else. nats-server IGNORES an ack payload it does not
+    recognise - verified by mutation, it does not fall back to treating it as
+    an ack - so a misspelling means no redelivery at all and this comes back
+    empty. That is what pins the literal }
+  LSecond := FJs.Fetch(FStream, 'workers', 1, WAIT_MS);
+
+  Assert.AreEqual(1, Length(LSecond), 'a NAK must redeliver without waiting out AckWait');
+  Assert.AreEqual(UInt64(1), LSecond[0].Metadata.StreamSeq, 'the same message');
+  Assert.AreEqual(UInt64(2), LSecond[0].Metadata.NumDelivered, 'and it is the second delivery');
+  Assert.IsTrue(LSecond[0].Metadata.IsRedelivery);
+end;
+
+procedure TJetStreamLiveTests.InProgress_LeavesTheMessageUnacknowledged;
+var
+  LConfig: TJetStreamConsumerConfig;
+  LFirst, LHeld, LRedelivered: TArray<IJetStreamMsg>;
+  LIndex: Integer;
+begin
+  Connect;
+  CreateTestStream;
+
+  { A SHORT AckWait, because the whole test is about outlasting it }
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.DurableName := 'workers';
+  LConfig.AckPolicy := TJetStreamAckPolicy.Explicit;
+  LConfig.AckWait := TJetStreamDuration.FromMillis(WPI_ACK_WAIT);
+  FJs.AddConsumer(FStream, LConfig);
+
+  FJs.Publish(FStream + '.one', 'first');
+
+  LFirst := FJs.Fetch(FStream, 'workers', 1, WAIT_MS);
+  Assert.AreEqual(1, Length(LFirst));
+  Assert.AreEqual(UInt64(1), LFirst[0].Metadata.NumDelivered);
+
+  { The sleeps here are the SUBJECT of the test, not a race being papered over:
+    what +WPI does is push AckWait back, and the only way to observe that is to
+    hold the message for longer than AckWait and see it not come back.
+
+    Checking NumAckPending instead would prove nothing. nats-server ignores an
+    ack payload it does not recognise, so a misspelled +WPI leaves the message
+    pending too - the counter reads the same either way, which is exactly how
+    an earlier version of this test passed against '+WIP'. }
+  for LIndex := 1 to WPI_SENDS do
+  begin
+    Sleep(WPI_INTERVAL);
+    LFirst[0].InProgress;
+  end;
+
+  LHeld := FJs.Fetch(FStream, 'workers', 1, 500);
+  Assert.AreEqual(0, Length(LHeld),
+    Format('+WPI must keep pushing AckWait back - the message was redelivered ' +
+      'after %d ms of progress reports', [WPI_SENDS * WPI_INTERVAL]));
+
+  { and once the reports stop, AckWait finally elapses and it does come back -
+    without this half, a fetch that was simply broken would pass the assertion
+    above }
+  LRedelivered := FJs.Fetch(FStream, 'workers', 1, WPI_ACK_WAIT * 3);
+
+  Assert.AreEqual(1, Length(LRedelivered),
+    'once the progress reports stop, AckWait must expire and redeliver');
+  Assert.AreEqual(UInt64(2), LRedelivered[0].Metadata.NumDelivered);
+  Assert.IsFalse(LFirst[0].Acknowledged, '+WPI settles nothing');
+end;
+
+procedure TJetStreamLiveTests.SubscribePush_ReceivesWhatWasPublished;
+var
+  LConsumerCfg: TJetStreamConsumerConfig;
+  LSeen: TNatsTestLog;
+  LDeliver: string;
+begin
+  Connect;
+  CreateTestStream;
+
+  { A PUSH consumer: setting DeliverSubject is the whole difference }
+  LDeliver := 'deliver.' + TNUID.NextNuid;
+  LConsumerCfg := Default(TJetStreamConsumerConfig);
+  LConsumerCfg.DurableName := 'pushers';
+  LConsumerCfg.AckPolicy := TJetStreamAckPolicy.Explicit;
+  LConsumerCfg.DeliverSubject := LDeliver;
+  FJs.AddConsumer(FStream, LConsumerCfg);
+
+  LSeen := TNatsTestLog.Create;
+  try
+    FJs.SubscribePush(FStream, 'pushers',
+      procedure (const AMsg: IJetStreamMsg)
+      begin
+        { Runs on the consumer thread, so only thread-safe state here - and
+          plain Ack only writes, so it is allowed. AckSync would deadlock }
+        LSeen.AddFmt('%s|%d', [AMsg.Payload, AMsg.Metadata.StreamSeq]);
+        AMsg.Ack;
+      end);
+
+    FJs.Publish(FStream + '.one', 'pushed');
+
+    Assert.IsTrue(WaitForCondition(
+      function: Boolean
+      begin
+        Result := LSeen.Count > 0;
+      end,
+      WAIT_MS),
+      'the push consumer never delivered anything');
+
+    Assert.AreEqual('pushed|1', LSeen.Item(0));
+  finally
+    LSeen.Free;
+  end;
 end;
 
 initialization

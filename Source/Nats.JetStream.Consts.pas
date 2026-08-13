@@ -59,6 +59,34 @@ type
     end;
 
     /// <summary>
+    ///   Headers a client puts on a JetStream publish. They are ordinary NATS
+    ///   headers on an ordinary subject - the stream reads them as it captures
+    ///   the message, so publishing with them needs HPUB and nothing else
+    /// </summary>
+    Header = class
+    const
+      /// <summary>
+      ///   Deduplication id. Inside the stream's duplicate window a second
+      ///   message carrying the same id is not stored, and the PubAck comes
+      ///   back with "duplicate" set and "seq" pointing at the original
+      /// </summary>
+      MSG_ID = 'Nats-Msg-Id';
+
+      { The optimistic-concurrency expectations. Each one makes the server
+        REJECT the publish unless it holds, which is the only way a client gets
+        compare-and-set semantics out of a stream }
+
+      /// The subject must land in this stream and no other
+      EXPECTED_STREAM = 'Nats-Expected-Stream';
+      /// The stream's last sequence must be this. Zero asserts it is empty
+      EXPECTED_LAST_SEQ = 'Nats-Expected-Last-Sequence';
+      /// As EXPECTED_LAST_SEQ, but counting only the subject being published to
+      EXPECTED_LAST_SUBJECT_SEQ = 'Nats-Expected-Last-Subject-Sequence';
+      /// The last stored message must have carried this MSG_ID
+      EXPECTED_LAST_MSG_ID = 'Nats-Expected-Last-Msg-Id';
+    end;
+
+    /// <summary>
     ///   Characters a stream or consumer name may not contain. A name goes into
     ///   the API subject verbatim, so a dot would silently add a token and
     ///   address a different endpoint entirely
@@ -84,6 +112,34 @@ type
       { The first two tokens, checked rather than assumed }
       TOKEN_JS = '$JS';
       TOKEN_ACK = 'ACK';
+
+      { What gets PUBLISHED to that subject to acknowledge the message. The
+        server also reads an empty body as a plain ack, but saying which one is
+        meant costs four bytes and makes a packet capture readable }
+
+      /// Done with it. In a work-queue stream this is what deletes the message
+      PAYLOAD_ACK = '+ACK';
+      /// <summary>
+      ///   Could not handle it - redeliver. Unlike simply not acking, this does
+      ///   not wait out AckWait first
+      /// </summary>
+      PAYLOAD_NAK = '-NAK';
+      /// <summary>
+      ///   Still working: resets AckWait without acknowledging anything. The
+      ///   one ack that may be sent repeatedly for the same message
+      /// </summary>
+      PAYLOAD_PROGRESS = '+WPI';
+      /// <summary>
+      ///   Never redeliver, whatever MaxDeliver says. For a message that will
+      ///   fail every time - a poison message
+      /// </summary>
+      PAYLOAD_TERM = '+TERM';
+
+      /// <summary>
+      ///   A NAK asking for redelivery after a specific delay rather than at
+      ///   once. The delay is NANOSECONDS, as everywhere else in JetStream
+      /// </summary>
+      PAYLOAD_NAK_DELAY = '-NAK {"delay":%d}';
 
       /// <summary>
       ///   What a server with no JetStream domain configured puts in the domain

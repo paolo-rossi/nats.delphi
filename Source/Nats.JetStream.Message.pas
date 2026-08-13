@@ -15,7 +15,11 @@ uses
   System.SysUtils, System.DateUtils,
 
   Nats.Consts,
-  Nats.JetStream.Consts;
+  Nats.Classes,
+  Nats.Connection,
+  Nats.Exceptions,
+  Nats.JetStream.Consts,
+  Nats.JetStream.Entities;
 
 type
   /// <summary>
@@ -88,6 +92,128 @@ type
     /// </remarks>
     class function TryParse(const ASubject: string;
       out AMetadata: TJetStreamMsgMetadata): Boolean; static;
+  end;
+
+  /// <summary>
+  ///   Acknowledging was attempted on a message that cannot be acknowledged, or
+  ///   that already has been
+  /// </summary>
+  EJetStreamAckError = class(ENatsException);
+
+  /// <summary>
+  ///   A message delivered by a JetStream consumer: the message itself, its
+  ///   metadata, and the ability to answer for itself
+  /// </summary>
+  /// <remarks>
+  ///   <para>
+  ///     This exists because a core handler receives a bare TNatsArgsMSG with
+  ///     no connection alongside it, so Ack could never be a method on the
+  ///     record - and putting one there would drag JetStream into
+  ///     Nats.Classes.pas and break the rule that core knows nothing about it.
+  ///   </para>
+  ///   <para>
+  ///     An interface, so the caller never has to free anything. Fetch hands
+  ///     back a whole batch of these.
+  ///   </para>
+  /// </remarks>
+  IJetStreamMsg = interface
+    ['{B9E2A1D4-6C37-4F58-9A0B-2E5D7C81F643}']
+    function GetSubject: string;
+    function GetPayload: string;
+    function GetPayloadData: TBytes;
+    function GetHeaders: TNatsHeaders;
+    function GetMetadata: TJetStreamMsgMetadata;
+    function GetAckSubject: string;
+    function GetAcknowledged: Boolean;
+
+    /// <summary>
+    ///   Done with it. Fire and forget: this returns as soon as the ack is on
+    ///   the wire, not when the server has recorded it - use AckSync when that
+    ///   difference matters
+    /// </summary>
+    procedure Ack;
+    /// <summary>
+    ///   Ack and wait for the server to confirm. BLOCKS, so it must never be
+    ///   called from a message handler - see the remarks on TJetStreamContext
+    /// </summary>
+    procedure AckSync(ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT);
+    /// Could not handle it: redeliver, and do not wait out AckWait first
+    procedure Nak; overload;
+    /// As Nak, but not before ADelay has passed
+    procedure Nak(ADelay: TJetStreamDuration); overload;
+    /// <summary>
+    ///   Still working. Resets AckWait without acknowledging, and unlike the
+    ///   others may be called as often as needed
+    /// </summary>
+    procedure InProgress;
+    /// Never redeliver this one, whatever MaxDeliver says
+    procedure Term;
+
+    property Subject: string read GetSubject;
+    /// The payload decoded as UTF-8; use PayloadData for anything binary
+    property Payload: string read GetPayload;
+    property PayloadData: TBytes read GetPayloadData;
+    property Headers: TNatsHeaders read GetHeaders;
+    /// Stream, consumer, sequences and delivery count, from the ack subject
+    property Metadata: TJetStreamMsgMetadata read GetMetadata;
+    /// Where an ack goes - the delivered message's reply-to
+    property AckSubject: string read GetAckSubject;
+    /// <summary>
+    ///   True once Ack, Nak or Term has been sent. InProgress does not set it,
+    ///   because it settles nothing
+    /// </summary>
+    property Acknowledged: Boolean read GetAcknowledged;
+  end;
+
+  /// <summary>
+  ///   Runs on the consumer thread for a push subscription, and on the caller's
+  ///   own thread for a Fetch. See TNatsMsgHandler for what that implies
+  /// </summary>
+  TJetStreamMsgHandler = reference to procedure(const AMsg: IJetStreamMsg);
+
+  TJetStreamMsg = class(TInterfacedObject, IJetStreamMsg)
+  private
+    FConnection: TNatsConnection;
+    FData: TNatsArgsMSG;
+    FMetadata: TJetStreamMsgMetadata;
+    FAcknowledged: Boolean;
+
+    function GetSubject: string;
+    function GetPayload: string;
+    function GetPayloadData: TBytes;
+    function GetHeaders: TNatsHeaders;
+    function GetMetadata: TJetStreamMsgMetadata;
+    function GetAckSubject: string;
+    function GetAcknowledged: Boolean;
+
+    /// <summary>
+    ///   The one place an ack is written. ASettles marks the message answered
+    ///   for, which is every ack except a progress report
+    /// </summary>
+    procedure SendAck(const APayload: string; ASettles: Boolean);
+    /// Raises unless this message can still be acknowledged
+    procedure CheckAckable;
+  public
+    /// <summary>
+    ///   Wraps a delivered message. Raises unless its reply-to really is a
+    ///   $JS.ACK subject - use TryWrap where that is not already known
+    /// </summary>
+    constructor Create(AConnection: TNatsConnection; const AData: TNatsArgsMSG);
+
+    /// <summary>
+    ///   False means this is not a JetStream delivery: an ordinary core NATS
+    ///   message, or a status message, both of which are normal things to meet
+    ///   on a subscription and neither of which can be acked
+    /// </summary>
+    class function TryWrap(AConnection: TNatsConnection; const AData: TNatsArgsMSG;
+      out AMsg: IJetStreamMsg): Boolean; static;
+
+    procedure Ack;
+    procedure AckSync(ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT);
+    procedure Nak; overload;
+    procedure Nak(ADelay: TJetStreamDuration); overload;
+    procedure InProgress;
+    procedure Term;
   end;
 
 implementation
@@ -171,6 +297,148 @@ begin
 
   AMetadata := LMeta;
   Result := True;
+end;
+
+{ TJetStreamMsg }
+
+constructor TJetStreamMsg.Create(AConnection: TNatsConnection; const AData: TNatsArgsMSG);
+begin
+  inherited Create;
+
+  if not Assigned(AConnection) then
+    raise EJetStreamAckError.Create('A JetStream message needs a connection to ack over');
+
+  { The metadata and the ack address are the same string, so a reply-to that
+    does not parse means there is nothing to answer on either }
+  if not TJetStreamMsgMetadata.TryParse(AData.ReplyTo, FMetadata) then
+    raise EJetStreamAckError.CreateFmt(
+      'Not a JetStream delivery: the reply-to [%s] is not a %s subject',
+      [AData.ReplyTo, JetStreamConstants.Ack.PREFIX]);
+
+  FConnection := AConnection;
+  FData := AData;
+end;
+
+class function TJetStreamMsg.TryWrap(AConnection: TNatsConnection;
+  const AData: TNatsArgsMSG; out AMsg: IJetStreamMsg): Boolean;
+var
+  LMeta: TJetStreamMsgMetadata;
+begin
+  AMsg := nil;
+
+  { A status message is control flow and carries no ack subject, so it can
+    never be wrapped - and letting one through would hand the application a
+    phantom empty message it would then try to ack }
+  Result := not AData.HasStatus and
+    TJetStreamMsgMetadata.TryParse(AData.ReplyTo, LMeta);
+
+  if Result then
+    AMsg := TJetStreamMsg.Create(AConnection, AData);
+end;
+
+function TJetStreamMsg.GetSubject: string;
+begin
+  Result := FData.Subject;
+end;
+
+function TJetStreamMsg.GetPayload: string;
+begin
+  Result := FData.Payload;
+end;
+
+function TJetStreamMsg.GetPayloadData: TBytes;
+begin
+  Result := FData.PayloadData;
+end;
+
+function TJetStreamMsg.GetHeaders: TNatsHeaders;
+begin
+  Result := FData.Headers;
+end;
+
+function TJetStreamMsg.GetMetadata: TJetStreamMsgMetadata;
+begin
+  Result := FMetadata;
+end;
+
+function TJetStreamMsg.GetAckSubject: string;
+begin
+  Result := FData.ReplyTo;
+end;
+
+function TJetStreamMsg.GetAcknowledged: Boolean;
+begin
+  Result := FAcknowledged;
+end;
+
+procedure TJetStreamMsg.CheckAckable;
+begin
+  { Acking twice is a bug worth reporting rather than swallowing. The second
+    ack lands on a subject the server has already retired, so it does nothing -
+    and the code that sent it goes on believing it settled something }
+  if FAcknowledged then
+    raise EJetStreamAckError.CreateFmt(
+      'Message %d of stream [%s] has already been acknowledged',
+      [FMetadata.StreamSeq, FMetadata.Stream]);
+end;
+
+procedure TJetStreamMsg.SendAck(const APayload: string; ASettles: Boolean);
+begin
+  CheckAckable;
+
+  { The flag goes up BEFORE the publish. If the publish raises, the message is
+    left settled on purpose: the connection is the thing that failed, and
+    retrying the ack on a dead connection cannot help. The server redelivers
+    after AckWait, which is exactly the right outcome }
+  if ASettles then
+    FAcknowledged := True;
+
+  FConnection.Publish(FData.ReplyTo, APayload);
+end;
+
+procedure TJetStreamMsg.Ack;
+begin
+  SendAck(JetStreamConstants.Ack.PAYLOAD_ACK, True);
+end;
+
+procedure TJetStreamMsg.AckSync(ATimeoutMs: Cardinal);
+var
+  LReply: TNatsArgsMSG;
+begin
+  CheckAckable;
+  FAcknowledged := True;
+
+  { The server answers an ack sent as a request, which is the only way to know
+    it was recorded rather than merely written to a socket }
+  if not FConnection.RequestSync(FData.ReplyTo,
+       JetStreamConstants.Ack.PAYLOAD_ACK, LReply, ATimeoutMs) then
+    raise EJetStreamAckError.CreateFmt(
+      'The server did not confirm the ack for message %d of stream [%s] within %d ms',
+      [FMetadata.StreamSeq, FMetadata.Stream, ATimeoutMs]);
+end;
+
+procedure TJetStreamMsg.Nak;
+begin
+  SendAck(JetStreamConstants.Ack.PAYLOAD_NAK, True);
+end;
+
+procedure TJetStreamMsg.Nak(ADelay: TJetStreamDuration);
+begin
+  { Nanoseconds, like every other duration here. Milliseconds would be accepted
+    and would ask for a redelivery a million times sooner than intended }
+  SendAck(Format(JetStreamConstants.Ack.PAYLOAD_NAK_DELAY, [Int64(ADelay)]), True);
+end;
+
+procedure TJetStreamMsg.InProgress;
+begin
+  { Deliberately does NOT settle: this says "not yet", so it may be sent as
+    often as the work takes }
+  SendAck(JetStreamConstants.Ack.PAYLOAD_PROGRESS, False);
+end;
+
+procedure TJetStreamMsg.Term;
+begin
+  SendAck(JetStreamConstants.Ack.PAYLOAD_TERM, True);
 end;
 
 end.
