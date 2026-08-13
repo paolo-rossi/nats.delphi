@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{2DC1CD7D-4314-4921-AE0C-F901837A4967}</ProjectGuid>
         <ProjectVersion>20.4</ProjectVersion>
@@ -123,7 +123,6 @@
         <DCCReference Include="..\Source\Nats.Parser.pas"/>
         <DCCReference Include="..\Source\Nats.Monitor.pas"/>
         <DCCReference Include="..\Source\Nats.Classes.pas"/>
-        <DCCReference Include="..\Source\Nats.Json.Utils.pas"/>
         <DCCReference Include="..\Source\Nats.Nuid.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
