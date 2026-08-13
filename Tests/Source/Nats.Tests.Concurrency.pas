@@ -556,7 +556,20 @@ begin
     end,
     5000),
     'a fatal -ERR must close the connection');
-  Assert.IsTrue(FLog.Contains('DISCONNECT'), 'the application must be told the connection died');
+
+  { Waited for in its own right rather than asserted on the spot. TearDown
+    flips the state to CLOSED as its FIRST act - that is what makes the
+    handlers run exactly once however many threads race into it - and calls the
+    disconnect handler as its LAST. So "not Connected" is true a moment before
+    the application has been told, and reading the log immediately is a race
+    the test usually wins and occasionally does not }
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FLog.Contains('DISCONNECT');
+    end,
+    5000),
+    'the application must be told the connection died');
 end;
 
 initialization

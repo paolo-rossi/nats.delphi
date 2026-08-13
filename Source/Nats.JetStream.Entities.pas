@@ -425,6 +425,59 @@ type
   end;
 
   /// <summary>
+  ///   Narrows a purge. With none of these set the WHOLE stream is emptied,
+  ///   which is why the filtered form exists as a separate call
+  /// </summary>
+  TJetStreamPurgeRequest = record
+    /// Only messages on this subject - which may be a wildcard
+    [NeonInclude(IncludeIf.NotDefault)]
+    Filter: string;
+    /// Only messages BELOW this sequence
+    [NeonInclude(IncludeIf.NotDefault)]
+    Seq: UInt64;
+    /// Keep this many of the most recent, purge the rest
+    [NeonInclude(IncludeIf.NotDefault)]
+    Keep: UInt64;
+  end;
+
+  /// <summary>
+  ///   Asks for one stored message: by sequence, or the last on a subject, or
+  ///   the first at or after a sequence. Exactly one of them is set
+  /// </summary>
+  TJetStreamMsgGetRequest = record
+    [NeonInclude(IncludeIf.NotDefault)]
+    Seq: UInt64;
+    /// The current value of a KV key is the LAST message on its subject
+    [NeonInclude(IncludeIf.NotDefault)]
+    LastBySubj: string;
+    [NeonInclude(IncludeIf.NotDefault)]
+    NextBySubj: string;
+  end;
+
+  /// <summary>
+  ///   One message as the stream stored it. Reading it needs no consumer, which
+  ///   is what makes a key/value get a single request
+  /// </summary>
+  /// <remarks>
+  ///   Data and Hdrs are BASE64, not text: a stored message is arbitrary bytes,
+  ///   and JSON has no way to carry those. Hdrs is the whole raw header block -
+  ///   'NATS/1.0', the pairs, and the blank line - so it goes back through
+  ///   TNatsParser.ParseHeaders rather than being read by hand.
+  /// </remarks>
+  TJetStreamStoredMsg = record
+    Subject: string;
+    Seq: UInt64;
+    Data: string;
+    Hdrs: string;
+    /// RFC3339, kept as text for the same reason every other timestamp here is
+    Time: string;
+  end;
+
+  TJetStreamMsgGetResponse = record
+    Message: TJetStreamStoredMsg;
+  end;
+
+  /// <summary>
   ///   What DELETE and PURGE answer with. Purged is only meaningful for a purge
   /// </summary>
   TJetStreamSuccessResponse = record

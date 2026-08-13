@@ -23,7 +23,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.DateUtils, System.JSON,
-  System.Diagnostics,
+  System.Diagnostics, System.NetEncoding, System.Generics.Collections,
 
   DUnitX.TestFramework,
 
@@ -35,6 +35,8 @@ uses
   Nats.JetStream.Client,
   Nats.JetStream.Entities,
   Nats.JetStream.Message,
+  Nats.JetStream.KV,
+  Nats.JetStream.ObjectStore,
 
   Nats.Tests.Mocks;
 
@@ -388,6 +390,156 @@ type
     procedure InProgress_DoesNotSettleTheMessage;
     [Test]
     procedure InProgress_MayRepeatAndStillBeAcked;
+  end;
+
+  /// <summary>
+  ///   Key/Value. Everything here is one request/reply, so it fits the mock -
+  ///   the multi-exchange operations (Keys, History) are proved live instead
+  /// </summary>
+  [TestFixture]
+  TJetStreamKVTests = class
+  private
+    FConn: TNatsConnection;
+    FSocket: TNatsMockSocket;
+    FJs: TJetStreamContext;
+    FKV: TJetStreamKV;
+    FServerThread: TThread;
+
+    procedure OpenAndHandshake;
+    procedure CaptureRequest(const AProc: TProc);
+    procedure ReplyWith(const AJson: string);
+    function RequestSubject: string;
+    function RequestBody: string;
+    /// The header block of the HPUB the client wrote
+    function RequestHeaders: string;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    { names, which become stream names and subjects }
+
+    [Test]
+    procedure Bucket_DerivesTheStreamName;
+    [Test]
+    procedure CheckBucket_Empty_Raises;
+    [Test]
+    procedure CheckBucket_WithADot_Raises;
+    [Test]
+    procedure CheckKey_Empty_Raises;
+    [Test]
+    procedure CheckKey_WithAWildcard_Raises;
+    [Test]
+    procedure CheckKey_LeadingOrTrailingDot_Raises;
+    [Test]
+    procedure CheckKey_DotsInTheMiddle_AreAllowed;
+
+    { a bucket is a stream }
+
+    [Test]
+    procedure CreateBucket_UsesTheKvNameAndSubject;
+    [Test]
+    procedure CreateBucket_HistoryIsMaxMsgsPerSubject;
+    [Test]
+    procedure CreateBucket_SetsTheFourSettingsThatMakeItAKvStore;
+    [Test]
+    procedure CreateBucket_HistoryBeyondTheCeiling_Raises;
+    [Test]
+    procedure ListBuckets_StripsTheStreamPrefix;
+
+    { writing }
+
+    [Test]
+    procedure Put_PublishesToTheKeySubject;
+    [Test]
+    procedure Put_ReturnsTheRevisionFromThePubAck;
+    [Test]
+    procedure PutIfAbsent_ExpectsSubjectSequenceZero;
+    [Test]
+    procedure Update_ExpectsTheRevisionGiven;
+    [Test]
+    procedure Delete_WritesATombstoneRatherThanRemovingAnything;
+    [Test]
+    procedure Purge_AddsTheRollupHeader;
+
+    { reading }
+
+    [Test]
+    procedure Get_AsksForTheLastMessageOnTheKeySubject;
+    [Test]
+    procedure Get_DecodesTheStoredValue;
+    [Test]
+    procedure Get_MissingKey_ReportsNotFound;
+    [Test]
+    procedure Get_Tombstone_ReportsNotFoundAndNoValue;
+    [Test]
+    procedure GetRevision_AsksBySequence;
+    [Test]
+    procedure GetRevision_OfAnotherKey_ReportsNotFound;
+  end;
+
+  /// <summary>
+  ///   Object Store. The chunking and the digest are proved live - they take
+  ///   many exchanges - so what is here is the naming, the bucket layout and
+  ///   the metadata round trip
+  /// </summary>
+  [TestFixture]
+  TJetStreamObjectStoreTests = class
+  private
+    FConn: TNatsConnection;
+    FSocket: TNatsMockSocket;
+    FJs: TJetStreamContext;
+    FOs: TJetStreamObjectStore;
+    FServerThread: TThread;
+
+    procedure OpenAndHandshake;
+    procedure CaptureRequest(const AProc: TProc);
+    procedure ReplyWith(const AJson: string);
+    function RequestSubject: string;
+    function RequestBody: string;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    { base64url, which every object name goes through }
+
+    [Test]
+    procedure Encode_HasNoPadding;
+    [Test]
+    procedure Encode_UsesTheUrlSafeAlphabet;
+    [Test]
+    procedure Encode_LongInput_HasNoLineBreaks;
+
+    { names and layout }
+
+    [Test]
+    procedure Bucket_DerivesTheStreamName;
+    [Test]
+    procedure CheckName_Empty_Raises;
+    [Test]
+    procedure CheckName_AllowsSpacesAndSlashes;
+    [Test]
+    procedure CreateBucket_CapturesBothSubjectSpaces;
+    [Test]
+    procedure CreateBucket_AllowsRollupForTheMetadata;
+    [Test]
+    procedure CreateBucket_SetsNoPerSubjectLimit;
+    [Test]
+    procedure ChunkSize_DefaultsAndCanBeOverridden;
+
+    { metadata }
+
+    [Test]
+    procedure Info_AsksForTheLastMessageOnTheEncodedMetaSubject;
+    [Test]
+    procedure Info_DecodesTheStoredMetadata;
+    [Test]
+    procedure Info_MissingObject_ReportsNotFound;
+    [Test]
+    procedure Info_Deleted_ReportsNotFound;
   end;
 
   /// <summary>
@@ -2537,6 +2689,887 @@ begin
   Assert.IsTrue(LMsg.Acknowledged);
 end;
 
+{ TJetStreamKVTests }
+
+/// <summary>
+///   A STREAM.MSG.GET response. Data and Hdrs are base64 on the wire, encoded
+///   here rather than written out by hand so the test stays readable
+/// </summary>
+function StoredMsgJson(const ASubject: string; ASeq: UInt64;
+  const AData, AHeaderBlock: string): string;
+var
+  LFields: string;
+begin
+  LFields := Format('"subject":"%s","seq":%d,"time":"2023-11-14T22:13:20Z"',
+    [ASubject, ASeq]);
+
+  if not AData.IsEmpty then
+    LFields := LFields + Format(',"data":"%s"',
+      [TNetEncoding.Base64.EncodeBytesToString(TEncoding.UTF8.GetBytes(AData))]);
+
+  if not AHeaderBlock.IsEmpty then
+    LFields := LFields + Format(',"hdrs":"%s"',
+      [TNetEncoding.Base64.EncodeBytesToString(TEncoding.UTF8.GetBytes(AHeaderBlock))]);
+
+  Result := Format(
+    '{"type":"io.nats.jetstream.api.v1.stream_msg_get_response","message":{%s}}',
+    [LFields]);
+end;
+
+procedure TJetStreamKVTests.Setup;
+begin
+  UseMockSocket;
+
+  FConn := TNatsConnection.Create;
+  FSocket := TNatsMockSocket.LastInstance;
+  Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
+
+  FConn.Name := 'KvTestConn';
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
+
+  FJs := TJetStreamContext.Create(FConn);
+  FJs.Timeout := API_TIMEOUT;
+  FKV := TJetStreamKV.Create(FJs, 'cfg');
+end;
+
+procedure TJetStreamKVTests.TearDown;
+begin
+  if Assigned(FServerThread) then
+  begin
+    FServerThread.WaitFor;
+    FreeAndNil(FServerThread);
+  end;
+
+  FKV.Free;
+  FJs.Free;
+  FConn.Free;
+end;
+
+procedure TJetStreamKVTests.OpenAndHandshake;
+begin
+  FConn.Open(nil, nil);
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + JS_INFO_JSON);
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.CONNECT),
+    'the client never sent CONNECT in response to INFO');
+  FSocket.ClearClientData;
+end;
+
+procedure TJetStreamKVTests.CaptureRequest(const AProc: TProc);
+begin
+  try
+    AProc();
+  except
+    on E: EJetStreamTimeout do ;   // expected: nobody is playing the server
+  end;
+end;
+
+procedure TJetStreamKVTests.ReplyWith(const AJson: string);
+var
+  LSocket: TNatsMockSocket;
+begin
+  LSocket := FSocket;
+
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LLines, LParts: TArray<string>;
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+      LParts := LLines[0].Split([NatsConstants.SPC]);
+
+      LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+        [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+         Length(TEncoding.UTF8.GetBytes(AJson)), AJson]));
+    end);
+
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+end;
+
+function TJetStreamKVTests.RequestSubject: string;
+var
+  LLine: string;
+begin
+  Result := '';
+  for LLine in FSocket.ClientText.Split([NatsConstants.CR_LF]) do
+    if LLine.StartsWith(NatsConstants.Protocol.PUB + ' ') or
+       LLine.StartsWith(NatsConstants.Protocol.HPUB + ' ') then
+      Exit(LLine.Split([NatsConstants.SPC])[1]);
+end;
+
+function TJetStreamKVTests.RequestBody: string;
+var
+  LLines: TArray<string>;
+  LIndex: Integer;
+begin
+  Result := '';
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+
+  for LIndex := 0 to High(LLines) - 1 do
+    if LLines[LIndex].StartsWith(NatsConstants.Protocol.PUB + ' ') then
+      Exit(LLines[LIndex + 1]);
+end;
+
+function TJetStreamKVTests.RequestHeaders: string;
+var
+  LLines: TArray<string>;
+  LIndex, LNext: Integer;
+begin
+  Result := '';
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+
+  for LIndex := 0 to High(LLines) do
+    if LLines[LIndex].StartsWith(NatsConstants.Protocol.HPUB + NatsConstants.SPC) then
+    begin
+      for LNext := LIndex + 1 to High(LLines) do
+      begin
+        if LLines[LNext].IsEmpty then
+          Exit;
+        Result := Result + LLines[LNext] + NatsConstants.CR_LF;
+      end;
+      Exit;
+    end;
+end;
+
+procedure TJetStreamKVTests.Bucket_DerivesTheStreamName;
+begin
+  { A bucket IS a stream, and this is the whole of that relationship }
+  Assert.AreEqual('cfg', FKV.Bucket);
+  Assert.AreEqual('KV_cfg', FKV.StreamName);
+end;
+
+procedure TJetStreamKVTests.CheckBucket_Empty_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckBucket('');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckBucket_WithADot_Raises;
+begin
+  { 'my.bucket' would become the stream 'KV_my.bucket', and a dot in a stream
+    name addresses a different API endpoint entirely }
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckBucket('my.bucket');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckKey_Empty_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKey('');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckKey_WithAWildcard_Raises;
+begin
+  { '*' in a key would make the publish address a wildcard subject, which is
+    not a key at all }
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKey('a.*');
+    end,
+    EJetStreamKVError);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKey('a.>');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckKey_LeadingOrTrailingDot_Raises;
+begin
+  { Either one produces an EMPTY subject token, which is a different subject }
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKey('.leading');
+    end,
+    EJetStreamKVError);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKey('trailing.');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckKey_DotsInTheMiddle_AreAllowed;
+begin
+  { A key spanning several tokens is legitimate and common - 'app.db.host' -
+    so the check must not be a blanket ban on dots }
+  TJetStreamKV.CheckKey('app.db.host');
+  Assert.Pass('a multi-token key is a valid key');
+end;
+
+procedure TJetStreamKVTests.CreateBucket_UsesTheKvNameAndSubject;
+var
+  LBody: TJSONObject;
+  LSubjects: TJSONArray;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      TJetStreamKV.CreateBucket(FJs, 'orders').Free;
+    end);
+
+  Assert.AreEqual('$JS.API.STREAM.CREATE.KV_orders', RequestSubject);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    Assert.AreEqual('KV_orders', LBody.GetValue<string>('name'));
+
+    LSubjects := LBody.GetValue<TJSONArray>('subjects');
+    Assert.AreEqual(1, LSubjects.Count);
+    Assert.AreEqual('$KV.orders.>', LSubjects.Items[0].Value);
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamKVTests.CreateBucket_HistoryIsMaxMsgsPerSubject;
+var
+  LConfig: TJetStreamKVConfig;
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  LConfig := Default(TJetStreamKVConfig);
+  LConfig.Bucket := 'orders';
+  LConfig.History := 5;
+
+  CaptureRequest(
+    procedure
+    begin
+      TJetStreamKV.CreateBucket(FJs, LConfig).Free;
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    { Keeping 5 revisions of a key IS keeping 5 messages on its subject -
+      there is no separate notion of history anywhere in the server }
+    Assert.AreEqual(Int64(5), LBody.GetValue<Int64>('max_msgs_per_subject'));
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamKVTests.CreateBucket_SetsTheFourSettingsThatMakeItAKvStore;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      TJetStreamKV.CreateBucket(FJs, 'orders').Free;
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    { Discard New so a full bucket REFUSES a write instead of silently dropping
+      somebody else's key - the default, Old, would lose data with no error }
+    Assert.AreEqual('new', LBody.GetValue<string>('discard'));
+    Assert.IsTrue(LBody.GetValue<Boolean>('deny_delete'), 'deny_delete');
+    { without this Purge cannot erase a key's history }
+    Assert.IsTrue(LBody.GetValue<Boolean>('allow_rollup_hdrs'), 'allow_rollup_hdrs');
+    Assert.IsTrue(LBody.GetValue<Boolean>('allow_direct'), 'allow_direct');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamKVTests.CreateBucket_HistoryBeyondTheCeiling_Raises;
+var
+  LConfig: TJetStreamKVConfig;
+begin
+  LConfig := Default(TJetStreamKVConfig);
+  LConfig.Bucket := 'orders';
+  LConfig.History := JetStreamConstants.KV.MAX_HISTORY + 1;
+
+  { Caught here rather than at the server, where it comes back as a generic
+    stream error that says nothing about history }
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CreateBucket(FJs, LConfig).Free;
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.ListBuckets_StripsTheStreamPrefix;
+var
+  LBuckets: TArray<string>;
+begin
+  OpenAndHandshake;
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+    '"total":3,"offset":0,"limit":256,"streams":["KV_cfg","ORDERS","KV_users"]}');
+
+  LBuckets := TJetStreamKV.ListBuckets(FJs);
+
+  { Every bucket is a stream, but not every stream is a bucket - and the caller
+    asked for bucket names, not stream names }
+  Assert.AreEqual(2, Length(LBuckets));
+  Assert.AreEqual('cfg', LBuckets[0]);
+  Assert.AreEqual('users', LBuckets[1]);
+end;
+
+procedure TJetStreamKVTests.Put_PublishesToTheKeySubject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FKV.Put('name', 'delphi');
+    end);
+
+  { A key is a subject. A put is an ordinary JetStream publish }
+  Assert.AreEqual('$KV.cfg.name', RequestSubject);
+  Assert.AreEqual('delphi', RequestBody);
+end;
+
+procedure TJetStreamKVTests.Put_ReturnsTheRevisionFromThePubAck;
+var
+  LRevision: UInt64;
+begin
+  OpenAndHandshake;
+  ReplyWith('{"stream":"KV_cfg","seq":7}');
+
+  LRevision := FKV.Put('name', 'delphi');
+
+  { A revision IS the stream sequence the value landed at - there is no
+    separate counter }
+  Assert.AreEqual(UInt64(7), LRevision);
+end;
+
+procedure TJetStreamKVTests.PutIfAbsent_ExpectsSubjectSequenceZero;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FKV.PutIfAbsent('name', 'delphi');
+    end);
+
+  { Zero means "nothing has ever been written to this subject", which is
+    exactly "this key does not exist". It is also why the publish options had
+    to be able to express an expectation OF zero rather than treating it as
+    unset - a create would otherwise become an unconditional put }
+  Assert.IsTrue(RequestHeaders.Contains('Nats-Expected-Last-Subject-Sequence: 0'),
+    'block was: ' + RequestHeaders);
+end;
+
+procedure TJetStreamKVTests.Update_ExpectsTheRevisionGiven;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FKV.Update('name', 'delphi', 42);
+    end);
+
+  { Compare-and-set, and the compare is the server's to do }
+  Assert.IsTrue(RequestHeaders.Contains('Nats-Expected-Last-Subject-Sequence: 42'),
+    'block was: ' + RequestHeaders);
+end;
+
+procedure TJetStreamKVTests.Delete_WritesATombstoneRatherThanRemovingAnything;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FKV.Delete('name');
+    end);
+
+  { The stream is created with DenyDelete, so a KV delete cannot be the removal
+    of a message - it is a marker appended after it, and History still shows
+    what the key used to hold }
+  Assert.AreEqual('$KV.cfg.name', RequestSubject);
+  Assert.IsTrue(RequestHeaders.Contains('KV-Operation: DEL'),
+    'block was: ' + RequestHeaders);
+  Assert.IsFalse(RequestHeaders.Contains('Nats-Rollup'),
+    'a delete keeps the history - only a purge rolls it up');
+end;
+
+procedure TJetStreamKVTests.Purge_AddsTheRollupHeader;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FKV.Purge('name');
+    end);
+
+  { Nats-Rollup: sub is what erases the history: it tells the server this
+    message REPLACES every earlier one on the subject }
+  Assert.IsTrue(RequestHeaders.Contains('KV-Operation: PURGE'),
+    'block was: ' + RequestHeaders);
+  Assert.IsTrue(RequestHeaders.Contains('Nats-Rollup: sub'),
+    'block was: ' + RequestHeaders);
+end;
+
+procedure TJetStreamKVTests.Get_AsksForTheLastMessageOnTheKeySubject;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    var
+      LEntry: TKVEntry;
+    begin
+      FKV.Get('name', LEntry);
+    end);
+
+  Assert.AreEqual('$JS.API.STREAM.MSG.GET.KV_cfg', RequestSubject);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    { "The current value" is "the last message on the subject", and that is the
+      entire implementation of a KV read }
+    Assert.AreEqual('$KV.cfg.name', LBody.GetValue<string>('last_by_subj'));
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamKVTests.Get_DecodesTheStoredValue;
+var
+  LEntry: TKVEntry;
+begin
+  OpenAndHandshake;
+  ReplyWith(StoredMsgJson('$KV.cfg.name', 7, 'delphi', ''));
+
+  Assert.IsTrue(FKV.Get('name', LEntry));
+
+  { A stored message comes back base64'd, because JSON cannot carry bytes }
+  Assert.AreEqual('delphi', LEntry.ValueString);
+  Assert.AreEqual('name', LEntry.Key, 'the key is the subject minus the bucket prefix');
+  Assert.AreEqual('cfg', LEntry.Bucket);
+  Assert.AreEqual(UInt64(7), LEntry.Revision);
+  Assert.IsTrue(LEntry.Operation = TKVOperation.Put);
+end;
+
+procedure TJetStreamKVTests.Get_MissingKey_ReportsNotFound;
+var
+  LEntry: TKVEntry;
+begin
+  OpenAndHandshake;
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_msg_get_response",' +
+    '"error":{"code":404,"err_code":10037,"description":"no message found"}}');
+
+  { False, not an exception: asking for a key that was never set is the most
+    ordinary thing a key/value store is asked to do }
+  Assert.IsFalse(FKV.Get('name', LEntry));
+  Assert.AreEqual('', LEntry.ValueString);
+end;
+
+procedure TJetStreamKVTests.Get_Tombstone_ReportsNotFoundAndNoValue;
+var
+  LEntry: TKVEntry;
+begin
+  OpenAndHandshake;
+  ReplyWith(StoredMsgJson('$KV.cfg.name', 8, '',
+    'NATS/1.0'#13#10'KV-Operation: DEL'#13#10#13#10));
+
+  { A tombstone IS the last message on the subject, so the read succeeds at the
+    stream level and the key is still not set. Reporting it as a hit would hand
+    back an empty value indistinguishable from one somebody stored }
+  Assert.IsFalse(FKV.Get('name', LEntry), 'a deleted key is not set');
+end;
+
+procedure TJetStreamKVTests.GetRevision_AsksBySequence;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    var
+      LEntry: TKVEntry;
+    begin
+      FKV.GetRevision('name', 7, LEntry);
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    Assert.AreEqual(Int64(7), LBody.GetValue<Int64>('seq'));
+    Assert.IsNull(LBody.GetValue('last_by_subj'), 'by sequence, not by subject');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamKVTests.GetRevision_OfAnotherKey_ReportsNotFound;
+var
+  LEntry: TKVEntry;
+begin
+  OpenAndHandshake;
+  ReplyWith(StoredMsgJson('$KV.cfg.other', 7, 'not yours', ''));
+
+  { A revision is a STREAM sequence, so it is unique across the whole bucket
+    rather than per key. Sequence 7 may well belong to a different key, and
+    handing its value back under this key's name would be a silent data leak }
+  Assert.IsFalse(FKV.GetRevision('name', 7, LEntry));
+end;
+
+{ TJetStreamObjectStoreTests }
+
+procedure TJetStreamObjectStoreTests.Setup;
+begin
+  UseMockSocket;
+
+  FConn := TNatsConnection.Create;
+  FSocket := TNatsMockSocket.LastInstance;
+  Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
+
+  FConn.Name := 'ObjTestConn';
+  FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
+
+  FJs := TJetStreamContext.Create(FConn);
+  FJs.Timeout := API_TIMEOUT;
+  FOs := TJetStreamObjectStore.Create(FJs, 'files');
+end;
+
+procedure TJetStreamObjectStoreTests.TearDown;
+begin
+  if Assigned(FServerThread) then
+  begin
+    FServerThread.WaitFor;
+    FreeAndNil(FServerThread);
+  end;
+
+  FOs.Free;
+  FJs.Free;
+  FConn.Free;
+end;
+
+procedure TJetStreamObjectStoreTests.OpenAndHandshake;
+begin
+  FConn.Open(nil, nil);
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + JS_INFO_JSON);
+
+  Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.CONNECT),
+    'the client never sent CONNECT in response to INFO');
+  FSocket.ClearClientData;
+end;
+
+procedure TJetStreamObjectStoreTests.CaptureRequest(const AProc: TProc);
+begin
+  try
+    AProc();
+  except
+    on E: EJetStreamTimeout do ;
+  end;
+end;
+
+procedure TJetStreamObjectStoreTests.ReplyWith(const AJson: string);
+var
+  LSocket: TNatsMockSocket;
+begin
+  LSocket := FSocket;
+
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LLines, LParts: TArray<string>;
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+      LParts := LLines[0].Split([NatsConstants.SPC]);
+
+      LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+        [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+         Length(TEncoding.UTF8.GetBytes(AJson)), AJson]));
+    end);
+
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+end;
+
+function TJetStreamObjectStoreTests.RequestSubject: string;
+var
+  LLine: string;
+begin
+  Result := '';
+  for LLine in FSocket.ClientText.Split([NatsConstants.CR_LF]) do
+    if LLine.StartsWith(NatsConstants.Protocol.PUB + ' ') or
+       LLine.StartsWith(NatsConstants.Protocol.HPUB + ' ') then
+      Exit(LLine.Split([NatsConstants.SPC])[1]);
+end;
+
+function TJetStreamObjectStoreTests.RequestBody: string;
+var
+  LLines: TArray<string>;
+  LIndex: Integer;
+begin
+  Result := '';
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+
+  for LIndex := 0 to High(LLines) - 1 do
+    if LLines[LIndex].StartsWith(NatsConstants.Protocol.PUB + ' ') then
+      Exit(LLines[LIndex + 1]);
+end;
+
+procedure TJetStreamObjectStoreTests.Encode_HasNoPadding;
+begin
+  { NATS uses the RAW (unpadded) base64url alphabet. An RTL encoder that pads
+    would put '=' in a subject token, which is legal but simply wrong - the
+    object would live at a subject no other client looks at }
+  Assert.AreEqual('aGVsbG8', TObjectStoreEncoding.Encode('hello'));
+  Assert.AreEqual('YQ', TObjectStoreEncoding.Encode('a'), 'two pad chars stripped');
+  Assert.AreEqual('YWI', TObjectStoreEncoding.Encode('ab'), 'one pad char stripped');
+  Assert.AreEqual('YWJj', TObjectStoreEncoding.Encode('abc'), 'nothing to strip');
+end;
+
+procedure TJetStreamObjectStoreTests.Encode_UsesTheUrlSafeAlphabet;
+var
+  LData: TBytes;
+begin
+  { These two bytes encode to '+/8=' in plain base64. Neither '+' nor '/' can
+    appear in a subject token, so both have to be substituted }
+  LData := [$FB, $FF];
+
+  Assert.AreEqual('-_8', TObjectStoreEncoding.Encode(LData));
+end;
+
+procedure TJetStreamObjectStoreTests.Encode_LongInput_HasNoLineBreaks;
+var
+  LEncoded: string;
+begin
+  { TNetEncoding.Base64 wraps at 76 characters, and a line break in a subject
+    would be a protocol violation rather than a wrong subject - it could inject
+    a second command }
+  LEncoded := TObjectStoreEncoding.Encode(StringOfChar('x', 500));
+
+  Assert.IsFalse(LEncoded.Contains(#13), 'no CR');
+  Assert.IsFalse(LEncoded.Contains(#10), 'no LF');
+  Assert.IsTrue(Length(LEncoded) > 76, 'the input was long enough to have wrapped');
+end;
+
+procedure TJetStreamObjectStoreTests.Bucket_DerivesTheStreamName;
+begin
+  Assert.AreEqual('files', FOs.Bucket);
+  Assert.AreEqual('OBJ_files', FOs.StreamName);
+end;
+
+procedure TJetStreamObjectStoreTests.CheckName_Empty_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamObjectStore.CheckName('');
+    end,
+    EJetStreamObjectError);
+end;
+
+procedure TJetStreamObjectStoreTests.CheckName_AllowsSpacesAndSlashes;
+begin
+  { An object name is usually a file name, and it is base64url-encoded into the
+    subject rather than used raw - so none of this needs rejecting }
+  TJetStreamObjectStore.CheckName('reports/2024 Q1.pdf');
+  TJetStreamObjectStore.CheckName('a name with * and > in it');
+  Assert.Pass('an object name is arbitrary text');
+end;
+
+procedure TJetStreamObjectStoreTests.CreateBucket_CapturesBothSubjectSpaces;
+var
+  LBody: TJSONObject;
+  LSubjects: TJSONArray;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      TJetStreamObjectStore.CreateBucket(FJs, 'docs').Free;
+    end);
+
+  Assert.AreEqual('$JS.API.STREAM.CREATE.OBJ_docs', RequestSubject);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    LSubjects := LBody.GetValue<TJSONArray>('subjects');
+
+    { Chunks and metadata share one stream, so no retention policy can apply to
+      one and not the other and leave an object without its description }
+    Assert.AreEqual(2, LSubjects.Count);
+    Assert.AreEqual('$O.docs.C.>', LSubjects.Items[0].Value, 'the chunk space');
+    Assert.AreEqual('$O.docs.M.>', LSubjects.Items[1].Value, 'the metadata space');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamObjectStoreTests.CreateBucket_AllowsRollupForTheMetadata;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      TJetStreamObjectStore.CreateBucket(FJs, 'docs').Free;
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    { Without this a metadata record cannot replace its predecessor, and every
+      version of every object's metadata would pile up forever }
+    Assert.IsTrue(LBody.GetValue<Boolean>('allow_rollup_hdrs'), 'allow_rollup_hdrs');
+    Assert.AreEqual('new', LBody.GetValue<string>('discard'),
+      'a full bucket must refuse a write, not shed another object''s chunks');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamObjectStoreTests.CreateBucket_SetsNoPerSubjectLimit;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      TJetStreamObjectStore.CreateBucket(FJs, 'docs').Free;
+    end);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    { The trap this store shares with none of the others: EVERY chunk of an
+      object is on ONE subject, so a max_msgs_per_subject would silently delete
+      the beginning of every object large enough to exceed it. A KV bucket sets
+      exactly this field, which is what makes it worth pinning here }
+    Assert.IsNull(LBody.GetValue('max_msgs_per_subject'),
+      'a per-subject limit would truncate every large object');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamObjectStoreTests.ChunkSize_DefaultsAndCanBeOverridden;
+var
+  LStore: TJetStreamObjectStore;
+begin
+  Assert.AreEqual(JetStreamConstants.Obj.DEFAULT_CHUNK_SIZE, FOs.ChunkSize);
+
+  LStore := TJetStreamObjectStore.Create(FJs, 'files', 4096);
+  try
+    Assert.AreEqual(4096, LStore.ChunkSize);
+  finally
+    LStore.Free;
+  end;
+end;
+
+procedure TJetStreamObjectStoreTests.Info_AsksForTheLastMessageOnTheEncodedMetaSubject;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    var
+      LInfo: TJetStreamObjectInfo;
+    begin
+      FOs.Info('reports/q1.pdf', LInfo);
+    end);
+
+  Assert.AreEqual('$JS.API.STREAM.MSG.GET.OBJ_files', RequestSubject);
+
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    { The name is ENCODED into the subject: used raw, 'reports/q1.pdf' would be
+      a perfectly valid but completely different subject }
+    Assert.AreEqual('$O.files.M.' + TObjectStoreEncoding.Encode('reports/q1.pdf'),
+      LBody.GetValue<string>('last_by_subj'));
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamObjectStoreTests.Info_DecodesTheStoredMetadata;
+var
+  LInfo: TJetStreamObjectInfo;
+begin
+  OpenAndHandshake;
+  ReplyWith(StoredMsgJson('$O.files.M.' + TObjectStoreEncoding.Encode('a.txt'), 9,
+    '{"name":"a.txt","bucket":"files","nuid":"ABC123","size":2048,"chunks":2,' +
+    '"digest":"SHA-256=deadbeef","mtime":"2023-11-14T22:13:20Z","deleted":false,' +
+    '"options":{"max_chunk_size":1024}}', ''));
+
+  Assert.IsTrue(FOs.Info('a.txt', LInfo));
+
+  Assert.AreEqual('a.txt', LInfo.Name);
+  Assert.AreEqual('files', LInfo.Bucket);
+  Assert.AreEqual('ABC123', LInfo.Nuid, 'the nuid is what names the chunk subject');
+  Assert.AreEqual(UInt64(2048), LInfo.Size);
+  Assert.AreEqual(2, LInfo.Chunks);
+  Assert.AreEqual('SHA-256=deadbeef', LInfo.Digest);
+  Assert.AreEqual(1024, LInfo.Options.MaxChunkSize);
+end;
+
+procedure TJetStreamObjectStoreTests.Info_MissingObject_ReportsNotFound;
+var
+  LInfo: TJetStreamObjectInfo;
+begin
+  OpenAndHandshake;
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_msg_get_response",' +
+    '"error":{"code":404,"err_code":10037,"description":"no message found"}}');
+
+  Assert.IsFalse(FOs.Info('never_stored', LInfo));
+end;
+
+procedure TJetStreamObjectStoreTests.Info_Deleted_ReportsNotFound;
+var
+  LInfo: TJetStreamObjectInfo;
+begin
+  OpenAndHandshake;
+  ReplyWith(StoredMsgJson('$O.files.M.' + TObjectStoreEncoding.Encode('gone.txt'), 9,
+    '{"name":"gone.txt","bucket":"files","nuid":"ABC123","size":0,"chunks":0,' +
+    '"deleted":true}', ''));
+
+  { A deleted object KEEPS its metadata record - that is how a name that was
+    removed stays distinguishable from one that never existed - so the read
+    succeeds at the stream level and there is still no object }
+  Assert.IsFalse(FOs.Info('gone.txt', LInfo), 'a deleted object is not an object');
+end;
+
 { TJetStreamPubOptionsTests }
 
 procedure TJetStreamPubOptionsTests.Empty_HasNoHeaders;
@@ -2679,5 +3712,7 @@ initialization
   TDUnitX.RegisterTestFixture(TJetStreamContextTests);
   TDUnitX.RegisterTestFixture(TJetStreamPubOptionsTests);
   TDUnitX.RegisterTestFixture(TJetStreamMsgTests);
+  TDUnitX.RegisterTestFixture(TJetStreamKVTests);
+  TDUnitX.RegisterTestFixture(TJetStreamObjectStoreTests);
 
 end.

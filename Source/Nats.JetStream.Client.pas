@@ -294,6 +294,31 @@ type
     function SubscribePush(const AStream, AConsumer: string;
       AHandler: TJetStreamMsgHandler): Integer;
 
+    /// <summary>
+    ///   Reads every message matching AFilter through a THROWAWAY consumer,
+    ///   calling AProc for each, and blocks until the filter is exhausted
+    /// </summary>
+    /// <remarks>
+    ///   <para>
+    ///     The general form of "look at a set of messages once" - which is how
+    ///     the key/value and object layers list keys, read a history and
+    ///     reassemble an object. There is no other way to see more than one
+    ///     message at a time.
+    ///   </para>
+    ///   <para>
+    ///     ALastPerSubject gives ONE message per subject, the current state;
+    ///     otherwise every message, in stream order. AHeadersOnly leaves the
+    ///     payloads on the server, for when only the metadata is wanted.
+    ///   </para>
+    ///   <para>
+    ///     The consumer is deleted on every exit path. It also carries an
+    ///     inactivity threshold, so a client that dies mid-scan does not leave
+    ///     one behind for good.
+    ///   </para>
+    /// </remarks>
+    procedure ScanSubject(const AStream, AFilter: string;
+      ALastPerSubject, AHeadersOnly: Boolean; const AProc: TProc<IJetStreamMsg>);
+
     { account }
 
     function AccountInfo: TJetStreamAccountInfo;
@@ -309,9 +334,33 @@ type
     function StreamInfo(const AStream: string): TJetStreamStreamInfo;
     function DeleteStream(const AStream: string): Boolean;
     /// Removes every message but keeps the stream. Returns how many went
-    function PurgeStream(const AStream: string): UInt64;
+    function PurgeStream(const AStream: string): UInt64; overload;
+    /// <summary>
+    ///   Removes only what the request selects - one subject, say. An object
+    ///   store deletes an object by purging its chunk subject this way
+    /// </summary>
+    function PurgeStream(const AStream: string;
+      const ARequest: TJetStreamPurgeRequest): UInt64; overload;
     function ListStreams(AOffset: Integer = 0): TJetStreamStreamListResponse;
     function StreamNames(AOffset: Integer = 0): TArray<string>;
+
+    /// <summary>
+    ///   Reads one stored message without creating a consumer. False means the
+    ///   server has no such message, which is an ordinary answer - only a real
+    ///   failure raises
+    /// </summary>
+    /// <remarks>
+    ///   The workhorse behind a key/value get: a bucket is a stream, a key is a
+    ///   subject, and the current value is the last message on it.
+    /// </remarks>
+    function GetMsg(const AStream: string; const ARequest: TJetStreamMsgGetRequest;
+      out AMsg: TJetStreamStoredMsg): Boolean; overload;
+    /// The last message on ASubject
+    function GetLastMsg(const AStream, ASubject: string;
+      out AMsg: TJetStreamStoredMsg): Boolean;
+    /// The message at ASeq
+    function GetMsg(const AStream: string; ASeq: UInt64;
+      out AMsg: TJetStreamStoredMsg): Boolean; overload;
 
     { consumers }
 
@@ -345,6 +394,15 @@ const
   FETCH_EXPIRY_MARGIN = 100;
   /// Floor for the above, so even a very short fetch carries a usable expiry
   FETCH_MIN_EXPIRY = 50;
+
+  /// How many messages a scan asks for at a time
+  SCAN_BATCH = 128;
+  /// <summary>
+  ///   How long a scan's throwaway consumer may sit idle before the server
+  ///   reaps it. A safety net only - the consumer is deleted explicitly - but
+  ///   without it a client that died mid-scan would leave one behind for good
+  /// </summary>
+  SCAN_IDLE_SECONDS = 60;
 
 type
   /// <summary>
@@ -831,6 +889,57 @@ begin
     end);
 end;
 
+procedure TJetStreamContext.ScanSubject(const AStream, AFilter: string;
+  ALastPerSubject, AHeadersOnly: Boolean; const AProc: TProc<IJetStreamMsg>);
+var
+  LConfig: TJetStreamConsumerConfig;
+  LInfo: TJetStreamConsumerInfo;
+  LBatch: TArray<IJetStreamMsg>;
+  LMsg: IJetStreamMsg;
+begin
+  if not Assigned(AProc) then
+    raise ENatsException.Create('A scan needs something to do with what it finds');
+
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.FilterSubject := AFilter;
+  LConfig.HeadersOnly := AHeadersOnly;
+  LConfig.InactiveThreshold := TJetStreamDuration.FromSeconds(SCAN_IDLE_SECONDS);
+
+  if ALastPerSubject then
+    LConfig.DeliverPolicy := TJetStreamDeliverPolicy.LastPerSubject
+  else
+    LConfig.DeliverPolicy := TJetStreamDeliverPolicy.All;
+
+  { Explicit rather than None: nats-server refuses a PULL consumer that
+    acknowledges nothing, so each message is acked as it is read }
+  LConfig.AckPolicy := TJetStreamAckPolicy.Explicit;
+
+  { No DurableName and no Name, so the server picks one. InactiveThreshold is
+    the safety net for a client that dies before the finally below }
+  LInfo := AddConsumer(AStream, LConfig);
+  try
+    repeat
+      { FetchNoWait, emphatically NOT Fetch. A scan drains what is ALREADY in
+        the stream, so there is never anything to wait for - and a plain Fetch
+        sets an expiry the server honours by holding the request open, which
+        means the final empty batch costs a full timeout every single time.
+        Every Keys, History and object read would pay it }
+      LBatch := FetchNoWait(AStream, LInfo.Name, SCAN_BATCH);
+
+      for LMsg in LBatch do
+      begin
+        AProc(LMsg);
+        LMsg.Ack;
+      end;
+
+      { An empty batch means the filter is exhausted: the server answered 404
+        at once rather than finding anything }
+    until Length(LBatch) = 0;
+  finally
+    DeleteConsumer(AStream, LInfo.Name);
+  end;
+end;
+
 { account }
 
 function TJetStreamContext.AccountInfo: TJetStreamAccountInfo;
@@ -880,6 +989,15 @@ begin
     ApiSubject(JetStreamConstants.Api.STREAM_PURGE, [AStream])).Purged;
 end;
 
+function TJetStreamContext.PurgeStream(const AStream: string;
+  const ARequest: TJetStreamPurgeRequest): UInt64;
+begin
+  CheckName('stream', AStream);
+
+  Result := ApiRequest<TJetStreamPurgeRequest, TJetStreamSuccessResponse>(
+    ApiSubject(JetStreamConstants.Api.STREAM_PURGE, [AStream]), ARequest).Purged;
+end;
+
 function TJetStreamContext.ListStreams(AOffset: Integer): TJetStreamStreamListResponse;
 var
   LRequest: TJetStreamListRequest;
@@ -898,6 +1016,51 @@ begin
 
   Result := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
     ApiSubject(JetStreamConstants.Api.STREAM_NAMES, []), LRequest).Streams;
+end;
+
+function TJetStreamContext.GetMsg(const AStream: string;
+  const ARequest: TJetStreamMsgGetRequest; out AMsg: TJetStreamStoredMsg): Boolean;
+begin
+  CheckName('stream', AStream);
+  AMsg := Default(TJetStreamStoredMsg);
+
+  try
+    AMsg := ApiRequest<TJetStreamMsgGetRequest, TJetStreamMsgGetResponse>(
+      ApiSubject(JetStreamConstants.Api.STREAM_MSG_GET, [AStream]), ARequest).Message;
+    Result := True;
+  except
+    { "No message found" is the ordinary answer to asking for a key that was
+      never set, so it is reported rather than raised. Every OTHER API error -
+      the stream missing, a bad request - still propagates }
+    on E: EJetStreamApiError do
+    begin
+      if not E.IsNotFound then
+        raise;
+      Result := False;
+    end;
+  end;
+end;
+
+function TJetStreamContext.GetLastMsg(const AStream, ASubject: string;
+  out AMsg: TJetStreamStoredMsg): Boolean;
+var
+  LRequest: TJetStreamMsgGetRequest;
+begin
+  LRequest := Default(TJetStreamMsgGetRequest);
+  LRequest.LastBySubj := ASubject;
+
+  Result := GetMsg(AStream, LRequest, AMsg);
+end;
+
+function TJetStreamContext.GetMsg(const AStream: string; ASeq: UInt64;
+  out AMsg: TJetStreamStoredMsg): Boolean;
+var
+  LRequest: TJetStreamMsgGetRequest;
+begin
+  LRequest := Default(TJetStreamMsgGetRequest);
+  LRequest.Seq := ASeq;
+
+  Result := GetMsg(AStream, LRequest, AMsg);
 end;
 
 { consumers }

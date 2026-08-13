@@ -29,7 +29,7 @@ unit Nats.Tests.Live;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.Diagnostics,
+  System.SysUtils, System.Classes, System.Diagnostics, System.IOUtils,
 
   DUnitX.TestFramework,
 
@@ -44,6 +44,8 @@ uses
   Nats.JetStream.Client,
   Nats.JetStream.Entities,
   Nats.JetStream.Message,
+  Nats.JetStream.KV,
+  Nats.JetStream.ObjectStore,
 
   Nats.Tests.Mocks;
 
@@ -187,6 +189,114 @@ type
     procedure SubscribePush_ReceivesWhatWasPublished;
   end;
 
+  /// <summary>
+  ///   Key/Value against a real server. This is where the multi-exchange
+  ///   operations live - Keys and History each drive a throwaway consumer, so
+  ///   the mock cannot say much about them
+  /// </summary>
+  [TestFixture]
+  [Category('Live')]
+  TJetStreamKVLiveTests = class
+  private
+    FConn: TNatsConnection;
+    FJs: TJetStreamContext;
+    FKV: TJetStreamKV;
+    FBucket: string;
+    procedure Connect;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    [Test]
+    procedure Bucket_CreateStatusAndDelete;
+    [Test]
+    procedure ListBuckets_FindsTheNewBucket;
+    [Test]
+    procedure PutAndGet_RoundTrip;
+    [Test]
+    procedure Put_Again_OverwritesAndBumpsTheRevision;
+    [Test]
+    procedure Get_MissingKey_ReportsNotFound;
+    [Test]
+    procedure BinaryValue_SurvivesTheBase64RoundTrip;
+    [Test]
+    procedure MultiTokenKey_RoundTrips;
+    /// The create-only path: proves the expectation of ZERO reaches the server
+    [Test]
+    procedure PutIfAbsent_SecondTime_Raises;
+    /// Compare-and-set
+    [Test]
+    procedure Update_WithAStaleRevision_Raises;
+    [Test]
+    procedure Delete_HidesTheKeyButKeepsItsHistory;
+    /// The one that proves Nats-Rollup reaches the server
+    [Test]
+    procedure Purge_ErasesTheHistoryToo;
+    [Test]
+    procedure Keys_ListsLiveKeysOnly;
+    /// A scan must not sit out a pull timeout to discover it has finished
+    [Test]
+    procedure Keys_DoesNotWaitOutAPullTimeout;
+    [Test]
+    procedure History_ShowsEveryRevisionOldestFirst;
+    [Test]
+    procedure History_IsBoundedByTheBucketsHistorySetting;
+  end;
+
+  /// <summary>
+  ///   Object Store against a real server. Everything that makes this store
+  ///   different from Key/Value - chunking, ordering, the digest, purging the
+  ///   old chunks on replace - only happens across many exchanges, so this is
+  ///   where it is proved
+  /// </summary>
+  [TestFixture]
+  [Category('Live')]
+  TJetStreamObjectStoreLiveTests = class
+  private
+    FConn: TNatsConnection;
+    FJs: TJetStreamContext;
+    FOs: TJetStreamObjectStore;
+    FBucket: string;
+    procedure Connect;
+    /// A memory-backed bucket whose chunks are deliberately tiny
+    procedure CreateBucket(AChunkSize: Integer);
+    /// ACount bytes with a repeating but non-uniform pattern
+    function Pattern(ACount: Integer): TBytes;
+  public
+    [Setup]
+    procedure Setup;
+    [TearDown]
+    procedure TearDown;
+
+    [Test]
+    procedure Bucket_CreateStatusAndDelete;
+    [Test]
+    procedure SmallObject_RoundTrips;
+    /// The one that proves chunking, ordering and reassembly
+    [Test]
+    procedure LargeObject_IsSplitAndPutBackTogether;
+    [Test]
+    procedure BinaryObject_SurvivesIntact;
+    [Test]
+    procedure ObjectNameWithSpacesAndSlashes_RoundTrips;
+    [Test]
+    procedure Get_MissingObject_ReportsNotFound;
+    [Test]
+    procedure Delete_RemovesTheObjectAndItsBytes;
+    /// The one that proves the old chunks are purged rather than left behind
+    [Test]
+    procedure Put_Again_ReplacesTheObjectAndDropsTheOldChunks;
+    [Test]
+    procedure List_OmitsDeletedObjects;
+    /// A truncated object must be reported, not returned short
+    [Test]
+    procedure Get_WithItsChunksPurged_Raises;
+    [Test]
+    procedure PutFileAndGetFile_RoundTrip;
+  end;
+
 implementation
 
 const
@@ -201,6 +311,13 @@ const
   WPI_INTERVAL = 500;
   /// Enough reports to outlast AckWait several times over
   WPI_SENDS = 6;
+
+  /// <summary>
+  ///   Keys_DoesNotWaitOutAPullTimeout. Comfortably under the context's own
+  ///   5 s request timeout, which is what a scan would burn per batch if it
+  ///   pulled with an expiry instead of no_wait
+  /// </summary>
+  SCAN_BUDGET_MS = 2000;
 
 var
   GLiveSwitchCount: Integer = 0;
@@ -1260,8 +1377,729 @@ begin
   end;
 end;
 
+{ TJetStreamKVLiveTests }
+
+/// <summary>
+///   A memory-backed bucket config, so a crashed run leaves no files behind.
+///   AHistory is how many revisions of each key the bucket keeps
+/// </summary>
+function KVConfig(const ABucket: string; AHistory: Integer): TJetStreamKVConfig;
+begin
+  Result := Default(TJetStreamKVConfig);
+  Result.Bucket := ABucket;
+  Result.History := AHistory;
+  Result.Storage := TJetStreamStorage.Memory;
+end;
+
+procedure TJetStreamKVLiveTests.Setup;
+begin
+  UseIndySocket;
+
+  { A bucket name may only hold letters, digits, underscore and hyphen, and
+    NUID is base62 - so this can never produce an invalid one }
+  FBucket := 'delphi_kv_' + TNUID.NextNuid;
+
+  FConn := TNatsConnection.Create;
+  FConn.Name := 'KvLiveConn';
+  FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
+
+  FJs := TJetStreamContext.Create(FConn);
+  FKV := nil;
+end;
+
+procedure TJetStreamKVLiveTests.TearDown;
+begin
+  if Assigned(FConn) and FConn.Connected then
+    try
+      TJetStreamKV.DeleteBucket(FJs, FBucket);
+    except
+      on E: EJetStreamApiError do ;   // never created, or already gone
+      on E: EJetStreamTimeout do ;
+    end;
+
+  FKV.Free;
+  FJs.Free;
+  FConn.Free;
+end;
+
+procedure TJetStreamKVLiveTests.Connect;
+begin
+  FConn.Open(nil);
+  Assert.IsTrue(FConn.WaitForReady(WAIT_MS),
+    Format('handshake with nats-server at %s:%d did not complete: %s',
+      [LIVE_HOST, NatsConstants.DEFAULT_PORT, FConn.LastError]));
+end;
+
+procedure TJetStreamKVLiveTests.Bucket_CreateStatusAndDelete;
+var
+  LConfig: TJetStreamKVConfig;
+  LStatus: TJetStreamKVStatus;
+begin
+  Connect;
+
+  LConfig := Default(TJetStreamKVConfig);
+  LConfig.Bucket := FBucket;
+  LConfig.History := 5;
+  LConfig.Storage := TJetStreamStorage.Memory;
+  FKV := TJetStreamKV.CreateBucket(FJs, LConfig);
+
+  LStatus := FKV.Status;
+
+  { Every one of these is a plain stream setting read back - which is the whole
+    claim this layer makes, that a bucket IS a stream }
+  Assert.AreEqual(FBucket, LStatus.Bucket);
+  Assert.AreEqual('KV_' + FBucket, LStatus.StreamName);
+  Assert.AreEqual(Int64(5), LStatus.History, 'history is max_msgs_per_subject');
+  Assert.AreEqual(UInt64(0), LStatus.Values, 'a new bucket holds nothing');
+
+  TJetStreamKV.DeleteBucket(FJs, FBucket);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Status;
+    end,
+    EJetStreamApiError, 'the bucket''s stream must really be gone');
+end;
+
+procedure TJetStreamKVLiveTests.ListBuckets_FindsTheNewBucket;
+var
+  LBuckets: TArray<string>;
+  LName: string;
+  LFound: Boolean;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LBuckets := TJetStreamKV.ListBuckets(FJs);
+
+  LFound := False;
+  for LName in LBuckets do
+  begin
+    if LName = FBucket then
+      LFound := True;
+
+    { and every name that came back must be a BUCKET name, never the KV_ stream
+      name it was derived from }
+    Assert.IsFalse(LName.StartsWith('KV_'),
+      'ListBuckets must strip the stream prefix, got: ' + LName);
+  end;
+
+  Assert.IsTrue(LFound, 'the new bucket must appear in the list');
+end;
+
+procedure TJetStreamKVLiveTests.PutAndGet_RoundTrip;
+var
+  LRevision: UInt64;
+  LEntry: TKVEntry;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LRevision := FKV.Put('name', 'delphi');
+  Assert.AreEqual(UInt64(1), LRevision, 'the first value in a bucket is revision 1');
+
+  Assert.IsTrue(FKV.Get('name', LEntry));
+  Assert.AreEqual('delphi', LEntry.ValueString);
+  Assert.AreEqual('name', LEntry.Key);
+  Assert.AreEqual(FBucket, LEntry.Bucket);
+  Assert.AreEqual(LRevision, LEntry.Revision);
+  Assert.IsTrue(LEntry.Operation = TKVOperation.Put);
+  Assert.IsFalse(LEntry.IsDelete);
+
+  Assert.AreEqual('delphi', FKV.Get('name'), 'and the convenience form agrees');
+end;
+
+procedure TJetStreamKVLiveTests.Put_Again_OverwritesAndBumpsTheRevision;
+var
+  LFirst, LSecond: UInt64;
+  LEntry: TKVEntry;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LFirst := FKV.Put('name', 'first');
+  LSecond := FKV.Put('name', 'second');
+
+  Assert.IsTrue(LSecond > LFirst, 'a revision is a stream sequence, so it only goes up');
+
+  Assert.IsTrue(FKV.Get('name', LEntry));
+  Assert.AreEqual('second', LEntry.ValueString, 'the current value is the LAST message');
+  Assert.AreEqual(LSecond, LEntry.Revision);
+end;
+
+procedure TJetStreamKVLiveTests.Get_MissingKey_ReportsNotFound;
+var
+  LEntry: TKVEntry;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  { The most ordinary question a key/value store is asked, so it must not raise }
+  Assert.IsFalse(FKV.Get('never_set', LEntry));
+  Assert.AreEqual('fallback', FKV.Get('never_set', 'fallback'));
+end;
+
+procedure TJetStreamKVLiveTests.BinaryValue_SurvivesTheBase64RoundTrip;
+var
+  LValue: TBytes;
+  LEntry: TKVEntry;
+  LIndex: Integer;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  { Not valid UTF-8. A stored message comes back base64'd inside JSON, and this
+    is what proves that path does not go through a string anywhere }
+  LValue := [$00, $FF, $FE, $01, $80, $7F];
+  FKV.Put('blob', LValue);
+
+  Assert.IsTrue(FKV.Get('blob', LEntry));
+  Assert.AreEqual(Length(LValue), Length(LEntry.Value), 'byte count');
+
+  for LIndex := 0 to High(LValue) do
+    Assert.AreEqual(LValue[LIndex], LEntry.Value[LIndex],
+      Format('byte %d survived unchanged', [LIndex]));
+end;
+
+procedure TJetStreamKVLiveTests.MultiTokenKey_RoundTrips;
+var
+  LEntry: TKVEntry;
+  LKeys: TArray<string>;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  { A key with dots becomes several subject tokens, which is legitimate - and
+    reading the key back out of the subject has to put them together again
+    rather than stopping at the first dot }
+  FKV.Put('app.db.host', 'localhost');
+
+  Assert.IsTrue(FKV.Get('app.db.host', LEntry));
+  Assert.AreEqual('localhost', LEntry.ValueString);
+  Assert.AreEqual('app.db.host', LEntry.Key, 'the whole key, dots included');
+
+  LKeys := FKV.Keys;
+  Assert.AreEqual(1, Length(LKeys));
+  Assert.AreEqual('app.db.host', LKeys[0]);
+end;
+
+procedure TJetStreamKVLiveTests.PutIfAbsent_SecondTime_Raises;
+var
+  LEntry: TKVEntry;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  FKV.PutIfAbsent('name', 'first');
+
+  { An expectation of ZERO - "nothing has ever been written to this subject" -
+    is what makes this a create rather than a put. A client that dropped a zero
+    expectation as "unset" would let this second call succeed }
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.PutIfAbsent('name', 'second');
+    end,
+    EJetStreamKVError);
+
+  Assert.IsTrue(FKV.Get('name', LEntry));
+  Assert.AreEqual('first', LEntry.ValueString, 'the rejected write must not have landed');
+end;
+
+procedure TJetStreamKVLiveTests.Update_WithAStaleRevision_Raises;
+var
+  LRevision: UInt64;
+  LEntry: TKVEntry;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LRevision := FKV.Put('name', 'first');
+  FKV.Update('name', 'second', LRevision);   // still current: succeeds
+
+  { ...and now LRevision is stale, which is exactly the race a compare-and-set
+    exists to lose safely }
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Update('name', 'third', LRevision);
+    end,
+    EJetStreamKVError);
+
+  Assert.IsTrue(FKV.Get('name', LEntry));
+  Assert.AreEqual('second', LEntry.ValueString);
+end;
+
+procedure TJetStreamKVLiveTests.Delete_HidesTheKeyButKeepsItsHistory;
+var
+  LEntry: TKVEntry;
+  LHistory: TArray<TKVEntry>;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 10));
+
+  FKV.Put('name', 'first');
+  FKV.Delete('name');
+
+  Assert.IsFalse(FKV.Get('name', LEntry), 'a deleted key is not set');
+
+  { The stream denies deletes, so the tombstone is an EXTRA message rather than
+    the removal of one - and the old value is still there to be seen }
+  LHistory := FKV.History('name');
+  Assert.AreEqual(2, Length(LHistory), 'the value and the tombstone');
+  Assert.AreEqual('first', LHistory[0].ValueString);
+  Assert.IsTrue(LHistory[1].Operation = TKVOperation.Delete);
+  Assert.AreEqual('', LHistory[1].ValueString, 'a tombstone carries no value');
+end;
+
+procedure TJetStreamKVLiveTests.Purge_ErasesTheHistoryToo;
+var
+  LHistory: TArray<TKVEntry>;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 10));
+
+  FKV.Put('name', 'first');
+  FKV.Put('name', 'second');
+  Assert.AreEqual(2, Length(FKV.History('name')), 'both revisions are held');
+
+  FKV.Purge('name');
+
+  { Nats-Rollup: sub is what does this - the purge message REPLACES every
+    earlier one on the subject. Misspell the header and the server ignores it,
+    leaving all three messages behind, which is what this pins }
+  LHistory := FKV.History('name');
+  Assert.AreEqual(1, Length(LHistory), 'a purge rolls the subject up to itself');
+  Assert.IsTrue(LHistory[0].Operation = TKVOperation.Purge);
+end;
+
+procedure TJetStreamKVLiveTests.Keys_ListsLiveKeysOnly;
+var
+  LKeys: TArray<string>;
+  LKey: string;
+  LFoundA, LFoundC, LFoundDeleted: Boolean;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  FKV.Put('alpha', '1');
+  FKV.Put('beta', '2');
+  FKV.Put('gamma', '3');
+  FKV.Delete('beta');
+
+  LKeys := FKV.Keys;
+
+  LFoundA := False;
+  LFoundC := False;
+  LFoundDeleted := False;
+  for LKey in LKeys do
+  begin
+    if LKey = 'alpha' then LFoundA := True;
+    if LKey = 'gamma' then LFoundC := True;
+    if LKey = 'beta' then LFoundDeleted := True;
+  end;
+
+  Assert.IsTrue(LFoundA, 'alpha');
+  Assert.IsTrue(LFoundC, 'gamma');
+
+  { A deleted key still HAS a subject and a last message - the tombstone - so
+    only reading the operation tells a live key from a dead one. A Keys that
+    just listed subjects would report beta }
+  Assert.IsFalse(LFoundDeleted, 'a deleted key is not a key');
+  Assert.AreEqual(2, Length(LKeys));
+end;
+
+procedure TJetStreamKVLiveTests.Keys_DoesNotWaitOutAPullTimeout;
+var
+  LClock: TStopwatch;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+  FKV.Put('one', '1');
+
+  LClock := TStopwatch.StartNew;
+  FKV.Keys;
+  LClock.Stop;
+
+  { A scan drains what is ALREADY in the stream, so it must pull with no_wait.
+    An ordinary Fetch sends an expiry the server honours by HOLDING the final,
+    empty request open for its whole duration - and every scan ends with one of
+    those, so Keys, History, List and every object read paid a full timeout.
+    Nothing else notices: the results are identical, only slower }
+  Assert.IsTrue(LClock.ElapsedMilliseconds < SCAN_BUDGET_MS,
+    Format('a scan of one key took %d ms - it is waiting out a pull timeout ' +
+      'rather than pulling with no_wait', [LClock.ElapsedMilliseconds]));
+end;
+
+procedure TJetStreamKVLiveTests.History_ShowsEveryRevisionOldestFirst;
+var
+  LHistory: TArray<TKVEntry>;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 10));
+
+  FKV.Put('name', 'one');
+  FKV.Put('name', 'two');
+  FKV.Put('name', 'three');
+
+  LHistory := FKV.History('name');
+
+  Assert.AreEqual(3, Length(LHistory));
+  Assert.AreEqual('one', LHistory[0].ValueString, 'oldest first');
+  Assert.AreEqual('two', LHistory[1].ValueString);
+  Assert.AreEqual('three', LHistory[2].ValueString);
+
+  Assert.IsTrue(LHistory[0].Revision < LHistory[2].Revision, 'revisions ascend');
+end;
+
+procedure TJetStreamKVLiveTests.History_IsBoundedByTheBucketsHistorySetting;
+var
+  LHistory: TArray<TKVEntry>;
+begin
+  Connect;
+
+  { History 2 means max_msgs_per_subject 2, and the server enforces it by
+    dropping the oldest - there is no separate history mechanism to get wrong }
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 2));
+
+  FKV.Put('name', 'one');
+  FKV.Put('name', 'two');
+  FKV.Put('name', 'three');
+
+  LHistory := FKV.History('name');
+
+  Assert.AreEqual(2, Length(LHistory), 'only the configured number of revisions is kept');
+  Assert.AreEqual('two', LHistory[0].ValueString, 'the oldest was dropped');
+  Assert.AreEqual('three', LHistory[1].ValueString);
+end;
+
+{ TJetStreamObjectStoreLiveTests }
+
+procedure TJetStreamObjectStoreLiveTests.Setup;
+begin
+  UseIndySocket;
+
+  FBucket := 'delphi_obj_' + TNUID.NextNuid;
+
+  FConn := TNatsConnection.Create;
+  FConn.Name := 'ObjLiveConn';
+  FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
+
+  FJs := TJetStreamContext.Create(FConn);
+  FOs := nil;
+end;
+
+procedure TJetStreamObjectStoreLiveTests.TearDown;
+begin
+  if Assigned(FConn) and FConn.Connected then
+    try
+      TJetStreamObjectStore.DeleteBucket(FJs, FBucket);
+    except
+      on E: EJetStreamApiError do ;
+      on E: EJetStreamTimeout do ;
+    end;
+
+  FOs.Free;
+  FJs.Free;
+  FConn.Free;
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Connect;
+begin
+  FConn.Open(nil);
+  Assert.IsTrue(FConn.WaitForReady(WAIT_MS),
+    Format('handshake with nats-server at %s:%d did not complete: %s',
+      [LIVE_HOST, NatsConstants.DEFAULT_PORT, FConn.LastError]));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.CreateBucket(AChunkSize: Integer);
+var
+  LConfig: TJetStreamObjectStoreConfig;
+begin
+  LConfig := Default(TJetStreamObjectStoreConfig);
+  LConfig.Bucket := FBucket;
+  LConfig.Storage := TJetStreamStorage.Memory;   // no files left behind
+
+  { Deliberately tiny, so a few kilobytes is genuinely many chunks. The default
+    is 128 KB, which no test would want to exceed just to see it split }
+  LConfig.ChunkSize := AChunkSize;
+
+  FOs := TJetStreamObjectStore.CreateBucket(FJs, LConfig);
+end;
+
+function TJetStreamObjectStoreLiveTests.Pattern(ACount: Integer): TBytes;
+var
+  LIndex: Integer;
+begin
+  SetLength(Result, ACount);
+
+  { Not uniform: a chunk delivered twice, or two delivered out of order, would
+    be invisible in a buffer of identical bytes }
+  for LIndex := 0 to ACount - 1 do
+    Result[LIndex] := Byte((LIndex * 7 + (LIndex div 251)) and $FF);
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Bucket_CreateStatusAndDelete;
+var
+  LStatus: TJetStreamObjectStoreStatus;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LStatus := FOs.Status;
+  Assert.AreEqual(FBucket, LStatus.Bucket);
+  Assert.AreEqual('OBJ_' + FBucket, LStatus.StreamName);
+  Assert.AreEqual(UInt64(0), LStatus.Messages, 'a new bucket holds nothing');
+
+  TJetStreamObjectStore.DeleteBucket(FJs, FBucket);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FOs.Status;
+    end,
+    EJetStreamApiError, 'the bucket''s stream must really be gone');
+end;
+
+procedure TJetStreamObjectStoreLiveTests.SmallObject_RoundTrips;
+var
+  LInfo: TJetStreamObjectInfo;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LInfo := FOs.PutString('greeting.txt', 'hello from delphi');
+
+  Assert.AreEqual('greeting.txt', LInfo.Name);
+  Assert.AreEqual(FBucket, LInfo.Bucket);
+  Assert.AreEqual(UInt64(17), LInfo.Size);
+  Assert.AreEqual(1, LInfo.Chunks, 'well under one chunk');
+  Assert.IsTrue(LInfo.Digest.StartsWith('SHA-256='), 'the digest names its algorithm');
+
+  Assert.AreEqual('hello from delphi', FOs.GetString('greeting.txt'));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.LargeObject_IsSplitAndPutBackTogether;
+var
+  LData, LBack: TBytes;
+  LInfo: TJetStreamObjectInfo;
+  LIndex: Integer;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  { 10 whole chunks plus a partial one, so the loop's end condition is exercised
+    rather than landing exactly on a boundary }
+  LData := Pattern(10 * 1024 + 377);
+
+  LInfo := FOs.Put('big.bin', LData);
+  Assert.AreEqual(UInt64(Length(LData)), LInfo.Size);
+  Assert.AreEqual(11, LInfo.Chunks, 'ten full chunks and a remainder');
+
+  Assert.IsTrue(FOs.Get('big.bin', LBack));
+
+  { Byte for byte. Every chunk of an object is on ONE subject, so stream order
+    IS chunk order - but nothing about that is obvious, and a reassembly that
+    dropped or repeated one would produce a plausible file of the wrong length }
+  Assert.AreEqual(Length(LData), Length(LBack), 'the whole object came back');
+  for LIndex := 0 to High(LData) do
+    if LData[LIndex] <> LBack[LIndex] then
+      Assert.Fail(Format('byte %d differs: stored %d, got %d',
+        [LIndex, LData[LIndex], LBack[LIndex]]));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.BinaryObject_SurvivesIntact;
+var
+  LData, LBack: TBytes;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  { Not valid UTF-8 anywhere, and containing the bytes a text path would ruin }
+  LData := [$00, $FF, $FE, $0D, $0A, $80, $7F, $00];
+
+  FOs.Put('blob.bin', LData);
+  Assert.IsTrue(FOs.Get('blob.bin', LBack));
+
+  Assert.AreEqual(Length(LData), Length(LBack));
+  Assert.AreEqual(LData[0], LBack[0], 'a leading zero byte');
+  Assert.AreEqual(LData[3], LBack[3], 'an embedded CR');
+  Assert.AreEqual(LData[4], LBack[4], 'an embedded LF');
+end;
+
+procedure TJetStreamObjectStoreLiveTests.ObjectNameWithSpacesAndSlashes_RoundTrips;
+const
+  NAME = 'reports/2024 Q1 (final).pdf';
+var
+  LList: TArray<TJetStreamObjectInfo>;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  { The name is base64url-encoded into the subject. Used raw it would be
+    several tokens with spaces and brackets in them - which is not a legal
+    subject at all, so this is what proves the encoding is really applied }
+  FOs.PutString(NAME, 'quarterly');
+
+  Assert.AreEqual('quarterly', FOs.GetString(NAME));
+
+  { and it must come back DECODED, not as the base64 the subject carries }
+  LList := FOs.List;
+  Assert.AreEqual(1, Length(LList));
+  Assert.AreEqual(NAME, LList[0].Name);
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Get_MissingObject_ReportsNotFound;
+var
+  LData: TBytes;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  Assert.IsFalse(FOs.Get('never_stored', LData));
+  Assert.AreEqual('fallback', FOs.GetString('never_stored', 'fallback'));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Delete_RemovesTheObjectAndItsBytes;
+var
+  LInfo: TJetStreamObjectInfo;
+  LBefore, LAfter: UInt64;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  FOs.Put('big.bin', Pattern(5 * 1024));
+  LBefore := FOs.Status.Messages;
+  Assert.IsTrue(LBefore >= 5, 'the chunks and the metadata record are all there');
+
+  FOs.Delete('big.bin');
+
+  Assert.IsFalse(FOs.Info('big.bin', LInfo), 'a deleted object is not an object');
+
+  { The chunks are purged, so the bucket shrinks. The metadata tombstone stays,
+    which is why this is "fewer", not "none" }
+  LAfter := FOs.Status.Messages;
+  Assert.IsTrue(LAfter < LBefore,
+    Format('the bytes must go: %d messages before, %d after', [LBefore, LAfter]));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Put_Again_ReplacesTheObjectAndDropsTheOldChunks;
+var
+  LFirst, LSecond: TJetStreamObjectInfo;
+  LAfterFirst, LAfterSecond: UInt64;
+  LBack: TBytes;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LFirst := FOs.Put('doc.bin', Pattern(5 * 1024));
+  LAfterFirst := FOs.Status.Messages;
+
+  LSecond := FOs.Put('doc.bin', Pattern(5 * 1024));
+  LAfterSecond := FOs.Status.Messages;
+
+  { A new write gets a NEW nuid, so its chunks land on a subject of their own -
+    which is what lets a reader finish streaming the old version }
+  Assert.AreNotEqual(LFirst.Nuid, LSecond.Nuid, 'each write gets its own chunk subject');
+
+  { ...and then the old subject is purged. Without that the bucket would grow
+    without bound on every overwrite, holding every version forever }
+  Assert.IsTrue(LAfterSecond <= LAfterFirst + 1,
+    Format('the old chunks must be purged: %d messages after one write, %d after two',
+      [LAfterFirst, LAfterSecond]));
+
+  Assert.IsTrue(FOs.Get('doc.bin', LBack));
+  Assert.AreEqual(5 * 1024, Length(LBack), 'and the current version still reads');
+end;
+
+procedure TJetStreamObjectStoreLiveTests.List_OmitsDeletedObjects;
+var
+  LList: TArray<TJetStreamObjectInfo>;
+  LInfo: TJetStreamObjectInfo;
+  LFoundDeleted: Boolean;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  FOs.PutString('alpha.txt', '1');
+  FOs.PutString('beta.txt', '2');
+  FOs.PutString('gamma.txt', '3');
+  FOs.Delete('beta.txt');
+
+  LList := FOs.List;
+
+  LFoundDeleted := False;
+  for LInfo in LList do
+    if LInfo.Name = 'beta.txt' then
+      LFoundDeleted := True;
+
+  { A deleted object keeps its metadata record, so a List that just read the
+    metadata space without checking the tombstone would report beta }
+  Assert.IsFalse(LFoundDeleted, 'a deleted object must not be listed');
+  Assert.AreEqual(2, Length(LList));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Get_WithItsChunksPurged_Raises;
+var
+  LInfo: TJetStreamObjectInfo;
+  LPurge: TJetStreamPurgeRequest;
+  LData: TBytes;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LInfo := FOs.Put('doomed.bin', Pattern(5 * 1024));
+
+  { Take the bytes out from under the metadata, which is exactly what a MaxAge
+    or a MaxBytes would eventually do to an old object }
+  LPurge := Default(TJetStreamPurgeRequest);
+  LPurge.Filter := Format('$O.%s.C.%s', [FBucket, LInfo.Nuid]);
+  FJs.PurgeStream('OBJ_' + FBucket, LPurge);
+
+  { The metadata still says five chunks, and five chunks is what the caller is
+    entitled to. Returning nothing and reporting success would hand back an
+    empty file that looks exactly like a successfully retrieved empty object }
+  Assert.WillRaise(
+    procedure
+    begin
+      FOs.Get('doomed.bin', LData);
+    end,
+    EJetStreamObjectError);
+end;
+
+procedure TJetStreamObjectStoreLiveTests.PutFileAndGetFile_RoundTrip;
+var
+  LSource, LTarget: string;
+  LData, LBack: TBytes;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LSource := TPath.Combine(TPath.GetTempPath, 'nats_obj_src_' + TNUID.NextNuid + '.bin');
+  LTarget := TPath.Combine(TPath.GetTempPath, 'nats_obj_dst_' + TNUID.NextNuid + '.bin');
+  try
+    LData := Pattern(3 * 1024 + 11);
+    TFile.WriteAllBytes(LSource, LData);
+
+    FOs.PutFile('from_disk.bin', LSource);
+    Assert.IsTrue(FOs.GetFile('from_disk.bin', LTarget));
+
+    LBack := TFile.ReadAllBytes(LTarget);
+    Assert.AreEqual(Length(LData), Length(LBack), 'the file came back whole');
+    Assert.AreEqual(LData[High(LData)], LBack[High(LBack)], 'including its last byte');
+  finally
+    if TFile.Exists(LSource) then
+      TFile.Delete(LSource);
+    if TFile.Exists(LTarget) then
+      TFile.Delete(LTarget);
+  end;
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TNatsLiveServerTests);
   TDUnitX.RegisterTestFixture(TJetStreamLiveTests);
+  TDUnitX.RegisterTestFixture(TJetStreamKVLiveTests);
+  TDUnitX.RegisterTestFixture(TJetStreamObjectStoreLiveTests);
 
 end.

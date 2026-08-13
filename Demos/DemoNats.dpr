@@ -39,6 +39,8 @@ uses
   Nats.JetStream.Consts in '..\Source\Nats.JetStream.Consts.pas',
   Nats.JetStream.Entities in '..\Source\Nats.JetStream.Entities.pas',
   Nats.JetStream.Message in '..\Source\Nats.JetStream.Message.pas',
+  Nats.JetStream.KV in '..\Source\Nats.JetStream.KV.pas',
+  Nats.JetStream.ObjectStore in '..\Source\Nats.JetStream.ObjectStore.pas',
   Nats.Nuid in '..\Source\Nats.Nuid.pas';
 
 {$R *.res}

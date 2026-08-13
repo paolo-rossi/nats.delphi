@@ -45,6 +45,14 @@ type
       STREAM_NAMES  = 'STREAM.NAMES';
 
       /// <summary>
+      ///   Reads one stored message without a consumer - by sequence, or the
+      ///   last one on a subject. This is how a key/value get is done: a KV
+      ///   bucket is a stream, and "the current value" is "the last message on
+      ///   that subject"
+      /// </summary>
+      STREAM_MSG_GET = 'STREAM.MSG.GET.%s';
+
+      /// <summary>
       ///   Ephemeral form - the server picks the name. A named or durable
       ///   consumer uses CONSUMER_CREATE_NAMED instead
       /// </summary>
@@ -84,6 +92,108 @@ type
       EXPECTED_LAST_SUBJECT_SEQ = 'Nats-Expected-Last-Subject-Sequence';
       /// The last stored message must have carried this MSG_ID
       EXPECTED_LAST_MSG_ID = 'Nats-Expected-Last-Msg-Id';
+
+      /// <summary>
+      ///   Makes this message REPLACE everything before it - with ROLLUP_SUBJECT
+      ///   only on its own subject. The stream must allow it (AllowRollupHdrs),
+      ///   and it is how a KV purge erases a key's history in one publish
+      /// </summary>
+      ROLLUP = 'Nats-Rollup';
+      ROLLUP_SUBJECT = 'sub';
+      ROLLUP_ALL = 'all';
+    end;
+
+    /// <summary>
+    ///   Key/Value is a naming convention over a stream, not new protocol: a
+    ///   bucket IS a stream, a key IS a subject, and the current value of a key
+    ///   is the last message on that subject
+    /// </summary>
+    KV = class
+    const
+      /// A bucket named "config" is the stream "KV_config"
+      STREAM_PREFIX = 'KV_';
+      /// ...capturing '$KV.config.>', one subject per key
+      SUBJECT_ALL = '$KV.%s.>';
+      SUBJECT_KEY = '$KV.%s.%s';
+
+      /// <summary>
+      ///   What marks a message as a tombstone rather than a value. Absent for
+      ///   an ordinary put, so a message with no KV-Operation IS the value
+      /// </summary>
+      HEADER_OPERATION = 'KV-Operation';
+      /// Deletes the key but keeps its history
+      OP_DELETE = 'DEL';
+      /// Deletes the key AND its history, via a subject rollup
+      OP_PURGE = 'PURGE';
+
+      /// How many revisions of each key are kept when the config says nothing
+      DEFAULT_HISTORY = 1;
+      /// <summary>
+      ///   The server's own ceiling on MaxMsgsPerSubject for a bucket. Asking
+      ///   for more is rejected, so it is checked here where the message can
+      ///   say what the limit is
+      /// </summary>
+      MAX_HISTORY = 64;
+
+      /// <summary>
+      ///   A bucket name becomes part of a stream name and of every subject, so
+      ///   it is restricted to what is safe in both
+      /// </summary>
+      VALID_BUCKET_CHARS = ['A'..'Z', 'a'..'z', '0'..'9', '_', '-'];
+      /// <summary>
+      ///   A key becomes a subject TOKEN, so dots are allowed - they simply
+      ///   make it several tokens - but wildcards are not, and it may not begin
+      ///   or end with a dot because that would produce an empty token
+      /// </summary>
+      VALID_KEY_CHARS = ['A'..'Z', 'a'..'z', '0'..'9', '_', '-', '/', '=', '.'];
+    end;
+
+    /// <summary>
+    ///   Object Store is a second convention over a stream, and a thicker one
+    ///   than Key/Value: an object is SPLIT across many messages, so the bucket
+    ///   holds two kinds of message - the chunks, and one metadata record per
+    ///   object saying how to put them back together
+    /// </summary>
+    Obj = class
+    const
+      /// A bucket named "files" is the stream "OBJ_files"
+      STREAM_PREFIX = 'OBJ_';
+
+      { The two subject spaces the bucket captures }
+
+      SUBJECT_CHUNKS_ALL = '$O.%s.C.>';
+      SUBJECT_META_ALL   = '$O.%s.M.>';
+
+      /// <summary>
+      ///   Every chunk of ONE object shares ONE subject, keyed by a NUID rather
+      ///   than by the object's name. Two consequences: the chunks come back in
+      ///   order because they are in stream order, and replacing an object is
+      ///   just writing a new NUID and purging the old subject
+      /// </summary>
+      SUBJECT_CHUNK = '$O.%s.C.%s';
+
+      /// <summary>
+      ///   The metadata subject carries the object's name BASE64URL-encoded,
+      ///   because an object name is arbitrary text and a subject token cannot
+      ///   hold spaces, dots or wildcards
+      /// </summary>
+      SUBJECT_META = '$O.%s.M.%s';
+
+      /// <summary>
+      ///   How much of an object goes in one message. Well under the usual 1 MB
+      ///   max_payload, because the whole point is not to depend on it
+      /// </summary>
+      DEFAULT_CHUNK_SIZE = 128 * 1024;
+
+      /// <summary>
+      ///   The digest is stored as "SHA-256=&lt;base64url of the raw hash&gt;".
+      ///   The algorithm is named rather than assumed so a later one can be
+      ///   told apart from this one
+      /// </summary>
+      DIGEST_PREFIX = 'SHA-256=';
+
+      /// As for a KV bucket, and for the same reasons
+      VALID_BUCKET_CHARS = ['A'..'Z', 'a'..'z', '0'..'9', '_', '-'];
     end;
 
     /// <summary>
