@@ -14,10 +14,10 @@
 {  Field values are deliberately few and obvious - the point is to read the    }
 {  KEYS and the shape, not the data. What to check:                            }
 {                                                                              }
-{    - key names are snake_case          (max_msgs_per_subject, not MaxMsgs...) }
-{    - enums are strings                 ("workqueue", not 2)                   }
-{    - durations are nanoseconds         (60 s -> 60000000000)                  }
-{    - unset numbers/strings are absent  (server then applies its own default)  }
+{    - key names are snake_case          (max_msgs_per_subject, not MaxMsgs..) }
+{    - enums are strings                 ("workqueue", not 2)                  }
+{    - durations are nanoseconds         (60 s -> 60000000000)                 }
+{    - unset numbers/strings are absent  (server then applies its own default) }
 {                                                                              }
 {******************************************************************************}
 program JetStreamJson;
