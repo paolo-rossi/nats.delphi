@@ -331,7 +331,7 @@ function TNatsHeadersHelper.GetHeader(const AName: string): string;
 begin
   Result := '';
   for var pair in Self do
-    if pair.Key = AName then
+    if SameText(pair.Key, AName) then
       Exit(pair.Value);
 end;
 
@@ -350,7 +350,7 @@ function TNatsHeadersHelper.GetIndex(const AName: string): Integer;
 begin
   Result := -1;
   for var LIndex := 0 to Length(Self) - 1 do
-    if Self[LIndex].Key = AName then
+    if SameText(Self[LIndex].Key, AName) then
       Exit(LIndex);
 end;
 

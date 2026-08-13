@@ -99,11 +99,11 @@ var
 begin
   Result := 0;
   if Length(ABuffer) = 0 then
-    raise Exception.Create('Cannot use a 0-lenght buffer');
+    raise Exception.Create('Cannot use a 0-length buffer');
 
   for LIndex := 0 to High(ABuffer) do
   begin
-    ABuffer[LIndex] := Random64(255);
+    ABuffer[LIndex] := Random64(256);
     Inc(Result);
   end;
 end;

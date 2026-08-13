@@ -114,6 +114,10 @@ type
     [Test]
     procedure GetHeader_ReturnsValue;
     [Test]
+    procedure GetHeader_IsCaseInsensitive;
+    [Test]
+    procedure SetHeader_CaseInsensitiveReplace;
+    [Test]
     procedure GetHeader_UnknownName_ReturnsEmpty;
     [Test]
     procedure GetIndex_UnknownName_ReturnsMinusOne;
@@ -503,6 +507,29 @@ begin
   LHeaders.Add('Nats-Msg-Id', 'abc');
 
   Assert.AreEqual('abc', LHeaders.GetHeader('Nats-Msg-Id'));
+end;
+
+procedure TNatsHeadersTests.GetHeader_IsCaseInsensitive;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := nil;
+  LHeaders.Add('Nats-Msg-Id', 'abc');
+
+  Assert.AreEqual('abc', LHeaders.GetHeader('nats-msg-id'));
+  Assert.AreEqual('abc', LHeaders.GetHeader('NATS-MSG-ID'));
+end;
+
+procedure TNatsHeadersTests.SetHeader_CaseInsensitiveReplace;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := nil;
+  LHeaders.Add('Nats-Msg-Id', '1');
+  LHeaders.SetHeader('nats-msg-id', '2');
+
+  Assert.AreEqual(1, LHeaders.Count, 'SetHeader must replace case-insensitively without duplicating');
+  Assert.AreEqual('2', LHeaders.GetHeader('Nats-Msg-Id'));
 end;
 
 procedure TNatsHeadersTests.GetHeader_UnknownName_ReturnsEmpty;
