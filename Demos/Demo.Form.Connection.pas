@@ -1,22 +1,10 @@
 {******************************************************************************}
 {                                                                              }
-{  NATS.Delphi: Delphi Client Library for NATS                                 }
+{  nats.delphi: Delphi Client Library for NATS                                 }
 {  Copyright (c) 2022 Paolo Rossi                                              }
 {  https://github.com/paolo-rossi/nats.delphi                                  }
 {                                                                              }
-{******************************************************************************}
-{                                                                              }
-{  Licensed under the Apache License, Version 2.0 (the "License");             }
-{  you may not use this file except in compliance with the License.            }
-{  You may obtain a copy of the License at                                     }
-{                                                                              }
-{      http://www.apache.org/licenses/LICENSE-2.0                              }
-{                                                                              }
-{  Unless required by applicable law or agreed to in writing, software         }
-{  distributed under the License is distributed on an "AS IS" BASIS,           }
-{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
-{  See the License for the specific language governing permissions and         }
-{  limitations under the License.                                              }
+{  Licensed under the MIT license                                              }
 {                                                                              }
 {******************************************************************************}
 unit Demo.Form.Connection;
@@ -337,16 +325,16 @@ begin
           TThread.Queue(TThread.Current,
             procedure
             begin
-              Log('Connected to server ' + AInfo.server_name);
+              Log('Connected to server ' + AInfo.ServerName);
 
-              lstServerInfo.Strings.Values['Server ID'] := AInfo.server_id;
-              lstServerInfo.Strings.Values['Server Name'] := AInfo.server_name;
-              lstServerInfo.Strings.Values['Server Version'] := AInfo.version;
-              lstServerInfo.Strings.Values['Protocol'] := AInfo.proto.ToString;
-              lstServerInfo.Strings.Values['Host'] := AInfo.host;
-              lstServerInfo.Strings.Values['Port'] := AInfo.port.ToString;
-              lstServerInfo.Strings.Values['Client ID'] := AInfo.client_id.ToString;
-              lstServerInfo.Strings.Values['Client IP'] := AInfo.client_ip;
+              lstServerInfo.Strings.Values['Server ID'] := AInfo.ServerId;
+              lstServerInfo.Strings.Values['Server Name'] := AInfo.ServerName;
+              lstServerInfo.Strings.Values['Server Version'] := AInfo.Version;
+              lstServerInfo.Strings.Values['Protocol'] := AInfo.Proto.ToString;
+              lstServerInfo.Strings.Values['Host'] := AInfo.Host;
+              lstServerInfo.Strings.Values['Port'] := AInfo.Port.ToString;
+              lstServerInfo.Strings.Values['Client ID'] := AInfo.ClientId.ToString;
+              lstServerInfo.Strings.Values['Client IP'] := AInfo.ClientIp;
             end
           );
         end,

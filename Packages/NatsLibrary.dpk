@@ -1,3 +1,12 @@
+{******************************************************************************}
+{                                                                              }
+{  nats.delphi: Delphi Client Library for NATS                                 }
+{  Copyright (c) 2022 Paolo Rossi                                              }
+{  https://github.com/paolo-rossi/nats.delphi                                  }
+{                                                                              }
+{  Licensed under the MIT license                                              }
+{                                                                              }
+{******************************************************************************}
 package NatsLibrary;
 
 {$R *.res}
@@ -33,7 +42,8 @@ package NatsLibrary;
 requires
   rtl,
   IndySystem,
-  IndyCore;
+  IndyCore,
+  Neon;
 
 contains
   Nats.Classes in '..\Source\Nats.Classes.pas',
@@ -41,6 +51,12 @@ contains
   Nats.Consts in '..\Source\Nats.Consts.pas',
   Nats.Entities in '..\Source\Nats.Entities.pas',
   Nats.Exceptions in '..\Source\Nats.Exceptions.pas',
+  Nats.JetStream.Client in '..\Source\Nats.JetStream.Client.pas',
+  Nats.JetStream.Consts in '..\Source\Nats.JetStream.Consts.pas',
+  Nats.JetStream.Entities in '..\Source\Nats.JetStream.Entities.pas',
+  Nats.JetStream.Message in '..\Source\Nats.JetStream.Message.pas',
+  Nats.JetStream.KV in '..\Source\Nats.JetStream.KV.pas',
+  Nats.JetStream.ObjectStore in '..\Source\Nats.JetStream.ObjectStore.pas',
   Nats.Monitor in '..\Source\Nats.Monitor.pas',
   Nats.Nuid in '..\Source\Nats.Nuid.pas',
   Nats.Parser in '..\Source\Nats.Parser.pas',

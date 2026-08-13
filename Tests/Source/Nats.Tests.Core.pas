@@ -88,6 +88,22 @@ type
     procedure ParseHeaders_FillsTheDestinationArray;
     [Test]
     procedure ParseHeaders_SkipsTheVersionLine;
+
+    { status line - §2 of Docs\JetStream-Plan.md. Pull consumers signal all
+      their control flow this way, so a status must never read as data }
+
+    [Test]
+    procedure ParseHeaders_StatusLine_YieldsCodeAndDescription;
+    [Test]
+    procedure ParseHeaders_StatusLine_IsNotAHeaderPair;
+    [Test]
+    procedure ParseHeaders_PlainVersionLine_YieldsNoStatus;
+    [Test]
+    procedure ParseHeaders_StatusWithoutDescription_YieldsCodeOnly;
+    [Test]
+    procedure ParseHeaders_StatusLineAndHeaders_BothParse;
+    [Test]
+    procedure ParseHeaders_StatusLineNotFirst_IsNotAStatus;
   end;
 
   [TestFixture]
@@ -97,6 +113,10 @@ type
     procedure Add_AppendsHeader;
     [Test]
     procedure GetHeader_ReturnsValue;
+    [Test]
+    procedure GetHeader_IsCaseInsensitive;
+    [Test]
+    procedure SetHeader_CaseInsensitiveReplace;
     [Test]
     procedure GetHeader_UnknownName_ReturnsEmpty;
     [Test]
@@ -112,10 +132,10 @@ type
     [Test]
     procedure CopyHeaders_AppendsAllPairs;
 
-    // [KNOWN BUG §3] Text emits "Key=Value"; NATS headers are "Key: Value"
+    // §3: Text must emit "Key: Value", not "Key=Value"
     [Test]
     procedure Text_UsesColonSeparator;
-    // [KNOWN BUG §3 + §4] what we write must be readable by what we read
+    // §3 + §4: what we write must be readable by what we read
     [Test]
     procedure Text_RoundTripsThroughParseHeaders;
   end;
@@ -184,14 +204,14 @@ begin
   Assert.IsTrue(LCommand.CommandType = TNatsCommandServer.INFO, 'command type must be INFO');
 
   LInfo := LCommand.GetArgAsInfo.Info;
-  Assert.AreEqual('nats-1', LInfo.server_name);
-  Assert.AreEqual('2.10.11', LInfo.version);
-  Assert.AreEqual(1, LInfo.proto);
-  Assert.AreEqual(4222, LInfo.port);
-  Assert.AreEqual(1048576, LInfo.max_payload);
-  Assert.IsTrue(LInfo.headers, 'headers must be True');
-  Assert.IsTrue(LInfo.jetstream, 'jetstream must be True');
-  Assert.IsFalse(LInfo.tls_required, 'tls_required must be False');
+  Assert.AreEqual('nats-1', LInfo.ServerName);
+  Assert.AreEqual('2.10.11', LInfo.Version);
+  Assert.AreEqual(1, LInfo.Proto);
+  Assert.AreEqual(4222, LInfo.Port);
+  Assert.AreEqual(1048576, LInfo.MaxPayload);
+  Assert.IsTrue(LInfo.Headers, 'headers must be True');
+  Assert.IsTrue(LInfo.Jetstream, 'jetstream must be True');
+  Assert.IsFalse(LInfo.TlsRequired, 'tls_required must be False');
 end;
 
 procedure TNatsParserTests.Parse_INFO_WithoutPayload_Raises;
@@ -359,9 +379,97 @@ begin
   LHeaders := nil;
   FParser.ParseHeaders(HEADER_BLOCK, LHeaders);
 
-  // [KNOWN BUG §4] ParseHeaders takes ADestHeaders by value
+  // §4: ADestHeaders is a var parameter, so the parsed headers reach the caller
   Assert.AreEqual(1, LHeaders.Count, 'the parsed headers must reach the caller');
   Assert.AreEqual('V', LHeaders.GetHeader('K'));
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLine_YieldsCodeAndDescription;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0 404 No Messages'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(NatsConstants.Status.NO_MESSAGES, LStatus, 'the status code must survive');
+  Assert.AreEqual('No Messages', LDescription);
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLine_IsNotAHeaderPair;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0 404 No Messages'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(0, LHeaders.Count,
+    'the status line is control flow, not a header pair');
+end;
+
+procedure TNatsParserTests.ParseHeaders_PlainVersionLine_YieldsNoStatus;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0'#13#10'K: V'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(0, LStatus, 'an ordinary header block carries no status');
+  Assert.AreEqual('', LDescription);
+  Assert.AreEqual(1, LHeaders.Count, 'and its headers must still parse');
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusWithoutDescription_YieldsCodeOnly;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  FParser.ParseHeaders('NATS/1.0 100'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(NatsConstants.Status.IDLE_HEARTBEAT, LStatus);
+  Assert.AreEqual('', LDescription, 'a bare code has no description to invent');
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLineAndHeaders_BothParse;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  // an idle heartbeat carries both a status and real headers
+  FParser.ParseHeaders(
+    'NATS/1.0 100 Idle Heartbeat'#13#10 +
+    'Nats-Last-Consumer: 5'#13#10 +
+    'Nats-Last-Stream: 12'#13#10#13#10, LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(NatsConstants.Status.IDLE_HEARTBEAT, LStatus);
+  Assert.AreEqual('Idle Heartbeat', LDescription,
+    'a multi-word description must not be truncated at the first space');
+  Assert.AreEqual(2, LHeaders.Count);
+  Assert.AreEqual('5', LHeaders.GetHeader('Nats-Last-Consumer'));
+  Assert.AreEqual('12', LHeaders.GetHeader('Nats-Last-Stream'));
+end;
+
+procedure TNatsParserTests.ParseHeaders_StatusLineNotFirst_IsNotAStatus;
+var
+  LHeaders: TNatsHeaders;
+  LStatus: Integer;
+  LDescription: string;
+begin
+  LHeaders := nil;
+  // only the FIRST line can be a status; anything later is just a header
+  FParser.ParseHeaders('NATS/1.0'#13#10'K: V'#13#10'NATS/1.0 404 No Messages'#13#10#13#10,
+    LHeaders, LStatus, LDescription);
+
+  Assert.AreEqual(0, LStatus, 'a status line can only be the first line of the block');
 end;
 
 procedure TNatsParserTests.ParseHeaders_SkipsTheVersionLine;
@@ -399,6 +507,29 @@ begin
   LHeaders.Add('Nats-Msg-Id', 'abc');
 
   Assert.AreEqual('abc', LHeaders.GetHeader('Nats-Msg-Id'));
+end;
+
+procedure TNatsHeadersTests.GetHeader_IsCaseInsensitive;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := nil;
+  LHeaders.Add('Nats-Msg-Id', 'abc');
+
+  Assert.AreEqual('abc', LHeaders.GetHeader('nats-msg-id'));
+  Assert.AreEqual('abc', LHeaders.GetHeader('NATS-MSG-ID'));
+end;
+
+procedure TNatsHeadersTests.SetHeader_CaseInsensitiveReplace;
+var
+  LHeaders: TNatsHeaders;
+begin
+  LHeaders := nil;
+  LHeaders.Add('Nats-Msg-Id', '1');
+  LHeaders.SetHeader('nats-msg-id', '2');
+
+  Assert.AreEqual(1, LHeaders.Count, 'SetHeader must replace case-insensitively without duplicating');
+  Assert.AreEqual('2', LHeaders.GetHeader('Nats-Msg-Id'));
 end;
 
 procedure TNatsHeadersTests.GetHeader_UnknownName_ReturnsEmpty;
@@ -487,7 +618,6 @@ begin
   LHeaders := nil;
   LHeaders.Add('Nats-Msg-Id', 'abc');
 
-  // [KNOWN BUG §3] Text currently emits "Nats-Msg-Id=abc"
   Assert.AreEqual('Nats-Msg-Id: abc'#13#10, LHeaders.Text,
     'NATS headers use the HTTP "Key: Value" form');
 end;
@@ -524,10 +654,10 @@ var
 begin
   LInfo := TNatsServerInfo.FromJSONString(INFO_JSON);
 
-  Assert.AreEqual('NDHJZQZ4YQXQ', LInfo.server_id);
-  Assert.AreEqual('127.0.0.1', LInfo.client_ip);
-  Assert.AreEqual(7, LInfo.client_id);
-  Assert.AreEqual(1048576, LInfo.max_payload);
+  Assert.AreEqual('NDHJZQZ4YQXQ', LInfo.ServerId);
+  Assert.AreEqual('127.0.0.1', LInfo.ClientIp);
+  Assert.AreEqual(7, LInfo.ClientId);
+  Assert.AreEqual(1048576, LInfo.MaxPayload);
 end;
 
 procedure TNatsEntitiesTests.ServerInfo_FromJSONString_IgnoresUnknownFields;
@@ -538,7 +668,7 @@ begin
   LInfo := TNatsServerInfo.FromJSONString(
     '{"server_name":"nats-1","cluster":"c1","connect_urls":["10.0.0.1:4222"],"ldm":false}');
 
-  Assert.AreEqual('nats-1', LInfo.server_name);
+  Assert.AreEqual('nats-1', LInfo.ServerName);
 end;
 
 procedure TNatsEntitiesTests.ConnectOptions_ToJSONString_UsesProtocolFieldNames;
@@ -547,15 +677,16 @@ var
   LJson: string;
 begin
   LOptions := Default(TNatsConnectOptions);
-  LOptions.lang := 'Delphi';
-  LOptions.version := NatsConstants.CLIENT_VERSION;
-  LOptions.protocol := 1;
-  LOptions.echo := True;
-  LOptions.user := 'joe';
+  LOptions.Lang := 'Delphi';
+  LOptions.Version := NatsConstants.CLIENT_VERSION;
+  LOptions.Protocol := 1;
+  LOptions.Echo := True;
+  LOptions.User := 'joe';
 
   LJson := LOptions.ToJSONString;
 
-  // the wire format is lowercase snake_case, matching the record fields verbatim
+  // the wire format is lowercase snake_case; Neon derives it from the PascalCase
+  // field names through TNeonCase.SnakeCase (see NatsJSONConfig)
   Assert.IsTrue(LJson.Contains('"lang":"Delphi"'), 'missing lang in ' + LJson);
   Assert.IsTrue(LJson.Contains('"protocol":1'), 'missing protocol in ' + LJson);
   Assert.IsTrue(LJson.Contains('"user":"joe"'), 'missing user in ' + LJson);
@@ -567,15 +698,15 @@ var
   LSource, LParsed: TNatsConnectOptions;
 begin
   LSource := Default(TNatsConnectOptions);
-  LSource.verbose := True;
-  LSource.name := 'client-1';
-  LSource.protocol := 1;
+  LSource.Verbose := True;
+  LSource.Name := 'client-1';
+  LSource.Protocol := 1;
 
   LParsed := TNatsConnectOptions.FromJSONString(LSource.ToJSONString);
 
-  Assert.IsTrue(LParsed.verbose, 'verbose must survive the round trip');
-  Assert.AreEqual('client-1', LParsed.name);
-  Assert.AreEqual(1, LParsed.protocol);
+  Assert.IsTrue(LParsed.Verbose, 'verbose must survive the round trip');
+  Assert.AreEqual('client-1', LParsed.Name);
+  Assert.AreEqual(1, LParsed.Protocol);
 end;
 
 procedure TNatsEntitiesTests.ConnectOptions_HeaderSupportFlagSerializes;
@@ -588,11 +719,11 @@ begin
   // That the connection turns this on by default is asserted by
   // TNatsConnectionProtocolTests.Connect_DeclaresHeaderSupport.
   LOptions := Default(TNatsConnectOptions);
-  LOptions.headers := True;
+  LOptions.Headers := True;
 
   Assert.IsTrue(LOptions.ToJSONString.Contains('"headers":true'),
     'the header support flag must reach the CONNECT payload');
-  Assert.IsTrue(TNatsConnectOptions.FromJSONString(LOptions.ToJSONString).headers,
+  Assert.IsTrue(TNatsConnectOptions.FromJSONString(LOptions.ToJSONString).Headers,
     'the header support flag must survive a round trip');
 end;
 

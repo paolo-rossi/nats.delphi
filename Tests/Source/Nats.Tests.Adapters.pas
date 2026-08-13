@@ -104,8 +104,15 @@ type
                              // "a message arrived" is never satisfied by the
                              // handshake
     FConnectUser: string;
-    procedure OpenAndHandshake;
+    /// <summary>
+    ///   Drives the "server" side of a RequestSync, which blocks the test
+    ///   thread. Joined in TearDown so it can never outlive the mock socket
+    /// </summary>
+    FServerThread: TThread;
+    procedure OpenAndHandshake; overload;
+    procedure OpenAndHandshake(const AInfoJson: string); overload;
     function LogHandler: TNatsMsgHandler;
+    procedure ReplyWhenSubscribed(const APayload: string);
   public
     [Setup]
     procedure Setup;
@@ -197,6 +204,17 @@ type
     [Test]
     procedure Hmsg_HeadersAreDeliveredToTheHandler;
 
+    { status line - §2 of Docs\JetStream-Plan.md }
+
+    // the whole point: a "404 No Messages" and a legitimate empty message are
+    // the same bytes apart from the status line
+    [Test]
+    procedure Hmsg_StatusMessage_CarriesTheStatusCode;
+    [Test]
+    procedure Hmsg_EmptyMessage_HasNoStatus;
+    [Test]
+    procedure Msg_WithoutHeaderBlock_HasNoStatus;
+
     { request / inbox }
 
     [Test]
@@ -210,6 +228,53 @@ type
     procedure Request_SubscriptionIsDroppedAfterTheReply;
     [Test]
     procedure NewInbox_IsUniqueAcrossConnections;
+
+    { synchronous request - §1 of Docs\JetStream-Plan.md }
+
+    [Test]
+    procedure RequestSync_WritesSubArmUnsubThenPublish;
+    [Test]
+    procedure RequestSync_ReturnsTheReply;
+    [Test]
+    procedure RequestSync_Reply_LeavesNoSubscription;
+    [Test]
+    procedure RequestSync_Timeout_ReturnsFalse;
+    // the leak §1 exists to close: a reply that never comes used to leave the
+    // inbox subscribed on both sides, one entry per call
+    [Test]
+    procedure RequestSync_Timeout_RemovesTheSubscription;
+    [Test]
+    procedure RequestSync_Timeout_UnsubscribesOnTheWire;
+    // the form JetStream publish needs: binary payload plus headers
+    [Test]
+    procedure RequestSync_WithHeaders_WritesHpub;
+    [Test]
+    procedure RequestSync_ConnectionClosedWhileWaiting_Raises;
+    [Test]
+    procedure RequestSync_NotConnected_Raises;
+    [Test]
+    procedure RequestSync_ZeroTimeout_Raises;
+
+    { max_payload - §5 of Docs\JetStream-Plan.md. Oversized publishes get the
+      connection closed by the server, so they must be refused at the call site }
+
+    [Test]
+    procedure MaxPayload_IsTakenFromInfo;
+    [Test]
+    procedure Publish_OversizedPayload_Raises;
+    [Test]
+    procedure Publish_OversizedPayload_WritesNothing;
+    [Test]
+    procedure Publish_ExactlyMaxPayload_IsAllowed;
+    [Test]
+    procedure PublishBytes_OversizedPayload_Raises;
+    // the server counts HPUB's <#total bytes>, so headers count too
+    [Test]
+    procedure Hpub_OversizedTotal_Raises;
+    [Test]
+    procedure Publish_BeforeInfo_IsNotSizeChecked;
+    [Test]
+    procedure MaxPayload_LaterInfo_UpdatesTheLimit;
   end;
 
 implementation
@@ -221,6 +286,23 @@ const
     '"jetstream":true,"client_id":7,"client_ip":"127.0.0.1"}';
 
   MOCK_TIMEOUT = 200;
+
+  /// <summary>
+  ///   Request timeout for the tests that mean to hit it. Short on purpose, and
+  ///   unrelated to the socket read timeout - the mock's is 30 s, so nothing
+  ///   here trips a keep-alive PING and pollutes the captured wire bytes
+  /// </summary>
+  REQUEST_TIMEOUT = 150;
+
+  /// <summary>
+  ///   The same server, declaring a tiny max_payload. Lets the size checks be
+  ///   exercised exactly at the boundary without allocating megabytes
+  /// </summary>
+  SMALL_MAX_PAYLOAD = 32;
+  INFO_JSON_SMALL =
+    '{"server_id":"NDHJZQZ4YQXQ","server_name":"nats-1","version":"2.10.11",' +
+    '"proto":1,"host":"0.0.0.0","port":4222,"headers":true,"max_payload":32,' +
+    '"jetstream":true,"client_id":7,"client_ip":"127.0.0.1"}';
 
 { TNatsSocketRegistryTests }
 
@@ -407,9 +489,48 @@ end;
 
 procedure TNatsConnectionProtocolTests.TearDown;
 begin
+  { Joined BEFORE the connection goes, because the mock socket is reference
+    counted and dies with it - a server thread still running would be touching
+    freed memory }
+  if Assigned(FServerThread) then
+  begin
+    FServerThread.WaitFor;
+    FreeAndNil(FServerThread);
+  end;
+
   FConn.Free;   // may fire the disconnect handler, which writes to FLog
   FMsgLog.Free;
   FLog.Free;
+end;
+
+procedure TNatsConnectionProtocolTests.ReplyWhenSubscribed(const APayload: string);
+var
+  LSocket: TNatsMockSocket;
+begin
+  LSocket := FSocket;
+
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LLines, LParts: TArray<string>;
+    begin
+      { Wait for the SUB to actually reach the wire. Replying earlier would
+        deliver a message for a sid that does not exist yet, and the consumer
+        would drop it }
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      // first line written by RequestSync is "SUB <inbox> <sid>"
+      LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+      LParts := LLines[0].Split([NatsConstants.SPC]);
+
+      LSocket.ServerSend(Format('MSG %s %s %d'#13#10'%s'#13#10,
+        [LParts[1], LParts[2], Length(TEncoding.UTF8.GetBytes(APayload)), APayload]));
+    end);
+
+  FServerThread.FreeOnTerminate := False;   // TearDown joins and frees it
+  FServerThread.Start;
 end;
 
 function TNatsConnectionProtocolTests.LogHandler: TNatsMsgHandler;
@@ -424,19 +545,24 @@ end;
 
 procedure TNatsConnectionProtocolTests.OpenAndHandshake;
 begin
+  OpenAndHandshake(INFO_JSON);
+end;
+
+procedure TNatsConnectionProtocolTests.OpenAndHandshake(const AInfoJson: string);
+begin
   FConn.Open(
     procedure (AInfo: TNatsServerInfo; var AConnectOptions: TNatsConnectOptions)
     begin
-      FLog.Add('CONNECT:' + AInfo.server_name);
+      FLog.Add('CONNECT:' + AInfo.ServerName);
       if FConnectUser <> '' then
-        AConnectOptions.user := FConnectUser;
+        AConnectOptions.User := FConnectUser;
     end,
     procedure
     begin
       FLog.Add('DISCONNECT');
     end);
 
-  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON);
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + AInfoJson);
 
   Assert.IsTrue(FSocket.WaitForClientText(NatsConstants.Protocol.CONNECT),
     'the client never sent CONNECT in response to INFO');
@@ -483,7 +609,7 @@ begin
 
   // ConnectOptions is passed to the handler as var, so what the handler sets
   // must end up in the CONNECT payload
-  Assert.IsTrue(FConn.ConnectOptions.user = 'joe', 'the handler must be able to set ConnectOptions');
+  Assert.IsTrue(FConn.ConnectOptions.User = 'joe', 'the handler must be able to set ConnectOptions');
 end;
 
 procedure TNatsConnectionProtocolTests.Connect_DeclaresHeaderSupport;
@@ -1109,6 +1235,391 @@ begin
   finally
     LOther.Free;
   end;
+end;
+
+procedure TNatsConnectionProtocolTests.Hmsg_StatusMessage_CarriesTheStatusCode;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('foo',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d|%s|%s|%d', [AMsg.Status, AMsg.Description, AMsg.Payload,
+        Ord(AMsg.HasStatus)]);
+    end);
+
+  { 'NATS/1.0 404 No Messages'#13#10 is 26 bytes, + the blank line = 28, and a
+    status message has no payload at all, so total = 28 }
+  FSocket.ServerSend(Format('HMSG foo %d 28 28'#13#10, [LSid]) +
+    'NATS/1.0 404 No Messages'#13#10#13#10 + #13#10);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the status message was never dispatched');
+  Assert.AreEqual('404|No Messages||1', FMsgLog.Item(0),
+    'a pull consumer cannot work until 404 reaches it as a status, not as an empty message');
+end;
+
+procedure TNatsConnectionProtocolTests.Hmsg_EmptyMessage_HasNoStatus;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('foo',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d|%s|%s|%d', [AMsg.Status, AMsg.Description, AMsg.Payload,
+        Ord(AMsg.HasStatus)]);
+    end);
+
+  // a real message that happens to have headers and an empty body: 18-byte
+  // header block, no payload
+  FSocket.ServerSend(Format('HMSG foo %d 18 18'#13#10, [LSid]) +
+    'NATS/1.0'#13#10'K: V'#13#10#13#10 + #13#10);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the empty message was never dispatched');
+  Assert.AreEqual('0|||0', FMsgLog.Item(0),
+    'an empty message must NOT look like a status - that is the distinction §2 exists for');
+end;
+
+procedure TNatsConnectionProtocolTests.Msg_WithoutHeaderBlock_HasNoStatus;
+var
+  LSid: Integer;
+  LSeen: TNatsTestLog;
+begin
+  OpenAndHandshake;
+
+  LSeen := FMsgLog;
+  LSid := FConn.Subscribe('foo',
+    procedure (const AMsg: TNatsArgsMSG)
+    begin
+      LSeen.AddFmt('%d|%d', [AMsg.Status, Ord(AMsg.HasStatus)]);
+    end);
+
+  FSocket.ServerSend(Format('MSG foo %d 5'#13#10'hello'#13#10, [LSid]));
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FMsgLog.Count > 0;
+    end),
+    'the message was never dispatched');
+  Assert.AreEqual('0|0', FMsgLog.Item(0),
+    'a plain MSG has no header block, so it can never carry a status');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_WritesSubArmUnsubThenPublish;
+var
+  LReply: TNatsArgsMSG;
+  LInbox, LSid: string;
+  LLines, LParts: TArray<string>;
+begin
+  OpenAndHandshake;
+
+  FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+
+  LLines := FSocket.ClientText.Split([NatsConstants.CR_LF]);
+  LParts := LLines[0].Split([NatsConstants.SPC]);   // SUB <inbox> <sid>
+
+  Assert.AreEqual(NatsConstants.Protocol.SUB, LParts[0],
+    'the inbox must be subscribed first: a fast responder can reply before Publish returns');
+  LInbox := LParts[1];
+  LSid := LParts[2];
+  Assert.IsTrue(LInbox.StartsWith(NatsConstants.INBOX_PREFIX), 'unexpected SUB line: ' + LLines[0]);
+
+  Assert.AreEqual(Format('%s %s 1', [NatsConstants.Protocol.UNSUB, LSid]), LLines[1],
+    'the one-reply auto-unsubscribe must be armed before the request goes out');
+  Assert.AreEqual(Format('%s svc.time %s 4', [NatsConstants.Protocol.PUB, LInbox]), LLines[2],
+    'the request must be published with the inbox as reply-to');
+  Assert.AreEqual('ping', LLines[3]);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_ReturnsTheReply;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+  ReplyWhenSubscribed('pong');
+
+  Assert.IsTrue(FConn.RequestSync('svc.time', 'ping', LReply),
+    'RequestSync must report that a reply arrived');
+  Assert.AreEqual('pong', LReply.Payload,
+    'the reply must be copied out of the consumer thread intact');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Reply_LeavesNoSubscription;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+  ReplyWhenSubscribed('pong');
+
+  Assert.IsTrue(FConn.RequestSync('svc.time', 'ping', LReply));
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'the inbox subscription must be gone once the reply has arrived');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Timeout_ReturnsFalse;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+
+  Assert.IsFalse(FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT),
+    'a request nobody answers must time out, not succeed');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Timeout_RemovesTheSubscription;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+
+  FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+
+  Assert.AreEqual(0, Length(FConn.GetSubscriptionList),
+    'a timed-out request must not leave its inbox subscribed - that leak is one ' +
+    'entry per call, and every JetStream operation is a request');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_Timeout_UnsubscribesOnTheWire;
+var
+  LReply: TNatsArgsMSG;
+  LText: string;
+  LLines, LParts: TArray<string>;
+begin
+  OpenAndHandshake;
+
+  FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+
+  LText := FSocket.ClientText;
+  LLines := LText.Split([NatsConstants.CR_LF]);
+  LParts := LLines[0].Split([NatsConstants.SPC]);   // SUB <inbox> <sid>
+
+  { The server delivered none of the one message the auto-unsubscribe allowed,
+    so it still holds the subscription and has to be told explicitly. Note this
+    is the bare "UNSUB <sid>", which the armed "UNSUB <sid> 1" does not match }
+  Assert.IsTrue(LText.Contains(Format('%s %s%s',
+    [NatsConstants.Protocol.UNSUB, LParts[2], NatsConstants.CR_LF])),
+    'a timed-out request must unsubscribe its inbox on the server too, wrote: ' + LText);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_WithHeaders_WritesHpub;
+var
+  LReply: TNatsArgsMSG;
+  LHeaders: TNatsHeaders;
+  LText: string;
+begin
+  OpenAndHandshake;
+
+  LHeaders := nil;
+  LHeaders.Add('Nats-Msg-Id', 'abc');
+
+  FConn.RequestSync('foo', TEncoding.UTF8.GetBytes('hello'), LHeaders, LReply, REQUEST_TIMEOUT);
+
+  LText := FSocket.ClientText;
+  Assert.IsTrue(LText.Contains(NatsConstants.Protocol.HPUB + ' foo ' + NatsConstants.INBOX_PREFIX),
+    'a request carrying headers must go out as HPUB with the inbox as reply-to, wrote: ' + LText);
+  Assert.IsTrue(LText.Contains('Nats-Msg-Id: abc'),
+    'the header must reach the wire, wrote: ' + LText);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_ConnectionClosedWhileWaiting_Raises;
+var
+  LReply: TNatsArgsMSG;
+  LSocket: TNatsMockSocket;
+begin
+  OpenAndHandshake;
+
+  LSocket := FSocket;
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      // drop the connection instead of answering
+      if LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        LSocket.Close;
+    end);
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+
+  { A connection that goes away is not the same outcome as a responder that is
+    slow, and the caller must not have to sit out the whole timeout to find out }
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.RequestSync('svc.time', 'ping', LReply, 3000);
+    end,
+    ENatsException,
+    'a connection lost mid-request must raise, not look like a timeout');
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_NotConnected_Raises;
+var
+  LReply: TNatsArgsMSG;
+begin
+  // no handshake at all: the socket was never opened
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.RequestSync('svc.time', 'ping', LReply, REQUEST_TIMEOUT);
+    end,
+    ENatsException);
+end;
+
+procedure TNatsConnectionProtocolTests.RequestSync_ZeroTimeout_Raises;
+var
+  LReply: TNatsArgsMSG;
+begin
+  OpenAndHandshake;
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.RequestSync('svc.time', 'ping', LReply, 0);
+    end,
+    ENatsException,
+    'a zero timeout would block forever, which is never what the caller meant');
+end;
+
+procedure TNatsConnectionProtocolTests.MaxPayload_IsTakenFromInfo;
+begin
+  Assert.AreEqual(0, FConn.MaxPayload, 'nothing is known before the handshake');
+
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  Assert.AreEqual(SMALL_MAX_PAYLOAD, FConn.MaxPayload,
+    'the limit must be taken from the server''s INFO');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_OversizedPayload_Raises;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('foo', StringOfChar('x', SMALL_MAX_PAYLOAD + 1));
+    end,
+    ENatsMaxPayloadError,
+    'the server would answer this with -ERR and close the connection');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_OversizedPayload_WritesNothing;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  try
+    FConn.Publish('foo', StringOfChar('x', SMALL_MAX_PAYLOAD + 1));
+  except
+    on E: ENatsMaxPayloadError do ;   // expected, asserted by the test above
+  end;
+
+  { Nothing may reach the wire: a half-written PUB would desynchronise the
+    stream, which is worse than the violation it is avoiding }
+  Assert.AreEqual('', FSocket.ClientText,
+    'a refused publish must not put a single byte on the wire');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_ExactlyMaxPayload_IsAllowed;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  // the limit is inclusive: max_payload bytes is legal, one more is not
+  FConn.Publish('foo', StringOfChar('x', SMALL_MAX_PAYLOAD));
+
+  Assert.AreEqual(Format('PUB foo %d'#13#10'%s'#13#10,
+    [SMALL_MAX_PAYLOAD, StringOfChar('x', SMALL_MAX_PAYLOAD)]), FSocket.ClientText);
+end;
+
+procedure TNatsConnectionProtocolTests.PublishBytes_OversizedPayload_Raises;
+var
+  LData: TBytes;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  SetLength(LData, SMALL_MAX_PAYLOAD + 1);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.PublishBytes('foo', LData);
+    end,
+    ENatsMaxPayloadError,
+    'the binary path must be checked too, not just the string one');
+end;
+
+procedure TNatsConnectionProtocolTests.Hpub_OversizedTotal_Raises;
+var
+  LHeaders: TNatsHeaders;
+begin
+  OpenAndHandshake(INFO_JSON_SMALL);
+
+  LHeaders := nil;
+  LHeaders.Add('K', 'V');
+
+  { The payload alone is 20 bytes, under the limit of 32. The header block adds
+    18, so <#total bytes> is 38 - and that total is what the server measures.
+    Checking only the payload here would let this through and lose the
+    connection anyway }
+  Assert.WillRaise(
+    procedure
+    begin
+      FConn.Publish('foo', StringOfChar('x', 20), '', LHeaders);
+    end,
+    ENatsMaxPayloadError,
+    'headers count towards max_payload, because HPUB declares a total');
+end;
+
+procedure TNatsConnectionProtocolTests.Publish_BeforeInfo_IsNotSizeChecked;
+begin
+  { No handshake, so no limit is known. Refusing here would be guessing, and
+    the publish fails on the socket anyway }
+  Assert.AreEqual(0, FConn.MaxPayload);
+  Assert.WillNotRaise(
+    procedure
+    begin
+      try
+        FConn.Publish('foo', StringOfChar('x', 10000));
+      except
+        on E: ENatsMaxPayloadError do
+          raise;              // the only failure this test cares about
+        on E: Exception do ;  // the socket is not open - not our concern here
+      end;
+    end,
+    ENatsMaxPayloadError);
+end;
+
+procedure TNatsConnectionProtocolTests.MaxPayload_LaterInfo_UpdatesTheLimit;
+begin
+  OpenAndHandshake(INFO_JSON);
+  Assert.AreEqual(1048576, FConn.MaxPayload, 'guard: the first INFO set the limit');
+
+  { A second INFO - a cluster reconfiguration - must not drive a second CONNECT,
+    but it must still update the limit }
+  FSocket.ServerSendLine(NatsConstants.Protocol.INFO + ' ' + INFO_JSON_SMALL);
+
+  Assert.IsTrue(WaitForCondition(
+    function: Boolean
+    begin
+      Result := FConn.MaxPayload = SMALL_MAX_PAYLOAD;
+    end),
+    'a later INFO must update max_payload, not be ignored with the handshake');
 end;
 
 initialization

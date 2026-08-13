@@ -1,22 +1,10 @@
 {******************************************************************************}
 {                                                                              }
-{  NATS.Delphi: Delphi Client Library for NATS                                 }
+{  nats.delphi: Delphi Client Library for NATS                                 }
 {  Copyright (c) 2022 Paolo Rossi                                              }
 {  https://github.com/paolo-rossi/nats.delphi                                  }
 {                                                                              }
-{******************************************************************************}
-{                                                                              }
-{  Licensed under the Apache License, Version 2.0 (the "License");             }
-{  you may not use this file except in compliance with the License.            }
-{  You may obtain a copy of the License at                                     }
-{                                                                              }
-{      http://www.apache.org/licenses/LICENSE-2.0                              }
-{                                                                              }
-{  Unless required by applicable law or agreed to in writing, software         }
-{  distributed under the License is distributed on an "AS IS" BASIS,           }
-{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
-{  See the License for the specific language governing permissions and         }
-{  limitations under the License.                                              }
+{  Licensed under the MIT license                                              }
 {                                                                              }
 {******************************************************************************}
 unit Nats.Consts;
@@ -80,6 +68,14 @@ type
     /// </summary>
     DEFAULT_READ_TIMEOUT = 3*60*1000;
 
+    /// <summary>
+    ///   How long RequestSync waits for a reply. Unrelated to the read timeout:
+    ///   this bounds one request/reply exchange, not one socket read, and it is
+    ///   deliberately short because a request that gets no answer usually means
+    ///   nobody is serving the subject
+    /// </summary>
+    DEFAULT_REQUEST_TIMEOUT = 5*1000;
+
     CR_LF = #13#10;
     TAB = #9;
     CR_LF_LEN = 2;
@@ -112,6 +108,29 @@ type
       OK      = '+OK';
       ERR     = '-ERR';
       UNKNOWN = 'UNKNOWN'; // For parser if command is not recognized
+    end;
+
+    /// <summary>
+    ///   Codes that can appear on the header block's status line, as in
+    ///   "NATS/1.0 404 No Messages". A status message has an EMPTY body: it is
+    ///   control flow, not data, and a consumer that treats it as a message
+    ///   hands the application a phantom empty payload
+    /// </summary>
+    Status = class
+    const
+      /// A pull consumer's batch produced nothing before it gave up
+      NO_MESSAGES = 404;
+      /// The pull request's own expiry elapsed
+      REQUEST_TIMEOUT = 408;
+      /// Consumer deleted, or the request exceeded MaxWaiting
+      CONFLICT = 409;
+      /// Keep-alive on an idle push consumer or pull batch
+      IDLE_HEARTBEAT = 100;
+      /// <summary>
+      ///   Nobody is subscribed to the requested subject. Only ever sent to a
+      ///   client that asked for it in CONNECT, which this one does not do yet
+      /// </summary>
+      NO_RESPONDERS = 503;
     end;
 
     class function DEFAULT_URI: string; static;

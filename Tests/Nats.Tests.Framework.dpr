@@ -41,6 +41,7 @@ uses
   Nats.Tests.Core in 'Source\Nats.Tests.Core.pas',
   Nats.Tests.Adapters in 'Source\Nats.Tests.Adapters.pas',
   Nats.Tests.Concurrency in 'Source\Nats.Tests.Concurrency.pas',
+  Nats.Tests.JetStream in 'Source\Nats.Tests.JetStream.pas',
   Nats.Tests.Live in 'Source\Nats.Tests.Live.pas';
 
 var

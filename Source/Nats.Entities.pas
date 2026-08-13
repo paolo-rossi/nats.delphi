@@ -1,22 +1,10 @@
 {******************************************************************************}
 {                                                                              }
-{  NATS.Delphi: Delphi Client Library for NATS                                 }
+{  nats.delphi: Delphi Client Library for NATS                                 }
 {  Copyright (c) 2022 Paolo Rossi                                              }
 {  https://github.com/paolo-rossi/nats.delphi                                  }
 {                                                                              }
-{******************************************************************************}
-{                                                                              }
-{  Licensed under the Apache License, Version 2.0 (the "License");             }
-{  you may not use this file except in compliance with the License.            }
-{  You may obtain a copy of the License at                                     }
-{                                                                              }
-{      http://www.apache.org/licenses/LICENSE-2.0                              }
-{                                                                              }
-{  Unless required by applicable law or agreed to in writing, software         }
-{  distributed under the License is distributed on an "AS IS" BASIS,           }
-{  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.    }
-{  See the License for the specific language governing permissions and         }
-{  limitations under the License.                                              }
+{  Licensed under the MIT license                                              }
 {                                                                              }
 {******************************************************************************}
 unit Nats.Entities;
@@ -24,55 +12,67 @@ unit Nats.Entities;
 interface
 
 uses
-  System.SysUtils, System.JSON.Serializers,
+  System.SysUtils,
 
   Nats.Consts;
 
 type
+  /// <summary>
+  ///   The server's INFO. Fields are named in Delphi casing and mapped onto the
+  ///   wire JSON (<c>server_id</c>, <c>max_payload</c>, ...) by the SnakeCase
+  ///   rule in <c>NatsJSONConfig</c> - so a rename here silently renames a
+  ///   protocol field. Anything the server sends that is not declared here is
+  ///   ignored.
+  /// </summary>
   TNatsServerInfo = record
-    server_id: string;
-    server_name: string;
-    version: string;
-    proto: Integer;
-    git_commit: string;
-    go: string;
-    host: string;
-    port: Integer;
-    headers: Boolean;
-    auth_required: Boolean;
-    tls_required: Boolean;
-    tls_available: Boolean;
-    max_payload: Integer;
-    jetstream: Boolean;
-    client_id: Integer;
-    client_ip: string;
-    nonce: string;
+    ServerId: string;
+    ServerName: string;
+    Version: string;
+    Proto: Integer;
+    GitCommit: string;
+    Go: string;
+    Host: string;
+    Port: Integer;
+    Headers: Boolean;
+    AuthRequired: Boolean;
+    TlsRequired: Boolean;
+    TlsAvailable: Boolean;
+    MaxPayload: Integer;
+    Jetstream: Boolean;
+    ClientId: Integer;
+    ClientIp: string;
+    Nonce: string;
 
     class function FromJSONString(const AValue: string): TNatsServerInfo; static;
   end;
 
+  /// <summary>
+  ///   The CONNECT payload. Same naming rule as <see cref="TNatsServerInfo" />:
+  ///   the wire names (<c>auth_token</c>, <c>tls_required</c>, ...) are derived
+  ///   from these by <c>NatsJSONConfig</c>.
+  /// </summary>
   TNatsConnectOptions = record
   public
-    verbose: Boolean;
-    pedantic: Boolean;
-    tls_required: Boolean;
-    auth_token: string;
-    user: string;
-    pass: string;
-    name: string;
-    lang: string;
-    version: string;
-    protocol: Integer;
-    echo: Boolean;
+    Verbose: Boolean;
+    Pedantic: Boolean;
+    TlsRequired: Boolean;
+    AuthToken: string;
+    User: string;
+    Pass: string;
+    Name: string;
+    Lang: string;
+    Version: string;
+    Protocol: Integer;
+    Echo: Boolean;
     /// <summary>
     ///   Must be True to use message headers: a server will refuse HPUB from a
     ///   client that has not declared header support (it closes the connection)
     ///   and will strip headers from anything it delivers, sending MSG instead
     ///   of HMSG
     /// </summary>
-    headers: Boolean;
-    sig: string;
-    jwt: string;
+    Headers: Boolean;
+    Sig: string;
+    Jwt: string;
 
     function ToJSONString: string;
     class function FromJSONString(const AValue: string): TNatsConnectOptions; static;
@@ -81,49 +81,47 @@ type
 implementation
 
 uses
-  { Serialization here is System.JSON.Serializers.TJsonSerializer only. REST.Json
-    used to be listed too and was never called - it was the sole reason the
-    package required RESTComponents }
-  System.JSON;
+  System.Rtti,
+
+  Neon.Core.Types,
+  Neon.Core.Persistence,
+  Neon.Core.Persistence.JSON;
+
+/// <summary>
+///   The Neon configuration these records must be (de)serialized with - always
+///   pass it explicitly, never use the parameterless TNeon overloads.
+/// </summary>
+/// <remarks>
+///   Those overloads resolve to TNeonConfiguration.Default, which is PascalCase,
+///   and the failure is silent rather than loud: the server ignores CONNECT
+///   fields it does not recognize, so the client would simply stop declaring
+///   header support and have the next HPUB drop the connection, while INFO would
+///   parse as an empty record. SnakeCase is what turns MaxPayload into
+///   max_payload, in both directions. Neon's default TNeonMembers.Standard
+///   already maps a record to its fields, which is what these records need.
+/// </remarks>
+function NatsJSONConfig: INeonConfiguration;
+begin
+  Result := TNeonConfiguration.Create.SetMemberCase(TNeonCase.SnakeCase);
+end;
 
 { TNatsServerInfo }
 
 class function TNatsServerInfo.FromJSONString(const AValue: string): TNatsServerInfo;
-var
-  LSer: TJsonSerializer;
 begin
-  LSer := TJsonSerializer.Create;
-  try
-    Result := LSer.Deserialize<TNatsServerInfo>(AValue);
-  finally
-    LSer.Free;
-  end;
+  Result := TNeon.JSONToValue<TNatsServerInfo>(AValue, NatsJSONConfig);
 end;
 
 { TNatsConnectOptions }
 
 class function TNatsConnectOptions.FromJSONString(const AValue: string): TNatsConnectOptions;
-var
-  LSer: TJsonSerializer;
 begin
-  LSer := TJsonSerializer.Create;
-  try
-    Result := LSer.Deserialize<TNatsConnectOptions>(AValue);
-  finally
-    LSer.Free;
-  end;
+  Result := TNeon.JSONToValue<TNatsConnectOptions>(AValue, NatsJSONConfig);
 end;
 
 function TNatsConnectOptions.ToJSONString: string;
-var
-  LSer: TJsonSerializer;
 begin
-  LSer := TJsonSerializer.Create;
-  try
-    Result := LSer.Serialize<TNatsConnectOptions>(Self);
-  finally
-    LSer.Free;
-  end;
+  Result := TNeon.ValueToJSONString(TValue.From<TNatsConnectOptions>(Self), NatsJSONConfig);
 end;
 
 end.
