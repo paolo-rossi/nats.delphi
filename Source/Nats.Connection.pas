@@ -52,19 +52,31 @@ type
   ///     scope as soon as the handler returns.
   ///   </para>
   /// </remarks>
-  INatsRequestWaiter = interface
+  /// <summary>
+  ///   Something a caller is blocked waiting on that the connection must release
+  ///   when it goes away. RequestSync's reply waiter implements it, and so does
+  ///   the JetStream fetch collector - which waits for MANY messages and is
+  ///   therefore not an INatsRequestWaiter, but has the same problem: a dead
+  ///   connection is not the same answer as silence
+  /// </summary>
+  INatsRequestCancellable = interface
+  ['{A3E5C1D8-4B72-4E9F-8C1A-6F2D9B0E57A3}']
+    /// <summary>
+    ///   Releases the waiter because the connection is going away. Runs on
+    ///   whichever thread discovered the failure. A result that already landed
+    ///   is kept, so a race with a delivery cannot lose one that was genuinely
+    ///   received
+    /// </summary>
+    procedure Cancel;
+  end;
+
+  INatsRequestWaiter = interface(INatsRequestCancellable)
   ['{4F0D1C7A-9E3B-4A16-8D2F-1B7C6E5A9042}']
     /// <summary>
     ///   Delivers the reply. Runs on the consumer thread; the first reply wins
     ///   and any later one is discarded
     /// </summary>
     procedure Signal(const AMsg: TNatsArgsMSG);
-    /// <summary>
-    ///   Releases the caller empty handed because the connection is going away.
-    ///   A reply that already landed is kept, so a race with Signal cannot lose
-    ///   a message that was genuinely received
-    /// </summary>
-    procedure Cancel;
     /// <summary>
     ///   Blocks for up to ATimeoutMs. False means the time ran out with no
     ///   reply; a connection torn down while waiting raises instead, because
@@ -215,7 +227,7 @@ type
     { Guards FPendingRequests only, and is always a LEAF: no other lock may be
       taken while it is held, and it is never taken while holding another }
     FRequestsLock: TCriticalSection;
-    FPendingRequests: TList<INatsRequestWaiter>;
+    FPendingRequests: TList<INatsRequestCancellable>;
     FState: Integer;
     FPingOutstanding: Integer;
     /// <summary>
@@ -257,12 +269,10 @@ type
     procedure JoinThreads;
     procedure CloseChannel;
     procedure ClearSubscriptions;
-    procedure AddPendingRequest(const AWaiter: INatsRequestWaiter);
-    procedure RemovePendingRequest(const AWaiter: INatsRequestWaiter);
     /// <summary>
-    ///   Releases everyone blocked in RequestSync. Without it a connection that
-    ///   drops mid-request leaves each caller waiting out its full timeout for
-    ///   a reply that provably cannot arrive
+    ///   Releases everyone blocked in a request or a pull fetch. Without it a
+    ///   connection that drops mid-exchange leaves each caller waiting out its
+    ///   full timeout for a reply that provably cannot arrive
     /// </summary>
     procedure CancelPendingRequests;
     procedure TearDown; overload;
@@ -328,6 +338,21 @@ type
     function RequestSync(const ASubject: string; const AData: TBytes; AHeaders: TNatsHeaders;
       out AReply: TNatsArgsMSG;
       ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT): Boolean; overload;
+
+    /// <summary>
+    ///   Registers something the caller is blocked on, so a connection that goes
+    ///   away releases it instead of leaving it to sit out its timeout.
+    ///   RequestSync registers its reply waiter; the JetStream fetch registers
+    ///   its batch collector. The connection does NOT own the object - call
+    ///   RemovePendingRequest on every exit path
+    /// </summary>
+    procedure AddPendingRequest(const AWaiter: INatsRequestCancellable);
+    /// <summary>
+    ///   The other half of AddPendingRequest. Removing something the teardown
+    ///   already emptied is a no-op, which is what makes this safe to call
+    ///   unconditionally in a finally
+    /// </summary>
+    procedure RemovePendingRequest(const AWaiter: INatsRequestCancellable);
 
     function Subscribe(const ASubject: string; AHandler: TNatsMsgHandler): Integer; overload;
     function Subscribe(const ASubject, AQueue: string; AHandler: TNatsMsgHandler): Integer; overload;
@@ -495,7 +520,7 @@ begin
   FWriteLock := TCriticalSection.Create;
   FSubsLock := TCriticalSection.Create;
   FRequestsLock := TCriticalSection.Create;
-  FPendingRequests := TList<INatsRequestWaiter>.Create;
+  FPendingRequests := TList<INatsRequestCancellable>.Create;
   FState := STATE_CLOSED;
   FReadQueue := TNatsCommandQueue.Create;
   FGenerator := TNatsGenerator.Create;
@@ -705,7 +730,7 @@ begin
   end;
 end;
 
-procedure TNatsConnection.AddPendingRequest(const AWaiter: INatsRequestWaiter);
+procedure TNatsConnection.AddPendingRequest(const AWaiter: INatsRequestCancellable);
 begin
   FRequestsLock.Enter;
   try
@@ -715,7 +740,7 @@ begin
   end;
 end;
 
-procedure TNatsConnection.RemovePendingRequest(const AWaiter: INatsRequestWaiter);
+procedure TNatsConnection.RemovePendingRequest(const AWaiter: INatsRequestCancellable);
 begin
   FRequestsLock.Enter;
   try
@@ -729,8 +754,8 @@ end;
 
 procedure TNatsConnection.CancelPendingRequests;
 var
-  LWaiters: TArray<INatsRequestWaiter>;
-  LWaiter: INatsRequestWaiter;
+  LWaiters: TArray<INatsRequestCancellable>;
+  LWaiter: INatsRequestCancellable;
 begin
   { Snapshot under the lock, cancel outside it: Cancel signals an event, and no
     lock in this class is ever held across a wait or a signal to another thread.

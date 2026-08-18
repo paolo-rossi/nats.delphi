@@ -318,6 +318,8 @@ type
     procedure Next_ReturnsTheFirstMessage;
     [Test]
     procedure Next_NothingThere_ReturnsFalse;
+    [Test]
+    procedure Fetch_ConnectionClosedMidWait_RaisesInsteadOfTimingOut;
 
     { push consumption - Phase 4 }
 
@@ -2326,6 +2328,48 @@ begin
     time in a polling loop }
   Assert.IsFalse(FJs.Next('ORDERS', 'workers', LMsg, 5000));
   Assert.IsNull(LMsg);
+end;
+
+procedure TJetStreamContextTests.Fetch_ConnectionClosedMidWait_RaisesInsteadOfTimingOut;
+var
+  LSocket: TNatsMockSocket;
+  LStopwatch: TStopwatch;
+begin
+  OpenAndHandshake;
+
+  LSocket := FSocket;
+
+  { Plays the server: waits for the fetch's inbox SUB, then kills the socket.
+    The reader sees the disconnect, tears the connection down, and the teardown
+    must RELEASE the blocked fetch - that is the whole point of this test }
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      LSocket.Close;
+    end);
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+
+  LStopwatch := TStopwatch.StartNew;
+
+  { A dead connection is not an empty stream: the fetch must RAISE, and it must
+    do so long before its own timeout. Before this fix it sat out the whole
+    LONG_WAIT and came back with an empty array that read exactly like a
+    healthy consumer with nothing to say }
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10, LONG_WAIT);
+    end,
+    ENatsException);
+
+  Assert.IsTrue(LStopwatch.ElapsedMilliseconds < (LONG_WAIT div 2),
+    'the teardown must release the fetch, not its own timeout - elapsed ' +
+    LStopwatch.ElapsedMilliseconds.ToString + ' ms');
 end;
 
 { push consumption }

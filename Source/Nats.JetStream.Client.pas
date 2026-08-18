@@ -243,7 +243,10 @@ type
     ///   <para>
     ///     A short batch is a normal result, not a failure - an empty array
     ///     simply means the consumer had nothing pending. Nothing here raises
-    ///     for an empty stream.
+    ///     for an empty stream. A connection that dies WHILE the fetch is
+    ///     waiting is a different answer: the fetch is released early and
+    ///     raises, exactly as RequestSync does - silence and a dead connection
+    ///     are not the same thing.
     ///   </para>
     ///   <para>
     ///     ATimeoutMs of 0 means this context's Timeout. The request carries
@@ -415,13 +418,14 @@ type
   ///   so a message arriving after the caller gave up still finds a live object
   ///   rather than a freed stack frame.
   /// </remarks>
-  IJetStreamFetch = interface
+  IJetStreamFetch = interface(INatsRequestCancellable)
     ['{7C4A8E12-3D96-4B0F-A5E7-C8103BD6F921}']
     /// Runs on the consumer thread, once per delivered message
     procedure Deliver(const AMsg: TNatsArgsMSG);
     /// <summary>
-    ///   Blocks until the batch is full, the server closes it out, or the wait
-    ///   elapses. Whatever was collected is returned in all three cases
+    ///   Blocks until the batch is full, the server closes it out, the
+    ///   connection dies (which raises), or the wait elapses. Whatever was
+    ///   collected is returned in every non-fatal case
     /// </summary>
     function WaitFor(ATimeoutMs: Cardinal): TArray<IJetStreamMsg>;
   end;
@@ -433,10 +437,20 @@ type
     FLock: TCriticalSection;
     FMessages: TList<IJetStreamMsg>;
     FBatch: Integer;
+    /// Set by Cancel: the connection died while the caller was waiting
+    FCancelled: Boolean;
+    /// <summary>
+    ///   The batch finished for a legitimate reason - full, or closed out by a
+    ///   status. A cancel that arrives after that must not turn a real result
+    ///   into a failure, exactly as TNatsRequestWaiter keeps a reply that
+    ///   landed before Cancel
+    /// </summary>
+    FClosed: Boolean;
   public
     constructor Create(AConnection: TNatsConnection; ABatch: Integer);
     destructor Destroy; override;
 
+    procedure Cancel;
     procedure Deliver(const AMsg: TNatsArgsMSG);
     function WaitFor(ATimeoutMs: Cardinal): TArray<IJetStreamMsg>;
   end;
@@ -462,6 +476,21 @@ begin
   inherited;
 end;
 
+procedure TJetStreamFetch.Cancel;
+begin
+  { Runs on whichever thread discovered the failure - the connection's teardown
+    path. The fetch's half of RequestSync's contract: a caller blocked in
+    WaitFor must be released, not left to sit out its timeout for messages that
+    provably cannot arrive }
+  FLock.Enter;
+  try
+    FCancelled := True;
+  finally
+    FLock.Leave;
+  end;
+  FEvent.SetEvent;
+end;
+
 procedure TJetStreamFetch.Deliver(const AMsg: TNatsArgsMSG);
 var
   LWrapped: IJetStreamMsg;
@@ -479,6 +508,12 @@ begin
       own expiry, 409 the consumer went away or MaxWaiting was exceeded. None
       of them is an error - whatever arrived before it is still a valid result,
       so the wait ends and the caller gets a short batch }
+    FLock.Enter;
+    try
+      FClosed := True;
+    finally
+      FLock.Leave;
+    end;
     FEvent.SetEvent;
     Exit;
   end;
@@ -493,6 +528,8 @@ begin
   try
     FMessages.Add(LWrapped);
     LComplete := FMessages.Count >= FBatch;
+    if LComplete then
+      FClosed := True;
   finally
     FLock.Leave;
   end;
@@ -510,6 +547,14 @@ begin
 
   FLock.Enter;
   try
+    { A cancel means the connection died under us, and that is not the same
+      answer as an empty stream. Unless the batch had already finished - then
+      what was collected is still a valid result, exactly as TNatsRequestWaiter
+      keeps a reply that arrived before Cancel }
+    if FCancelled and not FClosed then
+      raise ENatsException.Create(
+        'The connection was closed while waiting for a batch');
+
     Result := FMessages.ToArray;
   finally
     FLock.Leave;
@@ -776,21 +821,31 @@ begin
   LInbox := FConnection.GetNewInbox;
   LFetch := TJetStreamFetch.Create(FConnection, ARequest.Batch);
 
-  { A batch is emphatically NOT a RequestSync: the server answers with up to
-    Batch separate messages and then a status to close them out, where
-    RequestSync takes the first reply and stops }
-  LId := FConnection.Subscribe(LInbox,
-    procedure (const AMsg: TNatsArgsMSG)
-    begin
-      LFetch.Deliver(AMsg);
-    end);
+  { Registered with the connection's pending-request machinery BEFORE the
+    subscription exists, exactly as RequestSync does it: a connection torn down
+    at any point from here on releases this wait instead of stranding it until
+    its own timeout. A batch is emphatically NOT a RequestSync - the server
+    answers with up to Batch separate messages and then a status to close them
+    out, where RequestSync takes the first reply and stops - but the teardown
+    contract is the same }
+  FConnection.AddPendingRequest(LFetch);
   try
-    FConnection.Publish(LSubject, TJetStreamJSON.ToJSON<TJetStreamNextRequest>(ARequest), LInbox);
-    Result := LFetch.WaitFor(AWaitMs);
+    LId := FConnection.Subscribe(LInbox,
+      procedure (const AMsg: TNatsArgsMSG)
+      begin
+        LFetch.Deliver(AMsg);
+      end);
+    try
+      FConnection.Publish(LSubject, TJetStreamJSON.ToJSON<TJetStreamNextRequest>(ARequest), LInbox);
+      Result := LFetch.WaitFor(AWaitMs);
+    finally
+      { On every exit path, exactly as RequestSync does. Without it each fetch
+        leaves one inbox subscribed here and on the server }
+      FConnection.Unsubscribe(LId, 0);
+    end;
   finally
-    { On every exit path, exactly as RequestSync does. Without it each fetch
-      leaves one inbox subscribed here and on the server }
-    FConnection.Unsubscribe(LId, 0);
+    { No-op when the teardown already emptied the list }
+    FConnection.RemovePendingRequest(LFetch);
   end;
 end;
 
