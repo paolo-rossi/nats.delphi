@@ -493,6 +493,11 @@ type
     procedure GetRevision_AsksBySequence;
     [Test]
     procedure GetRevision_OfAnotherKey_ReportsNotFound;
+
+    { status }
+
+    [Test]
+    procedure Status_Values_IsTheKeyCountNotTheMessageCount;
   end;
 
   /// <summary>
@@ -3429,6 +3434,26 @@ begin
     rather than per key. Sequence 7 may well belong to a different key, and
     handing its value back under this key's name would be a silent data leak }
   Assert.IsFalse(FKV.GetRevision('name', 7, LEntry));
+end;
+
+procedure TJetStreamKVTests.Status_Values_IsTheKeyCountNotTheMessageCount;
+var
+  LStatus: TJetStreamKVStatus;
+begin
+  OpenAndHandshake;
+  { 5 messages across 3 subjects. Values must come from num_subjects: a key
+    with several revisions counts once, and a tombstone keeps its key counted -
+    the old code returned the message count, which was right only for a
+    History=1 bucket with no deletes }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_info_response",' +
+    '"config":{"name":"KV_cfg","max_msgs_per_subject":3,"max_age":0},' +
+    '"state":{"messages":5,"bytes":100,"num_subjects":3}}');
+
+  LStatus := FKV.Status;
+
+  Assert.AreEqual(UInt64(3), LStatus.Values, 'Values counts keys, not messages');
+  Assert.AreEqual(Int64(3), LStatus.History, 'the history setting round-trips');
+  Assert.AreEqual(UInt64(100), LStatus.Bytes);
 end;
 
 { TJetStreamObjectStoreTests }

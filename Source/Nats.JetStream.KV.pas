@@ -86,7 +86,11 @@ type
 
   TJetStreamKVStatus = record
     Bucket: string;
-    /// How many keys currently hold a value, tombstones included
+    /// <summary>
+    ///   How many keys currently hold at least one message - live keys plus
+    ///   tombstoned ones. A key with several revisions counts ONCE: this is
+    ///   the server's subject count (num_subjects), not the message count
+    /// </summary>
     Values: UInt64;
     /// Revisions kept per key
     History: Int64;
@@ -707,7 +711,13 @@ begin
   Result := Default(TJetStreamKVStatus);
   Result.Bucket := FBucket;
   Result.StreamName := FStream;
-  Result.Values := LInfo.State.Messages;
+
+  { "How many keys" is the stream's SUBJECT count, not its message count: a
+    key with History revisions is one subject holding History messages, and a
+    delete leaves a tombstone that keeps the subject alive. The KV bucket is
+    created with AllowDirect, which is what makes the server track subjects }
+  Result.Values := LInfo.State.NumSubjects;
+
   Result.History := LInfo.Config.MaxMsgsPerSubject;
   Result.TTL := LInfo.Config.MaxAge;
   Result.Bytes := LInfo.State.Bytes;

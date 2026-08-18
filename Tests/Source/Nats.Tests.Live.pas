@@ -246,6 +246,9 @@ type
     procedure History_ShowsEveryRevisionOldestFirst;
     [Test]
     procedure History_IsBoundedByTheBucketsHistorySetting;
+    /// The F6 fix: Values counts keys, not messages, tombstones included
+    [Test]
+    procedure Status_Values_CountsKeysNotMessages;
   end;
 
   /// <summary>
@@ -1842,6 +1845,33 @@ begin
   Assert.AreEqual(2, Length(LHistory), 'only the configured number of revisions is kept');
   Assert.AreEqual('two', LHistory[0].ValueString, 'the oldest was dropped');
   Assert.AreEqual('three', LHistory[1].ValueString);
+end;
+
+procedure TJetStreamKVLiveTests.Status_Values_CountsKeysNotMessages;
+var
+  LStatus: TJetStreamKVStatus;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 3));
+
+  { Two revisions of a, one each of b and c, then a tombstone for b }
+  FKV.Put('a', 'one');
+  FKV.Put('a', 'two');
+  FKV.Put('b', 'one');
+  FKV.Put('c', 'one');
+  FKV.Delete('b');
+
+  LStatus := FKV.Status;
+
+  { Five messages live in the stream, but only three SUBJECTS hold them: a
+    (two revisions), b (its tombstone), c. Values must be the key count with
+    the tombstoned key still counted - the old code returned the message
+    count, which was right only for a History=1 bucket with no deletes. This
+    also proves nats-server's num_subjects is what the KV layer expects }
+  Assert.AreEqual(UInt64(3), LStatus.Values,
+    'Values counts keys with a message, tombstones included');
+  Assert.IsTrue(LStatus.Bytes > 0, 'the stored bytes are reported');
+  Assert.AreEqual(2, Length(FKV.Keys), 'two live keys besides the tombstone');
 end;
 
 { TJetStreamObjectStoreLiveTests }
