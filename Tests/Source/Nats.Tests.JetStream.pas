@@ -465,6 +465,14 @@ type
     [Test]
     procedure Update_ExpectsTheRevisionGiven;
     [Test]
+    procedure PutIfAbsent_KeyExists_RaisesKvError;
+    [Test]
+    procedure PutIfAbsent_MissingBucket_PropagatesTheApiError;
+    [Test]
+    procedure Update_LostTheRace_RaisesKvError;
+    [Test]
+    procedure Update_MissingBucket_PropagatesTheApiError;
+    [Test]
     procedure Delete_WritesATombstoneRatherThanRemovingAnything;
     [Test]
     procedure Purge_AddsTheRollupHeader;
@@ -3186,6 +3194,72 @@ begin
   { Compare-and-set, and the compare is the server's to do }
   Assert.IsTrue(RequestHeaders.Contains('Nats-Expected-Last-Subject-Sequence: 42'),
     'block was: ' + RequestHeaders);
+end;
+
+procedure TJetStreamKVTests.PutIfAbsent_KeyExists_RaisesKvError;
+begin
+  OpenAndHandshake;
+  { The server's answer to "Nats-Expected-Last-Subject-Sequence: 0" when the
+    key already holds a value - the ordinary CAS defeat, which keeps its
+    friendly KV error }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":400,"err_code":10072,"description":"wrong last subject sequence: 3"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.PutIfAbsent('name', 'delphi');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.PutIfAbsent_MissingBucket_PropagatesTheApiError;
+begin
+  OpenAndHandshake;
+  { A bucket that was never created answers 10059 "stream not found" - and that
+    is NOT "the key exists". Before the fix this was rephrased into the exact
+    opposite of what happened }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.PutIfAbsent('name', 'delphi');
+    end,
+    EJetStreamApiError);
+end;
+
+procedure TJetStreamKVTests.Update_LostTheRace_RaisesKvError;
+begin
+  OpenAndHandshake;
+  { Newer servers report the failed Nats-Expected-Last-Subject-Sequence under
+    10164 rather than 10072 - it must still map to the CAS error, not leak out
+    as a raw API error }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":400,"err_code":10164,"description":"wrong last subject sequence"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Update('name', 'delphi', 7);
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.Update_MissingBucket_PropagatesTheApiError;
+begin
+  OpenAndHandshake;
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  { Same rule as PutIfAbsent: a missing bucket is a real error, not a lost race }
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Update('name', 'delphi', 7);
+    end,
+    EJetStreamApiError);
 end;
 
 procedure TJetStreamKVTests.Delete_WritesATombstoneRatherThanRemovingAnything;

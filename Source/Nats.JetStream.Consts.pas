@@ -285,6 +285,26 @@ type
       POS_TIMESTAMP     = 9;
       POS_NUM_PENDING   = 10;
     end;
+
+    /// <summary>
+    ///   The err_code values an API or PubAck error object can carry - the
+    ///   field worth branching on (the HTTP-like code only says 400/404/503).
+    ///   Only the ones this library needs to recognise are named
+    /// </summary>
+    ErrCode = class
+    const
+      /// The last-sequence expectation did not hold (Nats-Expected-Last-Sequence)
+      WRONG_LAST_SEQ = 10071;
+      /// Nats-Expected-Last-Subject-Sequence did not hold - the classic code
+      WRONG_LAST_SUBJECT_SEQ = 10072;
+      /// <summary>
+      ///   Newer servers report the same Nats-Expected-Last-Subject-Sequence
+      ///   failure under this code instead of 10072 - observed by the nats.py
+      ///   client's KV update. A caller that only cares "the CAS lost" accepts
+      ///   both
+      /// </summary>
+      WRONG_LAST_SUBJECT_SEQ_NEW = 10164;
+    end;
   end;
 
 implementation

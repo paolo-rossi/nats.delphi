@@ -140,6 +140,12 @@ type
     /// Publishes to the key's subject and returns the revision it landed at
     function PutRaw(const AKey: string; const AValue: TBytes;
       AOptions: TJetStreamPubOptions): UInt64;
+    /// <summary>
+    ///   True when AErrCode means "a publish expectation did not hold" - the
+    ///   only failure PutIfAbsent and Update translate into EJetStreamKVError.
+    ///   Everything else must propagate unchanged
+    /// </summary>
+    class function IsExpectationError(AErrCode: Integer): Boolean; static;
   public
     /// <summary>
     ///   Binds to an EXISTING bucket without a round trip. Use Status to
@@ -207,13 +213,16 @@ type
     /// <summary>
     ///   Sets AKey only if it holds nothing - NATS KV calls this Create; the
     ///   name is taken here by the constructor. Raises EJetStreamKVError when
-    ///   the key already exists
+    ///   the key already exists; any OTHER API error - a bucket that was never
+    ///   created, a quota - propagates unchanged as EJetStreamApiError
     /// </summary>
     function PutIfAbsent(const AKey: string; const AValue: TBytes): UInt64; overload;
     function PutIfAbsent(const AKey, AValue: string): UInt64; overload;
     /// <summary>
     ///   Compare-and-set: writes only if AKey is still at ARevision, and raises
-    ///   EJetStreamKVError otherwise. The revision comes from a previous Get
+    ///   EJetStreamKVError otherwise. The revision comes from a previous Get.
+    ///   As with PutIfAbsent, only the lost race is translated - every other
+    ///   API error propagates unchanged
     /// </summary>
     function Update(const AKey: string; const AValue: TBytes;
       ARevision: UInt64): UInt64; overload;
@@ -541,6 +550,19 @@ begin
   Result := FContext.PublishBytes(KeySubject(AKey), AValue, AOptions).Seq;
 end;
 
+class function TJetStreamKV.IsExpectationError(AErrCode: Integer): Boolean;
+begin
+  { The publish-expectation family. KV publishes only with
+    Nats-Expected-Last-Subject-Sequence, and nats-server versions differ in
+    which code they return for a failed one: 10071 when the subject check is
+    folded into the generic "wrong last sequence", 10072 in the classic
+    numbering, 10164 on newer servers (as observed by the nats.py client).
+    They all mean the same thing here - the CAS did not hold }
+  Result := (AErrCode = JetStreamConstants.ErrCode.WRONG_LAST_SEQ) or
+            (AErrCode = JetStreamConstants.ErrCode.WRONG_LAST_SUBJECT_SEQ) or
+            (AErrCode = JetStreamConstants.ErrCode.WRONG_LAST_SUBJECT_SEQ_NEW);
+end;
+
 function TJetStreamKV.Put(const AKey: string; const AValue: TBytes): UInt64;
 begin
   Result := PutRaw(AKey, AValue, TJetStreamPubOptions.New);
@@ -560,8 +582,16 @@ begin
     Result := PutRaw(AKey, AValue, TJetStreamPubOptions.New.WithExpectedLastSubjectSeq(0));
   except
     on E: EJetStreamApiError do
+    begin
+      { ONLY "the expectation did not hold" means the key exists. Every other
+        API error - a bucket that was never created (10059), a bad request, a
+        quota - must propagate unchanged: rephrasing those as "key already
+        exists" would report the exact opposite of what happened }
+      if not IsExpectationError(E.ErrCode) then
+        raise;
       raise EJetStreamKVError.CreateFmt(
         'Key [%s] already exists in bucket [%s]: %s', [AKey, FBucket, E.Error.Description]);
+    end;
   end;
 end;
 
@@ -578,11 +608,17 @@ begin
       TJetStreamPubOptions.New.WithExpectedLastSubjectSeq(ARevision));
   except
     { The whole point of a compare-and-set is that losing the race is a normal
-      outcome, so it gets an error the caller can recognise and retry on }
+      outcome, so it gets an error the caller can recognise and retry on - but
+      ONLY when the server actually said the expectation failed. Anything else
+      (a missing bucket, a quota) is a real error and keeps its own type }
     on E: EJetStreamApiError do
+    begin
+      if not IsExpectationError(E.ErrCode) then
+        raise;
       raise EJetStreamKVError.CreateFmt(
         'Key [%s] in bucket [%s] is no longer at revision %d: %s',
         [AKey, FBucket, ARevision, E.Error.Description]);
+    end;
   end;
 end;
 
