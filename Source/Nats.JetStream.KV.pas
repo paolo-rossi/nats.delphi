@@ -182,7 +182,9 @@ type
 
     /// <summary>
     ///   The current value. False means the key is not set - never set, or
-    ///   deleted - which is an ordinary answer rather than an error
+    ///   deleted - which is an ordinary answer rather than an error. A bucket
+    ///   whose stream does not exist raises EJetStreamApiError instead, so a
+    ///   missing bucket can never be mistaken for an unset key
     /// </summary>
     function Get(const AKey: string; out AEntry: TKVEntry): Boolean; overload;
     /// The current value as text, or ADefault when the key is not set

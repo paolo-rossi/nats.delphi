@@ -349,8 +349,10 @@ type
 
     /// <summary>
     ///   Reads one stored message without creating a consumer. False means the
-    ///   server has no such message, which is an ordinary answer - only a real
-    ///   failure raises
+    ///   server answered err_code 10037 "no message found" - the ordinary
+    ///   answer to asking for a key that was never set. A stream that does not
+    ///   exist (10059) is NOT that answer: it raises, so "the bucket is gone"
+    ///   can never be mistaken for "the key is absent"
     /// </summary>
     /// <remarks>
     ///   The workhorse behind a key/value get: a bucket is a stream, a key is a
@@ -1084,12 +1086,14 @@ begin
       ApiSubject(JetStreamConstants.Api.STREAM_MSG_GET, [AStream]), ARequest).Message;
     Result := True;
   except
-    { "No message found" is the ordinary answer to asking for a key that was
-      never set, so it is reported rather than raised. Every OTHER API error -
-      the stream missing, a bad request - still propagates }
+    { "No message found" (err_code 10037) is the ordinary answer to asking for
+      a key that was never set, so it is reported rather than raised. The
+      discrimination has to be on err_code, not on the HTTP-like code:
+      "stream not found" (10059) also carries 404, and a missing bucket is NOT
+      "the key is absent" - it is a real error the caller should see }
     on E: EJetStreamApiError do
     begin
-      if not E.IsNotFound then
+      if E.ErrCode <> JetStreamConstants.ErrCode.NO_MESSAGE_FOUND then
         raise;
       Result := False;
     end;

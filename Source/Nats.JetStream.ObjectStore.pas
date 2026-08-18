@@ -190,14 +190,19 @@ type
     /// <summary>
     ///   Writes the object to ADest. False means no such object - never stored,
     ///   or deleted. Raises EJetStreamObjectError if what came back does not
-    ///   match the stored digest
+    ///   match the stored digest, and EJetStreamApiError if the bucket's stream
+    ///   does not exist at all
     /// </summary>
     function Get(const AName: string; ADest: TStream): Boolean; overload;
     function Get(const AName: string; out AData: TBytes): Boolean; overload;
     function GetString(const AName: string; const ADefault: string = ''): string;
     function GetFile(const AName, AFileName: string): Boolean;
 
-    /// The metadata alone, without moving any bytes. False if there is none
+    /// <summary>
+    ///   The metadata alone, without moving any bytes. False if there is none -
+    ///   or if the object was deleted. A bucket whose stream does not exist
+    ///   raises EJetStreamApiError instead
+    /// </summary>
     function Info(const AName: string; out AInfo: TJetStreamObjectInfo): Boolean;
     /// Every object currently stored, deleted ones left out
     function List: TArray<TJetStreamObjectInfo>;

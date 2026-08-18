@@ -237,8 +237,10 @@ function GetLastMsg(const AStream, ASubject: string;
   out AMsg: TJetStreamStoredMsg): Boolean;
 ```
 
-`False` means the server has no such message — an ordinary answer. Only a real
-failure raises.
+`False` means the server answered err_code 10037 "no message found" — an
+ordinary answer. A stream that does not exist (err_code 10059) is **not** that
+answer: it raises `EJetStreamApiError`, so a missing bucket can never be
+mistaken for an absent key.
 
 ```pascal
 var LMsg: TJetStreamStoredMsg;
@@ -969,7 +971,9 @@ for var LRev in LKV.History('db.host') do
 
 `Get` returning `False` means the key is not set — never set, or deleted —
 which is an ordinary answer rather than an error. It checks the tombstone, so a
-deleted key never comes back as an empty value.
+deleted key never comes back as an empty value. A bucket whose stream does not
+exist raises `EJetStreamApiError` instead, so "the bucket is gone" stays
+distinguishable from "the key is absent".
 
 `Keys` lists only keys currently **holding a value**; deleted and purged keys
 are left out, even though their tombstones are still in the stream.

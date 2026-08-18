@@ -488,6 +488,8 @@ type
     [Test]
     procedure Get_Tombstone_ReportsNotFoundAndNoValue;
     [Test]
+    procedure Get_MissingBucket_PropagatesTheApiError;
+    [Test]
     procedure GetRevision_AsksBySequence;
     [Test]
     procedure GetRevision_OfAnotherKey_ReportsNotFound;
@@ -554,6 +556,8 @@ type
     procedure Info_MissingObject_ReportsNotFound;
     [Test]
     procedure Info_Deleted_ReportsNotFound;
+    [Test]
+    procedure Info_MissingBucket_PropagatesTheApiError;
   end;
 
   /// <summary>
@@ -3371,6 +3375,26 @@ begin
   Assert.IsFalse(FKV.Get('name', LEntry), 'a deleted key is not set');
 end;
 
+procedure TJetStreamKVTests.Get_MissingBucket_PropagatesTheApiError;
+var
+  LEntry: TKVEntry;
+begin
+  OpenAndHandshake;
+  { "Stream not found" (10059) also carries HTTP code 404, so discriminating on
+    the code would read a missing bucket as "the key is not set". Only 10037 -
+    "no message found" - is the key being absent; a bucket that was never
+    created (or was deleted) is a real error and must propagate }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_msg_get_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Get('name', LEntry);
+    end,
+    EJetStreamApiError);
+end;
+
 procedure TJetStreamKVTests.GetRevision_AsksBySequence;
 var
   LBody: TJSONObject;
@@ -3733,6 +3757,24 @@ begin
     removed stays distinguishable from one that never existed - so the read
     succeeds at the stream level and there is still no object }
   Assert.IsFalse(FOs.Info('gone.txt', LInfo), 'a deleted object is not an object');
+end;
+
+procedure TJetStreamObjectStoreTests.Info_MissingBucket_PropagatesTheApiError;
+var
+  LInfo: TJetStreamObjectInfo;
+begin
+  OpenAndHandshake;
+  { As in the KV case: "stream not found" (10059) is a 404 too, and it must NOT
+    read as "no such object" - a bucket that does not exist is a real error }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_msg_get_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FOs.Info('a.txt', LInfo);
+    end,
+    EJetStreamApiError);
 end;
 
 { TJetStreamPubOptionsTests }

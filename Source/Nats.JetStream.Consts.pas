@@ -293,6 +293,10 @@ type
     /// </summary>
     ErrCode = class
     const
+      /// STREAM.MSG.GET found nothing for the requested sequence or subject
+      NO_MESSAGE_FOUND = 10037;
+      /// The stream named in the request does not exist
+      STREAM_NOT_FOUND = 10059;
       /// The last-sequence expectation did not hold (Nats-Expected-Last-Sequence)
       WRONG_LAST_SEQ = 10071;
       /// Nats-Expected-Last-Subject-Sequence did not hold - the classic code

@@ -219,6 +219,9 @@ type
     procedure Put_Again_OverwritesAndBumpsTheRevision;
     [Test]
     procedure Get_MissingKey_ReportsNotFound;
+    /// The F5 fix: a missing bucket is a 10059, and it must raise, not read as an unset key
+    [Test]
+    procedure Get_MissingBucket_Raises;
     [Test]
     procedure BinaryValue_SurvivesTheBase64RoundTrip;
     [Test]
@@ -1585,6 +1588,26 @@ begin
   { The most ordinary question a key/value store is asked, so it must not raise }
   Assert.IsFalse(FKV.Get('never_set', LEntry));
   Assert.AreEqual('fallback', FKV.Get('never_set', 'fallback'));
+end;
+
+procedure TJetStreamKVLiveTests.Get_MissingBucket_Raises;
+var
+  LEntry: TKVEntry;
+begin
+  Connect;
+  { Bind WITHOUT creating the bucket - the constructor makes no round trip, so
+    this really is "the bucket does not exist", not a handle on one }
+  FKV := TJetStreamKV.Create(FJs, FBucket);
+
+  { The mock pins the discrimination on err_code 10037 vs 10059; this proves a
+    real server answers STREAM.MSG.GET on a missing stream with 10059 - and
+    that Get therefore raises instead of reading it as an unset key }
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Get('name', LEntry);
+    end,
+    EJetStreamApiError);
 end;
 
 procedure TJetStreamKVLiveTests.BinaryValue_SurvivesTheBase64RoundTrip;
