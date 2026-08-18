@@ -14,10 +14,11 @@ interface
 {$SCOPEDENUMS ON}
 
 uses
-  System.SysUtils, System.Rtti,
+  System.SysUtils, System.Rtti, System.JSON, System.TypInfo,
 
   Neon.Core.Types,
   Neon.Core.Attributes,
+  Neon.Core.Nullables,
   Neon.Core.Persistence,
   Neon.Core.Persistence.JSON;
 
@@ -262,8 +263,18 @@ type
     OptStartSeq: UInt64;
     [NeonInclude(IncludeIf.NotDefault)]
     OptStartTime: string;
+    /// <remarks>
+    ///   Nullable on purpose. The enum's zero value is None, and sending
+    ///   "ack_policy":"none" is NOT what nats-server does when the field is
+    ///   absent: its default is explicit, and a PULL consumer with ack policy
+    ///   "none" is rejected outright. Neon emits enums unconditionally, so a
+    ///   plain field would send "none" for every consumer whose policy the
+    ///   caller never set. A nullable field is omitted instead, and the
+    ///   server's own default (explicit) applies. Serialized by
+    ///   TNullableEnumSerializer, registered in JetStreamJSONConfig.
+    /// </remarks>
     [NeonInclude(IncludeIf.NotDefault)]
-    AckPolicy: TJetStreamAckPolicy;
+    AckPolicy: Nullable<TJetStreamAckPolicy>;
     /// <summary>
     ///   How long the server waits for an ack before redelivering.
     ///   Nanoseconds; the server's own default is 30 seconds
@@ -542,15 +553,120 @@ type
     class function FromJSON<T: record>(const AJson: string): T; static;
   end;
 
+  /// <summary>
+  ///   Neon serializer for Nullable&lt;enum&gt;: a set value goes out as the
+  ///   wire name from the enum's NeonEnumNames attribute, an unset one is
+  ///   omitted (or null, per the field's NeonInclude). The stock
+  ///   RegisterNullableSerializers covers only primitives - without this an
+  ///   enum nullable would be serialized as its raw record fields
+  /// </summary>
+  TNullableEnumSerializer<T> = class(TCustomSerializer)
+  protected
+    class function GetTargetInfo: PTypeInfo; override;
+    class function CanHandle(AType: PTypeInfo): Boolean; override;
+  public
+    function Serialize(const AValue: TValue; ANeonObject: TNeonRttiObject;
+      AContext: ISerializerContext): TJSONValue; override;
+    function Deserialize(AValue: TJSONValue; const AData: TValue;
+      ANeonObject: TNeonRttiObject; AContext: IDeserializerContext): TValue; override;
+  end;
+
 implementation
 
 uses
-  Neon.Core.Serializers.Nullables;
+  Neon.Core.Serializers.Nullables,
+  Neon.Core.Utils;
+
+{ TNullableEnumSerializer<T> }
+
+class function TNullableEnumSerializer<T>.GetTargetInfo: PTypeInfo;
+begin
+  Result := TypeInfo(Nullable<T>);
+end;
+
+class function TNullableEnumSerializer<T>.CanHandle(AType: PTypeInfo): Boolean;
+begin
+  Result := AType = GetTargetInfo;
+end;
+
+function TNullableEnumSerializer<T>.Serialize(const AValue: TValue;
+  ANeonObject: TNeonRttiObject; AContext: ISerializerContext): TJSONValue;
+var
+  LValue: Nullable<T>;
+begin
+  LValue := AValue.AsType<Nullable<T>>;
+
+  if not LValue.HasValue then
+  begin
+    { Honour NeonInclude exactly as the stock nullable serializers do: an unset
+      value is omitted under NotDefault/NotEmpty/NotNull, an explicit null
+      otherwise }
+    case ANeonObject.NeonInclude.Value of
+      IncludeIf.NotNull,
+      IncludeIf.NotEmpty,
+      IncludeIf.NotDefault: Exit(nil);
+    else
+      Exit(TJSONNull.Create);
+    end;
+  end;
+
+  { The wire name comes from the same NeonEnumNames attribute the plain enum
+    writer reads, so the two can never drift apart }
+  Result := TJSONString.Create(
+    TTypeInfoUtils.EnumToString(TypeInfo(T),
+      Integer(TValue.From<T>(LValue.Value).AsOrdinal)));
+end;
+
+function TNullableEnumSerializer<T>.Deserialize(AValue: TJSONValue;
+  const AData: TValue; ANeonObject: TNeonRttiObject; AContext: IDeserializerContext): TValue;
+var
+  LValue: Nullable<T>;
+  LNames: TArray<string>;
+  LAttribute: NeonEnumNamesAttribute;
+  LTypeData: PTypeData;
+  LOrdinal, LIndex: Integer;
+begin
+  if AValue is TJSONNull then
+  begin
+    LValue := nil;
+    Result := TValue.From<Nullable<T>>(LValue);
+    Exit;
+  end;
+
+  if not (AValue is TJSONString) then
+    raise ENeonException.Create(Self.ClassName + ' expects a JSON string');
+
+  { The same name-to-ordinal mapping Neon's own enum reader uses: the
+    NeonEnumNames attribute first, the Delphi name as the fallback }
+  LAttribute := TRttiUtils.FindAttribute<NeonEnumNamesAttribute>(
+    TRttiUtils.Context.GetType(TypeInfo(T)));
+  if Assigned(LAttribute) then
+    LNames := LAttribute.Names;
+
+  LOrdinal := -1;
+  for LIndex := Low(LNames) to High(LNames) do
+    if LNames[LIndex] = AValue.Value then
+      LOrdinal := LIndex;
+  if LOrdinal = -1 then
+    LOrdinal := GetEnumValue(TypeInfo(T), AValue.Value);
+
+  LTypeData := GetTypeData(TypeInfo(T));
+  if (LOrdinal < LTypeData.MinValue) or (LOrdinal > LTypeData.MaxValue) then
+    raise ENeonException.CreateFmt('Invalid %s value [%s]',
+      [TRttiUtils.Context.GetType(TypeInfo(T)).Name, AValue.Value]);
+
+  LValue := TValue.FromOrdinal(TypeInfo(T), LOrdinal).AsType<T>;
+  Result := TValue.From<Nullable<T>>(LValue);
+end;
 
 function JetStreamJSONConfig: INeonConfiguration;
 begin
   Result := TNeonConfiguration.Create.SetMemberCase(TNeonCase.SnakeCase);
   RegisterNullableSerializers(Result.GetSerializers);
+  { The stock nullable serializers cover only primitives; an enum nullable
+    would otherwise be serialized as its raw record fields. TNullableEnumSerializer
+    writes the same NeonEnumNames the plain enum writer reads }
+  Result.GetSerializers.RegisterSerializer(TNullableEnumSerializer<TJetStreamAckPolicy>);
 end;
 
 { TJetStreamJSON }

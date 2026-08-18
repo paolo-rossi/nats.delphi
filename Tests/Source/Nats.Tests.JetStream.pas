@@ -142,6 +142,10 @@ type
     [Test]
     procedure ConsumerConfig_PullConsumer_OmitsDeliverSubject;
     [Test]
+    procedure ConsumerConfig_UnsetAckPolicy_IsOmitted;
+    [Test]
+    procedure ConsumerConfig_AckPolicy_RoundTripsThroughTheNullable;
+    [Test]
     procedure ConsumerInfo_RealServerJson_ParsesEveryField;
 
     { publish ack and errors }
@@ -1132,6 +1136,49 @@ begin
   finally
     LObj.Free;
   end;
+end;
+
+procedure TJetStreamEntityTests.ConsumerConfig_UnsetAckPolicy_IsOmitted;
+var
+  LConfig: TJetStreamConsumerConfig;
+  LObj: TJSONObject;
+begin
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.DurableName := 'workers';
+
+  LObj := JsonOf(TJetStreamJSON.ToJSON<TJetStreamConsumerConfig>(LConfig));
+  try
+    { The fix this pins: a consumer whose ack policy the caller never set must
+      NOT arrive as "ack_policy":"none". Neon emits plain enums
+      unconditionally, and "none" is neither the server's default (explicit)
+      nor accepted for a PULL consumer - so an unset policy is omitted and the
+      server applies its own default }
+    Assert.IsNull(LObj.GetValue('ack_policy'),
+      'an unset ack policy must be omitted, not sent as "none"');
+  finally
+    LObj.Free;
+  end;
+end;
+
+procedure TJetStreamEntityTests.ConsumerConfig_AckPolicy_RoundTripsThroughTheNullable;
+var
+  LConfig: TJetStreamConsumerConfig;
+  LJson: string;
+begin
+  { An explicitly set policy still travels under the same wire name, in both
+    directions - None included, which is the one value that used to leak out
+    of a Default config }
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.DurableName := 'workers';
+  LConfig.AckPolicy := TJetStreamAckPolicy.None;
+
+  LJson := TJetStreamJSON.ToJSON<TJetStreamConsumerConfig>(LConfig);
+  Assert.IsTrue(LJson.Contains('"ack_policy":"none"'),
+    'explicitly setting None must still emit it: ' + LJson);
+
+  LConfig := TJetStreamJSON.FromJSON<TJetStreamConsumerConfig>(LJson);
+  Assert.IsTrue(LConfig.AckPolicy = TJetStreamAckPolicy.None,
+    'None must survive a round trip');
 end;
 
 procedure TJetStreamEntityTests.ConsumerInfo_RealServerJson_ParsesEveryField;

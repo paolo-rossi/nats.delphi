@@ -725,7 +725,9 @@ Two Neon behaviours are load-bearing here:
 - **Booleans and enums are always emitted** — Neon ignores the omit rule for
   them. That is safe only because each Delphi zero value equals the server's own
   default: retention `limits`, storage `file`, discard `old`, every flag false.
-  A field that breaks that correspondence needs `Nullable<T>`.
+  The one field that broke that correspondence, `AckPolicy`, is a
+  `Nullable<TJetStreamAckPolicy>` for exactly this reason: an unset policy is
+  omitted from the request and the server applies its default (`explicit`).
 
 ### TJetStreamConsumerConfig
 
@@ -735,7 +737,7 @@ Two Neon behaviours are load-bearing here:
 | `Name`, `Description` | `string` | |
 | `DeliverPolicy` | `TJetStreamDeliverPolicy` | `All`, `Last`, `New`, `ByStartSequence`, `ByStartTime`, `LastPerSubject` |
 | `OptStartSeq` / `OptStartTime` | `UInt64` / `string` | Only read for `ByStartSequence` / `ByStartTime` |
-| `AckPolicy` | `TJetStreamAckPolicy` | `None`, `All`, `Explicit`. Only `Explicit` makes sense for a work queue |
+| `AckPolicy` | `Nullable<TJetStreamAckPolicy>` | `None`, `All`, `Explicit`. Only `Explicit` makes sense for a work queue. Leave it unset to omit the field and get the server default (`explicit`); setting it to `None` explicitly sends `"ack_policy":"none"` |
 | `AckWait` | `TJetStreamDuration` | Server default 30 s |
 | `MaxDeliver` | `Integer` | `-1` unlimited |
 | `FilterSubject` / `FilterSubjects` | `string` / `TArray<string>` | |
