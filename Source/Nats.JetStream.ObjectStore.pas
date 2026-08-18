@@ -142,6 +142,12 @@ type
     procedure PutInfo(const AInfo: TJetStreamObjectInfo);
     /// Removes every chunk belonging to ANuid
     procedure PurgeChunks(const ANuid: string);
+    /// <summary>
+    ///   Raises if AStream said EOF while still claiming data - a stream whose
+    ///   Read ends early. Streams that cannot report a size are skipped; the
+    ///   read loop in Put is the guarantee there
+    /// </summary>
+    procedure CheckStreamComplete(const AStream: TStream);
   public
     /// <summary>
     ///   Binds to an EXISTING bucket without a round trip. Use Status to
@@ -434,6 +440,30 @@ begin
   FContext.PurgeStream(FStream, LRequest);
 end;
 
+procedure TJetStreamObjectStore.CheckStreamComplete(const AStream: TStream);
+var
+  LSize, LPosition: Int64;
+begin
+  { The read loop is the guarantee against short reads; this is the net for a
+    stream whose Read reports EOF while it still claims more data. Reading is
+    the only way to get the bytes, so only the stream's own word about its size
+    can catch that - and a stream which cannot give one (a wrapper reporting 0,
+    or a non-seekable one whose Size access raises) is skipped, because for
+    those the read loop is all there is }
+  try
+    LSize := AStream.Size;
+    LPosition := AStream.Position;
+  except
+    on E: Exception do
+      Exit;
+  end;
+
+  if (LSize > 0) and (LPosition <> LSize) then
+    raise EJetStreamObjectError.CreateFmt(
+      'The stream ended at %d of its declared %d bytes - refusing to store a truncated object',
+      [LPosition, LSize]);
+end;
+
 function TJetStreamObjectStore.Put(const AName: string; AStream: TStream): TJetStreamObjectInfo;
 var
   LPrevious: TJetStreamObjectInfo;
@@ -465,7 +495,14 @@ begin
   LHash := THashSHA2.Create(SHA256);
   SetLength(LBuffer, FChunkSize);
 
-  repeat
+  { Read until the stream says EOF, treating a short read as a smaller chunk
+    rather than as the end: many TStream implementations return fewer bytes
+    than asked for before the end (sockets, pipes, filtered streams). The old
+    loop stopped on the FIRST short read, so those objects were silently
+    truncated - and the digest was computed over the truncated bytes, so no
+    read ever caught it }
+  while True do
+  begin
     LRead := AStream.Read(LBuffer, 0, FChunkSize);
     if LRead <= 0 then
       Break;
@@ -480,7 +517,12 @@ begin
 
     Inc(Result.Size, LRead);
     Inc(Result.Chunks);
-  until LRead < FChunkSize;
+  end;
+
+  { The loop above guarantees short reads cannot truncate. One failure mode
+    remains - a stream whose Read reports EOF while it still claims more data -
+    and only the stream's own word about its size can catch that }
+  CheckStreamComplete(AStream);
 
   Result.Digest := JetStreamConstants.Obj.DIGEST_PREFIX +
     TObjectStoreEncoding.Encode(LHash.HashAsBytes);

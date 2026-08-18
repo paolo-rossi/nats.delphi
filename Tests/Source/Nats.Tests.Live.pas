@@ -295,6 +295,12 @@ type
     procedure Get_WithItsChunksPurged_Raises;
     [Test]
     procedure PutFileAndGetFile_RoundTrip;
+    /// The F4 fix: short reads must not truncate an upload
+    [Test]
+    procedure Put_PartialReads_StillStoresTheWholeObject;
+    /// A stream that says EOF while claiming more must be refused, not stored short
+    [Test]
+    procedure Put_StreamEndingEarly_Raises;
   end;
 
 implementation
@@ -327,6 +333,47 @@ begin
   // see UseMockSocket: the registry default is process-wide
   Inc(GLiveSwitchCount);
   TNatsSocketRegistry.Register<TNatsSocketIndy>(Format('IndyLive#%d', [GLiveSwitchCount]), True);
+end;
+
+type
+  { Hands out at most ALimit bytes per Read call. A Put that stops on the first
+    short read - the defect Put_PartialReads_StillStoresTheWholeObject pins -
+    would store only ALimit bytes, with the digest computed over exactly those,
+    so a Get would come back short with nothing having raised. Size is honest,
+    so the store's own completeness check is satisfied once the whole object
+    really has been read. }
+  TShortReadStream = class(TBytesStream)
+  private
+    FLimit: Integer;
+  public
+    constructor Create(const AData: TBytes; ALimit: Integer);
+    function Read(var Buffer; Count: Longint): Longint; override;
+  end;
+
+  { Claims more bytes than it will ever hand out: Read returns 0 while
+    Position is still short of the declared Size. The store must refuse the
+    upload rather than record a digest of the bytes it did manage to read. }
+  TShortStream = class(TBytesStream)
+  public
+    function GetSize: Int64; override;
+  end;
+
+constructor TShortReadStream.Create(const AData: TBytes; ALimit: Integer);
+begin
+  inherited Create(AData);
+  FLimit := ALimit;
+end;
+
+function TShortReadStream.Read(var Buffer; Count: Longint): Longint;
+begin
+  if Count > FLimit then
+    Count := FLimit;
+  Result := inherited Read(Buffer, Count);
+end;
+
+function TShortStream.GetSize: Int64;
+begin
+  Result := inherited GetSize + 1000;
 end;
 
 { TNatsLiveServerTests }
@@ -2093,6 +2140,64 @@ begin
       TFile.Delete(LSource);
     if TFile.Exists(LTarget) then
       TFile.Delete(LTarget);
+  end;
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Put_PartialReads_StillStoresTheWholeObject;
+var
+  LData, LBack: TBytes;
+  LStream: TShortReadStream;
+  LInfo: TJetStreamObjectInfo;
+  LIndex: Integer;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LData := Pattern(5 * 1024 + 123);
+  LStream := TShortReadStream.Create(LData, 300);
+  try
+    LInfo := FOs.Put('short-reads.bin', LStream);
+  finally
+    LStream.Free;
+  end;
+
+  { The old loop stopped on the FIRST short read, so only 300 of these bytes
+    would have been stored - and the digest was computed over those 300, so a
+    Get would come back short with nothing having raised. The whole object has
+    to land }
+  Assert.AreEqual(UInt64(Length(LData)), LInfo.Size,
+    'a stream that reads in dribs and drabs must still be stored whole');
+  Assert.IsTrue(LInfo.Chunks > 1, 'the short reads must produce several chunks');
+
+  Assert.IsTrue(FOs.Get('short-reads.bin', LBack));
+  Assert.AreEqual(Length(LData), Length(LBack), 'the whole object came back');
+  for LIndex := 0 to High(LData) do
+    if LData[LIndex] <> LBack[LIndex] then
+      Assert.Fail(Format('byte %d differs: stored %d, got %d',
+        [LIndex, LData[LIndex], LBack[LIndex]]));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Put_StreamEndingEarly_Raises;
+var
+  LStream: TShortStream;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LStream := TShortStream.Create(Pattern(1024));
+  try
+    { A stream that claims a size it will never deliver: storing the bytes it
+      did hand out would produce an object whose digest matches a truncated
+      upload, exactly the silent corruption the completeness check exists to
+      stop }
+    Assert.WillRaise(
+      procedure
+      begin
+        FOs.Put('short.bin', LStream);
+      end,
+      EJetStreamObjectError);
+  finally
+    LStream.Free;
   end;
 end;
 
