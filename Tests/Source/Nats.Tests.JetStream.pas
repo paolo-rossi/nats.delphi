@@ -398,6 +398,10 @@ type
     procedure InProgress_DoesNotSettleTheMessage;
     [Test]
     procedure InProgress_MayRepeatAndStillBeAcked;
+    [Test]
+    procedure AckSync_NoReply_RaisesAckErrorNotingItMayHaveBeenRecorded;
+    [Test]
+    procedure AckSync_ConnectionClosedMidWait_RaisesAckError;
   end;
 
   /// <summary>
@@ -2882,6 +2886,77 @@ begin
   LMsg.Ack;
 
   Assert.IsTrue(LMsg.Acknowledged);
+end;
+
+procedure TJetStreamMsgTests.AckSync_NoReply_RaisesAckErrorNotingItMayHaveBeenRecorded;
+var
+  LMsg: IJetStreamMsg;
+  LRaised: EJetStreamAckError;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  { Nobody answers the ack request, so RequestSync times out. The ack WAS
+    published, though - only the confirmation reply is missing - and the error
+    has to admit that rather than claim the ack definitely did not land }
+  LRaised := nil;
+  try
+    LMsg.AckSync(150);
+  except
+    on E: EJetStreamAckError do
+      LRaised := EJetStreamAckError(AcquireExceptionObject);
+  end;
+
+  Assert.IsNotNull(LRaised, 'a missing confirmation must raise EJetStreamAckError');
+  Assert.IsTrue(LRaised.Message.Contains('may or may not have been recorded'),
+    'the ack may have been recorded even though no reply came: ' + LRaised.Message);
+  Assert.IsTrue(LMsg.Acknowledged,
+    'the message stays settled even though the confirmation failed');
+end;
+
+procedure TJetStreamMsgTests.AckSync_ConnectionClosedMidWait_RaisesAckError;
+var
+  LMsg: IJetStreamMsg;
+  LSocket: TNatsMockSocket;
+  LServerThread: TThread;
+  LRaised: EJetStreamAckError;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+  LSocket := FSocket;
+
+  { Kills the connection while the ack request is in flight. RequestSync then
+    raises a bare ENatsException - before the fix that leaked out with a
+    different type than the timeout case, so a caller catching
+    EJetStreamAckError saw one of the two failure modes silently }
+  LServerThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT) then
+        Exit;
+      LSocket.Close;
+    end);
+  LServerThread.FreeOnTerminate := False;
+  try
+    LServerThread.Start;
+
+    LRaised := nil;
+    try
+      LMsg.AckSync(3000);
+    except
+      on E: EJetStreamAckError do
+        LRaised := EJetStreamAckError(AcquireExceptionObject);
+    end;
+
+    Assert.IsNotNull(LRaised,
+      'a connection that dies mid-confirmation must raise EJetStreamAckError, ' +
+      'not leak a bare ENatsException');
+    Assert.IsTrue(LRaised.Message.Contains('may or may not have been recorded'),
+      'the ack may have reached the server before the connection died');
+  finally
+    LServerThread.WaitFor;
+    LServerThread.Free;
+  end;
 end;
 
 { TJetStreamKVTests }
