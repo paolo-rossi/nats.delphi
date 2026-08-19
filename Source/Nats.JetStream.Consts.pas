@@ -101,6 +101,15 @@ type
       ROLLUP = 'Nats-Rollup';
       ROLLUP_SUBJECT = 'sub';
       ROLLUP_ALL = 'all';
+
+      /// <summary>
+      ///   The server-to-client counterpart of the publish headers above: a
+      ///   PUSH delivery marked as a flow-control request. Modern nats-server
+      ///   sends those as status lines instead, but older versions used this
+      ///   header on an ordinary message - either way the delivery carries a
+      ///   reply subject that MUST be answered
+      /// </summary>
+      FLOW_CONTROL = 'Nats-Flow-Control';
     end;
 
     /// <summary>
@@ -266,7 +275,10 @@ type
       /// <summary>
       ///   V2 adds &lt;domain&gt;.&lt;account hash&gt; after ACK and a random
       ///   token at the end. This is a MINIMUM, not an equality: a later server
-      ///   may append further tokens, and appending must not break parsing
+      ///   may append further tokens, and appending must not break parsing. The
+      ///   10-11 gap below this floor is deliberately refused in TryParse -
+      ///   those shapes have no defined layout; lower the floor only if a real
+      ///   server ever emits them
       /// </summary>
       V2_TOKEN_COUNT = 12;
 
@@ -284,6 +296,30 @@ type
       POS_CONSUMER_SEQ  = 8;
       POS_TIMESTAMP     = 9;
       POS_NUM_PENDING   = 10;
+    end;
+
+    /// <summary>
+    ///   The err_code values an API or PubAck error object can carry - the
+    ///   field worth branching on (the HTTP-like code only says 400/404/503).
+    ///   Only the ones this library needs to recognise are named
+    /// </summary>
+    ErrCode = class
+    const
+      /// STREAM.MSG.GET found nothing for the requested sequence or subject
+      NO_MESSAGE_FOUND = 10037;
+      /// The stream named in the request does not exist
+      STREAM_NOT_FOUND = 10059;
+      /// The last-sequence expectation did not hold (Nats-Expected-Last-Sequence)
+      WRONG_LAST_SEQ = 10071;
+      /// Nats-Expected-Last-Subject-Sequence did not hold - the classic code
+      WRONG_LAST_SUBJECT_SEQ = 10072;
+      /// <summary>
+      ///   Newer servers report the same Nats-Expected-Last-Subject-Sequence
+      ///   failure under this code instead of 10072 - observed by the nats.py
+      ///   client's KV update. A caller that only cares "the CAS lost" accepts
+      ///   both
+      /// </summary>
+      WRONG_LAST_SUBJECT_SEQ_NEW = 10164;
     end;
   end;
 

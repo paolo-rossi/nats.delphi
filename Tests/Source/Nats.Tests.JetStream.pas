@@ -79,6 +79,8 @@ type
     [Test]
     procedure TenTokens_Fails;
     [Test]
+    procedure ElevenTokens_Fails;
+    [Test]
     procedure NonNumericSequence_Fails;
     [Test]
     procedure FailedParse_LeavesMetadataEmpty;
@@ -142,6 +144,10 @@ type
     [Test]
     procedure ConsumerConfig_PullConsumer_OmitsDeliverSubject;
     [Test]
+    procedure ConsumerConfig_UnsetAckPolicy_IsOmitted;
+    [Test]
+    procedure ConsumerConfig_AckPolicy_RoundTripsThroughTheNullable;
+    [Test]
     procedure ConsumerInfo_RealServerJson_ParsesEveryField;
 
     { publish ack and errors }
@@ -195,6 +201,11 @@ type
     /// </summary>
     procedure ReplyWithBatch(const APayloads: TArray<string>; AStatus: Integer;
       const ADescription: string; ALeadingStatus: Integer = 0);
+    /// <summary>
+    ///   Answers a pull request with a 409 conflict, then the CONSUMER.INFO
+    ///   request FetchRaw makes to verify whether the conflict was push-misuse
+    /// </summary>
+    procedure ReplyFetchConflictThenInfo(const AInfoJson: string);
     /// The subject of the PUB the client wrote
     function RequestSubject: string;
     /// The body of the PUB the client wrote
@@ -246,6 +257,8 @@ type
     [Test]
     procedure StreamNames_ReturnsTheNames;
     [Test]
+    procedure StreamNames_PagesUntilTotalIsReached;
+    [Test]
     procedure AccountInfo_ParsesLimitsAndUsage;
 
     { errors - the reason ApiRequest is a choke point }
@@ -295,6 +308,12 @@ type
     [Test]
     procedure Fetch_ExpiryIsShorterThanTheCallersWait;
     [Test]
+    procedure Fetch_ServerExpiry_NeverExceedsTheCallersWait;
+    [Test]
+    procedure Fetch_OnAPushConsumer_Raises;
+    [Test]
+    procedure Fetch_TransientConflictOnPullConsumer_ReturnsEmpty;
+    [Test]
     procedure Fetch_CollectsTheWholeBatch;
     [Test]
     procedure Fetch_MessagesCarryTheirMetadata;
@@ -309,11 +328,15 @@ type
     [Test]
     procedure Fetch_EmptyBatch_Raises;
     [Test]
+    procedure Fetch_ZeroTimeout_Raises;
+    [Test]
     procedure FetchNoWait_SetsNoWaitAndNoExpiry;
     [Test]
     procedure Next_ReturnsTheFirstMessage;
     [Test]
     procedure Next_NothingThere_ReturnsFalse;
+    [Test]
+    procedure Fetch_ConnectionClosedMidWait_RaisesInsteadOfTimingOut;
 
     { push consumption - Phase 4 }
 
@@ -325,6 +348,10 @@ type
     procedure SubscribePush_DeliversWrappedMessages;
     [Test]
     procedure SubscribePush_FlowControl_IsAnswered;
+    [Test]
+    procedure SubscribePush_FlowControlHeader_IsAnswered;
+    [Test]
+    procedure SubscribePush_OtherStatusWithReplyTo_IsNotAnswered;
     [Test]
     procedure SubscribePush_StatusNeverReachesTheHandler;
   end;
@@ -390,6 +417,10 @@ type
     procedure InProgress_DoesNotSettleTheMessage;
     [Test]
     procedure InProgress_MayRepeatAndStillBeAcked;
+    [Test]
+    procedure AckSync_NoReply_RaisesAckErrorNotingItMayHaveBeenRecorded;
+    [Test]
+    procedure AckSync_ConnectionClosedMidWait_RaisesAckError;
   end;
 
   /// <summary>
@@ -459,6 +490,14 @@ type
     [Test]
     procedure Update_ExpectsTheRevisionGiven;
     [Test]
+    procedure PutIfAbsent_KeyExists_RaisesKvError;
+    [Test]
+    procedure PutIfAbsent_MissingBucket_PropagatesTheApiError;
+    [Test]
+    procedure Update_LostTheRace_RaisesKvError;
+    [Test]
+    procedure Update_MissingBucket_PropagatesTheApiError;
+    [Test]
     procedure Delete_WritesATombstoneRatherThanRemovingAnything;
     [Test]
     procedure Purge_AddsTheRollupHeader;
@@ -474,9 +513,16 @@ type
     [Test]
     procedure Get_Tombstone_ReportsNotFoundAndNoValue;
     [Test]
+    procedure Get_MissingBucket_PropagatesTheApiError;
+    [Test]
     procedure GetRevision_AsksBySequence;
     [Test]
     procedure GetRevision_OfAnotherKey_ReportsNotFound;
+
+    { status }
+
+    [Test]
+    procedure Status_Values_IsTheKeyCountNotTheMessageCount;
   end;
 
   /// <summary>
@@ -540,6 +586,8 @@ type
     procedure Info_MissingObject_ReportsNotFound;
     [Test]
     procedure Info_Deleted_ReportsNotFound;
+    [Test]
+    procedure Info_MissingBucket_PropagatesTheApiError;
   end;
 
   /// <summary>
@@ -804,6 +852,20 @@ begin
     which fields are missing }
   Assert.IsFalse(TJetStreamMsgMetadata.TryParse(
     '$JS.ACK.ORDERS.workers.3.42.7.1700000000123456789.5.extra', LMeta),
+    'a count between the two layouts is not a subject we can read');
+end;
+
+procedure TJetStreamMetadataTests.ElevenTokens_Fails;
+var
+  LMeta: TJetStreamMsgMetadata;
+begin
+  { The other half of the 10-11 gap, pinned so the boundary is explicit: the
+    domain and account hash a V2 adds could sit in either order in an
+    11-token subject, or one could be the trailing random token - no layout
+    to index, so refuse rather than report plausible-looking wrong metadata }
+  Assert.IsFalse(TJetStreamMsgMetadata.TryParse(
+    '$JS.ACK.hub.ORDERS.workers.3.42.7.1700000000123456789.5.extra1',
+    LMeta),
     'a count between the two layouts is not a subject we can read');
 end;
 
@@ -1134,6 +1196,49 @@ begin
   end;
 end;
 
+procedure TJetStreamEntityTests.ConsumerConfig_UnsetAckPolicy_IsOmitted;
+var
+  LConfig: TJetStreamConsumerConfig;
+  LObj: TJSONObject;
+begin
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.DurableName := 'workers';
+
+  LObj := JsonOf(TJetStreamJSON.ToJSON<TJetStreamConsumerConfig>(LConfig));
+  try
+    { The fix this pins: a consumer whose ack policy the caller never set must
+      NOT arrive as "ack_policy":"none". Neon emits plain enums
+      unconditionally, and "none" is neither the server's default (explicit)
+      nor accepted for a PULL consumer - so an unset policy is omitted and the
+      server applies its own default }
+    Assert.IsNull(LObj.GetValue('ack_policy'),
+      'an unset ack policy must be omitted, not sent as "none"');
+  finally
+    LObj.Free;
+  end;
+end;
+
+procedure TJetStreamEntityTests.ConsumerConfig_AckPolicy_RoundTripsThroughTheNullable;
+var
+  LConfig: TJetStreamConsumerConfig;
+  LJson: string;
+begin
+  { An explicitly set policy still travels under the same wire name, in both
+    directions - None included, which is the one value that used to leak out
+    of a Default config }
+  LConfig := Default(TJetStreamConsumerConfig);
+  LConfig.DurableName := 'workers';
+  LConfig.AckPolicy := TJetStreamAckPolicy.None;
+
+  LJson := TJetStreamJSON.ToJSON<TJetStreamConsumerConfig>(LConfig);
+  Assert.IsTrue(LJson.Contains('"ack_policy":"none"'),
+    'explicitly setting None must still emit it: ' + LJson);
+
+  LConfig := TJetStreamJSON.FromJSON<TJetStreamConsumerConfig>(LJson);
+  Assert.IsTrue(LConfig.AckPolicy = TJetStreamAckPolicy.None,
+    'None must survive a round trip');
+end;
+
 procedure TJetStreamEntityTests.ConsumerInfo_RealServerJson_ParsesEveryField;
 var
   LInfo: TJetStreamConsumerInfo;
@@ -1437,6 +1542,89 @@ begin
   FServerThread.Start;
 end;
 
+procedure TJetStreamContextTests.ReplyFetchConflictThenInfo(const AInfoJson: string);
+var
+  LSocket: TNatsMockSocket;
+begin
+  LSocket := FSocket;
+
+  { Two exchanges: the pull request first (answered with a 409 conflict, which
+    is how a push consumer rejects a pull request), then the CONSUMER.INFO that
+    FetchRaw performs to decide whether the conflict was push-misuse }
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LSubCount, LIdx: Integer;
+      LDeadline: UInt64;
+      LLines, LParts: TArray<string>;
+      LLine: string;
+    begin
+      { Wait for this request's SUB; ClientText accumulates, so the k-th SUB
+        line is the k-th request. Bounded so a failed test cannot leave
+        TearDown joining a thread that spins forever }
+      LDeadline := TThread.GetTickCount64 + 3000;
+      while True do
+      begin
+        LSubCount := 0;
+        LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+        for LLine in LLines do
+          if LLine.StartsWith(NatsConstants.Protocol.SUB + ' ') then
+            Inc(LSubCount);
+        if LSubCount > 0 then
+          Break;
+        if TThread.GetTickCount64 > LDeadline then
+          Exit;
+        Sleep(10);
+      end;
+
+      LParts := nil;
+      for LIdx := 0 to High(LLines) do
+        if LLines[LIdx].StartsWith(NatsConstants.Protocol.SUB + ' ') then
+        begin
+          LParts := LLines[LIdx].Split([NatsConstants.SPC]);
+          Break;
+        end;
+
+      LSocket.ServerSend(StatusFrame(LParts[1], LParts[2],
+        NatsConstants.Status.CONFLICT, 'Consumer is push based'));
+
+      { the verification's CONSUMER.INFO request }
+      LDeadline := TThread.GetTickCount64 + 3000;
+      while True do
+      begin
+        LSubCount := 0;
+        LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+        for LLine in LLines do
+          if LLine.StartsWith(NatsConstants.Protocol.SUB + ' ') then
+            Inc(LSubCount);
+        if LSubCount > 1 then
+          Break;
+        if TThread.GetTickCount64 > LDeadline then
+          Exit;
+        Sleep(10);
+      end;
+
+      LSubCount := 0;
+      for LIdx := 0 to High(LLines) do
+        if LLines[LIdx].StartsWith(NatsConstants.Protocol.SUB + ' ') then
+        begin
+          Inc(LSubCount);
+          if LSubCount = 2 then
+          begin
+            LParts := LLines[LIdx].Split([NatsConstants.SPC]);
+            Break;
+          end;
+        end;
+
+      LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+        [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+         Length(TEncoding.UTF8.GetBytes(AInfoJson)), AInfoJson]));
+    end);
+
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+end;
+
 function TJetStreamContextTests.RequestSubject: string;
 var
   LLine: string;
@@ -1707,6 +1895,91 @@ begin
   Assert.AreEqual(2, Length(LNames));
   Assert.AreEqual('ORDERS', LNames[0]);
   Assert.AreEqual('EVENTS', LNames[1]);
+end;
+
+procedure TJetStreamContextTests.StreamNames_PagesUntilTotalIsReached;
+var
+  LSocket: TNatsMockSocket;
+  LNames: TArray<string>;
+begin
+  OpenAndHandshake;
+  LSocket := FSocket;
+
+  { Serves TWO pages: the first carries 2 of the 4 names, the second the rest.
+    The old code returned the first page and stopped, so a caller with more
+    than one page of streams silently lost the tail }
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LPage, LSubCount, LIdx: Integer;
+      LDeadline: UInt64;
+      LLines, LParts: TArray<string>;
+      LLine: string;
+    begin
+      for LPage := 0 to 1 do
+      begin
+        { Wait until this request's SUB is on the wire; ClientText accumulates,
+          so the page's SUB is the (LPage+1)-th one. Bounded so a failed test
+          cannot leave TearDown joining a thread that spins forever }
+        LDeadline := TThread.GetTickCount64 + 3000;
+        while True do
+        begin
+          LSubCount := 0;
+          LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+          for LLine in LLines do
+            if LLine.StartsWith(NatsConstants.Protocol.SUB + ' ') then
+              Inc(LSubCount);
+          if LSubCount > LPage then
+            Break;
+          if TThread.GetTickCount64 > LDeadline then
+            Exit;
+          Sleep(10);
+        end;
+
+        { Find that SUB line for the inbox and sid of THIS request }
+        LSubCount := 0;
+        for LIdx := 0 to High(LLines) do
+          if LLines[LIdx].StartsWith(NatsConstants.Protocol.SUB + ' ') then
+          begin
+            Inc(LSubCount);
+            if LSubCount = LPage + 1 then
+            begin
+              LParts := LLines[LIdx].Split([NatsConstants.SPC]);
+              Break;
+            end;
+          end;
+
+        if LPage = 0 then
+          LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+            [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+             Length(TEncoding.UTF8.GetBytes(
+               '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":0,"limit":2,"streams":["A","B"]}')),
+             '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":0,"limit":2,"streams":["A","B"]}']))
+        else
+          LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+            [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+             Length(TEncoding.UTF8.GetBytes(
+               '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":2,"limit":2,"streams":["C","D"]}')),
+             '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":2,"limit":2,"streams":["C","D"]}']));
+      end;
+    end);
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+
+  { The server fixes the page size, so the mock returns 2-item pages with a
+    Total of 4 - without the paging loop the caller would see two names and
+    never learn there were four }
+  LNames := FJs.StreamNames;
+
+  Assert.AreEqual(4, Length(LNames), 'every page must be collected');
+  Assert.AreEqual('A', LNames[0]);
+  Assert.AreEqual('B', LNames[1]);
+  Assert.AreEqual('C', LNames[2]);
+  Assert.AreEqual('D', LNames[3]);
 end;
 
 procedure TJetStreamContextTests.AccountInfo_ParsesLimitsAndUsage;
@@ -2109,6 +2382,64 @@ begin
   end;
 end;
 
+procedure TJetStreamContextTests.Fetch_ServerExpiry_NeverExceedsTheCallersWait;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10, 10);   // a 10 ms wait
+    end);
+
+  { The floor used to be 50 ms even for a shorter wait, so a 10 ms wait gave
+    the server a 50 ms deadline: the caller gave up and unsubscribed while the
+    request kept counting against MaxWaiting until its own expiry. The server's
+    deadline must never outlive the caller's - 10 ms wait, 10 ms expiry }
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    Assert.AreEqual(Int64(TJetStreamDuration.FromMillis(10)),
+      LBody.GetValue<Int64>('expires'),
+      'the server''s deadline must never exceed the caller''s own wait');
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.Fetch_OnAPushConsumer_Raises;
+begin
+  OpenAndHandshake;
+  { The server answers the pull request with a 409 - it is a PUSH consumer -
+    and the verification CONSUMER.INFO confirms it. Asking a push consumer to
+    pull must raise, not come back empty forever }
+  ReplyFetchConflictThenInfo(CONSUMER_INFO_PUSH_JSON);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'pushers', 10, 5000);
+    end,
+    ENatsException,
+    'a push consumer cannot be pulled, and that must not look like emptiness');
+end;
+
+procedure TJetStreamContextTests.Fetch_TransientConflictOnPullConsumer_ReturnsEmpty;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  OpenAndHandshake;
+  { A 409 can also be transient - MaxWaiting exceeded, say. The verification
+    shows the consumer is pull, so the conflict keeps its documented meaning:
+    a short batch is a result, not an error }
+  ReplyFetchConflictThenInfo(CONSUMER_INFO_JSON);
+
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 10, 5000);
+
+  Assert.AreEqual(0, Length(LMsgs), 'a transient conflict is still an empty result');
+end;
+
 procedure TJetStreamContextTests.Fetch_CollectsTheWholeBatch;
 var
   LMsgs: TArray<IJetStreamMsg>;
@@ -2233,6 +2564,31 @@ begin
     ENatsException, 'a batch of zero asks the server for nothing');
 end;
 
+procedure TJetStreamContextTests.Fetch_ZeroTimeout_Raises;
+begin
+  OpenAndHandshake;
+
+  { Fetch(0) means "use the context's Timeout", so a Timeout of 0 is a
+    misconfiguration rather than a request to wait nothing. Before the fix a
+    zero wait returned immediately with an empty array - indistinguishable
+    from a consumer with nothing to say }
+  FJs.Timeout := 0;
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10);
+    end,
+    ENatsException, 'a zero wait must be refused, not read as an empty consumer');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.FetchNoWait('ORDERS', 'workers', 10);
+    end,
+    ENatsException, 'FetchNoWait uses the context''s Timeout too');
+end;
+
 procedure TJetStreamContextTests.FetchNoWait_SetsNoWaitAndNoExpiry;
 var
   LBody: TJSONObject;
@@ -2279,6 +2635,48 @@ begin
     time in a polling loop }
   Assert.IsFalse(FJs.Next('ORDERS', 'workers', LMsg, 5000));
   Assert.IsNull(LMsg);
+end;
+
+procedure TJetStreamContextTests.Fetch_ConnectionClosedMidWait_RaisesInsteadOfTimingOut;
+var
+  LSocket: TNatsMockSocket;
+  LStopwatch: TStopwatch;
+begin
+  OpenAndHandshake;
+
+  LSocket := FSocket;
+
+  { Plays the server: waits for the fetch's inbox SUB, then kills the socket.
+    The reader sees the disconnect, tears the connection down, and the teardown
+    must RELEASE the blocked fetch - that is the whole point of this test }
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.SUB + ' ' +
+           NatsConstants.INBOX_PREFIX) then
+        Exit;
+
+      LSocket.Close;
+    end);
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+
+  LStopwatch := TStopwatch.StartNew;
+
+  { A dead connection is not an empty stream: the fetch must RAISE, and it must
+    do so long before its own timeout. Before this fix it sat out the whole
+    LONG_WAIT and came back with an empty array that read exactly like a
+    healthy consumer with nothing to say }
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10, LONG_WAIT);
+    end,
+    ENatsException);
+
+  Assert.IsTrue(LStopwatch.ElapsedMilliseconds < (LONG_WAIT div 2),
+    'the teardown must release the fetch, not its own timeout - elapsed ' +
+    LStopwatch.ElapsedMilliseconds.ToString + ' ms');
 end;
 
 { push consumption }
@@ -2378,6 +2776,67 @@ begin
   Assert.IsTrue(FSocket.WaitForClientText(
     NatsConstants.Protocol.PUB + ' $JS.FC.token'),
     'a flow-control request must be answered, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_FlowControlHeader_IsAnswered;
+var
+  LSid: Integer;
+  LBlock: string;
+  LLen: Integer;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSid := FJs.SubscribePush('ORDERS', 'pushers',
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+    end);
+
+  FSocket.ClearClientData;
+
+  { Older servers sent the flow-control request as an ordinary HMSG carrying
+    the Nats-Flow-Control header instead of a status line - it still has a
+    reply-to that must be answered, and it must not reach the handler }
+  LBlock := NatsConstants.CLIENT_HEADER_VERSION + #13#10 +
+    JetStreamConstants.Header.FLOW_CONTROL + ': 1'#13#10;
+  LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+  FSocket.ServerSend(Format('%s deliver.pushers %d $JS.FC.token %d %d'#13#10,
+    [NatsConstants.Protocol.HMSG, LSid, LLen, LLen]) + LBlock + #13#10 + #13#10);
+
+  Assert.IsTrue(FSocket.WaitForClientText(
+    NatsConstants.Protocol.PUB + ' $JS.FC.token'),
+    'a flow-control header must be answered, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_OtherStatusWithReplyTo_IsNotAnswered;
+var
+  LSid: Integer;
+  LBlock: string;
+  LLen: Integer;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSid := FJs.SubscribePush('ORDERS', 'pushers',
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+    end);
+
+  FSocket.ClearClientData;
+
+  { A status that is NOT the flow-control one: it is still control, not data,
+    so it must not reach the handler - but answering it as a flow-control
+    request would be wrong, so nothing may be published to its reply-to }
+  LBlock := NatsConstants.CLIENT_HEADER_VERSION + ' 404 No Messages'#13#10;
+  LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+  FSocket.ServerSend(Format('%s deliver.pushers %d $JS.other.token %d %d'#13#10,
+    [NatsConstants.Protocol.HMSG, LSid, LLen, LLen]) + LBlock + #13#10 + #13#10);
+
+  Assert.IsFalse(FSocket.WaitForClientText(
+    NatsConstants.Protocol.PUB + ' $JS.other.token', 300),
+    'a non-flow-control status must not be answered as one');
 end;
 
 procedure TJetStreamContextTests.SubscribePush_StatusNeverReachesTheHandler;
@@ -2687,6 +3146,77 @@ begin
   LMsg.Ack;
 
   Assert.IsTrue(LMsg.Acknowledged);
+end;
+
+procedure TJetStreamMsgTests.AckSync_NoReply_RaisesAckErrorNotingItMayHaveBeenRecorded;
+var
+  LMsg: IJetStreamMsg;
+  LRaised: EJetStreamAckError;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+
+  { Nobody answers the ack request, so RequestSync times out. The ack WAS
+    published, though - only the confirmation reply is missing - and the error
+    has to admit that rather than claim the ack definitely did not land }
+  LRaised := nil;
+  try
+    LMsg.AckSync(150);
+  except
+    on E: EJetStreamAckError do
+      LRaised := EJetStreamAckError(AcquireExceptionObject);
+  end;
+
+  Assert.IsNotNull(LRaised, 'a missing confirmation must raise EJetStreamAckError');
+  Assert.IsTrue(LRaised.Message.Contains('may or may not have been recorded'),
+    'the ack may have been recorded even though no reply came: ' + LRaised.Message);
+  Assert.IsTrue(LMsg.Acknowledged,
+    'the message stays settled even though the confirmation failed');
+end;
+
+procedure TJetStreamMsgTests.AckSync_ConnectionClosedMidWait_RaisesAckError;
+var
+  LMsg: IJetStreamMsg;
+  LSocket: TNatsMockSocket;
+  LServerThread: TThread;
+  LRaised: EJetStreamAckError;
+begin
+  OpenAndHandshake;
+  Assert.IsTrue(TJetStreamMsg.TryWrap(FConn, Delivery(ACK_SUBJECT), LMsg));
+  LSocket := FSocket;
+
+  { Kills the connection while the ack request is in flight. RequestSync then
+    raises a bare ENatsException - before the fix that leaked out with a
+    different type than the timeout case, so a caller catching
+    EJetStreamAckError saw one of the two failure modes silently }
+  LServerThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      if not LSocket.WaitForClientText(NatsConstants.Protocol.PUB + ' ' + ACK_SUBJECT) then
+        Exit;
+      LSocket.Close;
+    end);
+  LServerThread.FreeOnTerminate := False;
+  try
+    LServerThread.Start;
+
+    LRaised := nil;
+    try
+      LMsg.AckSync(3000);
+    except
+      on E: EJetStreamAckError do
+        LRaised := EJetStreamAckError(AcquireExceptionObject);
+    end;
+
+    Assert.IsNotNull(LRaised,
+      'a connection that dies mid-confirmation must raise EJetStreamAckError, ' +
+      'not leak a bare ENatsException');
+    Assert.IsTrue(LRaised.Message.Contains('may or may not have been recorded'),
+      'the ack may have reached the server before the connection died');
+  finally
+    LServerThread.WaitFor;
+    LServerThread.Free;
+  end;
 end;
 
 { TJetStreamKVTests }
@@ -3097,6 +3627,72 @@ begin
     'block was: ' + RequestHeaders);
 end;
 
+procedure TJetStreamKVTests.PutIfAbsent_KeyExists_RaisesKvError;
+begin
+  OpenAndHandshake;
+  { The server's answer to "Nats-Expected-Last-Subject-Sequence: 0" when the
+    key already holds a value - the ordinary CAS defeat, which keeps its
+    friendly KV error }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":400,"err_code":10072,"description":"wrong last subject sequence: 3"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.PutIfAbsent('name', 'delphi');
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.PutIfAbsent_MissingBucket_PropagatesTheApiError;
+begin
+  OpenAndHandshake;
+  { A bucket that was never created answers 10059 "stream not found" - and that
+    is NOT "the key exists". Before the fix this was rephrased into the exact
+    opposite of what happened }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.PutIfAbsent('name', 'delphi');
+    end,
+    EJetStreamApiError);
+end;
+
+procedure TJetStreamKVTests.Update_LostTheRace_RaisesKvError;
+begin
+  OpenAndHandshake;
+  { Newer servers report the failed Nats-Expected-Last-Subject-Sequence under
+    10164 rather than 10072 - it must still map to the CAS error, not leak out
+    as a raw API error }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":400,"err_code":10164,"description":"wrong last subject sequence"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Update('name', 'delphi', 7);
+    end,
+    EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.Update_MissingBucket_PropagatesTheApiError;
+begin
+  OpenAndHandshake;
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.pub_ack_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  { Same rule as PutIfAbsent: a missing bucket is a real error, not a lost race }
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Update('name', 'delphi', 7);
+    end,
+    EJetStreamApiError);
+end;
+
 procedure TJetStreamKVTests.Delete_WritesATombstoneRatherThanRemovingAnything;
 begin
   OpenAndHandshake;
@@ -3206,6 +3802,26 @@ begin
   Assert.IsFalse(FKV.Get('name', LEntry), 'a deleted key is not set');
 end;
 
+procedure TJetStreamKVTests.Get_MissingBucket_PropagatesTheApiError;
+var
+  LEntry: TKVEntry;
+begin
+  OpenAndHandshake;
+  { "Stream not found" (10059) also carries HTTP code 404, so discriminating on
+    the code would read a missing bucket as "the key is not set". Only 10037 -
+    "no message found" - is the key being absent; a bucket that was never
+    created (or was deleted) is a real error and must propagate }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_msg_get_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Get('name', LEntry);
+    end,
+    EJetStreamApiError);
+end;
+
 procedure TJetStreamKVTests.GetRevision_AsksBySequence;
 var
   LBody: TJSONObject;
@@ -3240,6 +3856,26 @@ begin
     rather than per key. Sequence 7 may well belong to a different key, and
     handing its value back under this key's name would be a silent data leak }
   Assert.IsFalse(FKV.GetRevision('name', 7, LEntry));
+end;
+
+procedure TJetStreamKVTests.Status_Values_IsTheKeyCountNotTheMessageCount;
+var
+  LStatus: TJetStreamKVStatus;
+begin
+  OpenAndHandshake;
+  { 5 messages across 3 subjects. Values must come from num_subjects: a key
+    with several revisions counts once, and a tombstone keeps its key counted -
+    the old code returned the message count, which was right only for a
+    History=1 bucket with no deletes }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_info_response",' +
+    '"config":{"name":"KV_cfg","max_msgs_per_subject":3,"max_age":0},' +
+    '"state":{"messages":5,"bytes":100,"num_subjects":3}}');
+
+  LStatus := FKV.Status;
+
+  Assert.AreEqual(UInt64(3), LStatus.Values, 'Values counts keys, not messages');
+  Assert.AreEqual(Int64(3), LStatus.History, 'the history setting round-trips');
+  Assert.AreEqual(UInt64(100), LStatus.Bytes);
 end;
 
 { TJetStreamObjectStoreTests }
@@ -3568,6 +4204,24 @@ begin
     removed stays distinguishable from one that never existed - so the read
     succeeds at the stream level and there is still no object }
   Assert.IsFalse(FOs.Info('gone.txt', LInfo), 'a deleted object is not an object');
+end;
+
+procedure TJetStreamObjectStoreTests.Info_MissingBucket_PropagatesTheApiError;
+var
+  LInfo: TJetStreamObjectInfo;
+begin
+  OpenAndHandshake;
+  { As in the KV case: "stream not found" (10059) is a 404 too, and it must NOT
+    read as "no such object" - a bucket that does not exist is a real error }
+  ReplyWith('{"type":"io.nats.jetstream.api.v1.stream_msg_get_response",' +
+    '"error":{"code":404,"err_code":10059,"description":"stream not found"}}');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FOs.Info('a.txt', LInfo);
+    end,
+    EJetStreamApiError);
 end;
 
 { TJetStreamPubOptionsTests }

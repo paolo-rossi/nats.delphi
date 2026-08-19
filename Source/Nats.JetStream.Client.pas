@@ -198,6 +198,14 @@ type
     ///   dot in it would address a different endpoint, not fail
     /// </summary>
     procedure CheckName(const AKind, AName: string);
+    /// <summary>
+    ///   Pages through a *.NAMES endpoint until the server's Total is reached,
+    ///   collecting every name. The server fixes the page size (256), so the
+    ///   loop advances by what came back and stops on Total. A bare names
+    ///   array carries no metadata, so a single page would silently drop
+    ///   everything past it
+    /// </summary>
+    function CollectAllNames(const ASubject: string; AOffset: Integer): TArray<string>;
   public
     constructor Create(AConnection: TNatsConnection; const ADomain: string = '');
 
@@ -243,12 +251,17 @@ type
     ///   <para>
     ///     A short batch is a normal result, not a failure - an empty array
     ///     simply means the consumer had nothing pending. Nothing here raises
-    ///     for an empty stream.
+    ///     for an empty stream. A connection that dies WHILE the fetch is
+    ///     waiting is a different answer: the fetch is released early and
+    ///     raises, exactly as RequestSync does - silence and a dead connection
+    ///     are not the same thing.
     ///   </para>
     ///   <para>
     ///     ATimeoutMs of 0 means this context's Timeout. The request carries
     ///     its own, slightly shorter expiry so the SERVER closes the batch and
-    ///     stops holding it open; see FETCH_EXPIRY_MARGIN.
+    ///     stops holding it open; see FETCH_EXPIRY_MARGIN. A Timeout of 0 on
+    ///     the context itself is refused: the wait would return immediately
+    ///     with an empty array, indistinguishable from an empty consumer.
     ///   </para>
     ///   <para>
     ///     Blocks, so never call it from a message, connect or disconnect
@@ -259,7 +272,9 @@ type
       ATimeoutMs: Cardinal = 0): TArray<IJetStreamMsg>;
     /// <summary>
     ///   As Fetch, but returns with whatever is already waiting instead of
-    ///   holding the request open. Ideal for draining, wrong for polling
+    ///   holding the request open. Ideal for draining, wrong for polling. Uses
+    ///   this context's Timeout as the wait for the replies to travel back, so
+    ///   a Timeout of 0 raises here too
     /// </summary>
     function FetchNoWait(const AStream, AConsumer: string;
       ABatch: Integer = 1): TArray<IJetStreamMsg>;
@@ -341,13 +356,26 @@ type
     /// </summary>
     function PurgeStream(const AStream: string;
       const ARequest: TJetStreamPurgeRequest): UInt64; overload;
+    /// <summary>
+    ///   ONE page of streams, starting at AOffset. The response carries Total,
+    ///   so a caller pages with ListStreams(AOffset + Length(Streams)) - or
+    ///   uses StreamNames for the whole list without the envelope
+    /// </summary>
     function ListStreams(AOffset: Integer = 0): TJetStreamStreamListResponse;
+    /// <summary>
+    ///   Every stream name, paged through internally until the server's Total
+    ///   is reached. A single page (the server fixes it at 256) would silently
+    ///   drop everything past it, and a bare name array has no metadata to
+    ///   notice the truncation with
+    /// </summary>
     function StreamNames(AOffset: Integer = 0): TArray<string>;
 
     /// <summary>
     ///   Reads one stored message without creating a consumer. False means the
-    ///   server has no such message, which is an ordinary answer - only a real
-    ///   failure raises
+    ///   server answered err_code 10037 "no message found" - the ordinary
+    ///   answer to asking for a key that was never set. A stream that does not
+    ///   exist (10059) is NOT that answer: it raises, so "the bucket is gone"
+    ///   can never be mistaken for "the key is absent"
     /// </summary>
     /// <remarks>
     ///   The workhorse behind a key/value get: a bucket is a stream, a key is a
@@ -372,7 +400,15 @@ type
       const AConfig: TJetStreamConsumerConfig): TJetStreamConsumerInfo;
     function ConsumerInfo(const AStream, AConsumer: string): TJetStreamConsumerInfo;
     function DeleteConsumer(const AStream, AConsumer: string): Boolean;
+    /// <summary>
+    ///   ONE page of consumers on AStream, starting at AOffset - page with the
+    ///   returned Total, or use ConsumerNames for the whole list
+    /// </summary>
     function ListConsumers(const AStream: string; AOffset: Integer = 0): TJetStreamConsumerListResponse;
+    /// <summary>
+    ///   Every consumer name on AStream, paged through internally until the
+    ///   server's Total is reached
+    /// </summary>
     function ConsumerNames(const AStream: string; AOffset: Integer = 0): TArray<string>;
 
     /// Empty unless this context was built for a JetStream domain
@@ -415,15 +451,21 @@ type
   ///   so a message arriving after the caller gave up still finds a live object
   ///   rather than a freed stack frame.
   /// </remarks>
-  IJetStreamFetch = interface
+  IJetStreamFetch = interface(INatsRequestCancellable)
     ['{7C4A8E12-3D96-4B0F-A5E7-C8103BD6F921}']
     /// Runs on the consumer thread, once per delivered message
     procedure Deliver(const AMsg: TNatsArgsMSG);
     /// <summary>
-    ///   Blocks until the batch is full, the server closes it out, or the wait
-    ///   elapses. Whatever was collected is returned in all three cases
+    ///   Blocks until the batch is full, the server closes it out, the
+    ///   connection dies (which raises), or the wait elapses. Whatever was
+    ///   collected is returned in every non-fatal case
     /// </summary>
     function WaitFor(ATimeoutMs: Cardinal): TArray<IJetStreamMsg>;
+    /// <summary>
+    ///   The status that closed the batch out - 0 when it filled or timed out.
+    ///   Lets FetchRaw tell a batch closed by a 409 from an ordinary result
+    /// </summary>
+    function GetCloseStatus: Integer;
   end;
 
   TJetStreamFetch = class(TInterfacedObject, IJetStreamFetch)
@@ -433,12 +475,25 @@ type
     FLock: TCriticalSection;
     FMessages: TList<IJetStreamMsg>;
     FBatch: Integer;
+    /// Set by Cancel: the connection died while the caller was waiting
+    FCancelled: Boolean;
+    /// <summary>
+    ///   The batch finished for a legitimate reason - full, or closed out by a
+    ///   status. A cancel that arrives after that must not turn a real result
+    ///   into a failure, exactly as TNatsRequestWaiter keeps a reply that
+    ///   landed before Cancel
+    /// </summary>
+    FClosed: Boolean;
+    /// The status that closed the batch, 0 if it filled or the wait elapsed
+    FCloseStatus: Integer;
   public
     constructor Create(AConnection: TNatsConnection; ABatch: Integer);
     destructor Destroy; override;
 
+    procedure Cancel;
     procedure Deliver(const AMsg: TNatsArgsMSG);
     function WaitFor(ATimeoutMs: Cardinal): TArray<IJetStreamMsg>;
+    function GetCloseStatus: Integer;
   end;
 
 { TJetStreamFetch }
@@ -462,6 +517,21 @@ begin
   inherited;
 end;
 
+procedure TJetStreamFetch.Cancel;
+begin
+  { Runs on whichever thread discovered the failure - the connection's teardown
+    path. The fetch's half of RequestSync's contract: a caller blocked in
+    WaitFor must be released, not left to sit out its timeout for messages that
+    provably cannot arrive }
+  FLock.Enter;
+  try
+    FCancelled := True;
+  finally
+    FLock.Leave;
+  end;
+  FEvent.SetEvent;
+end;
+
 procedure TJetStreamFetch.Deliver(const AMsg: TNatsArgsMSG);
 var
   LWrapped: IJetStreamMsg;
@@ -478,7 +548,15 @@ begin
     { Everything else closes the batch: 404 nothing there, 408 the request's
       own expiry, 409 the consumer went away or MaxWaiting was exceeded. None
       of them is an error - whatever arrived before it is still a valid result,
-      so the wait ends and the caller gets a short batch }
+      so the wait ends and the caller gets a short batch. The status is kept so
+      FetchRaw can tell a 409 from an ordinary result }
+    FLock.Enter;
+    try
+      FClosed := True;
+      FCloseStatus := AMsg.Status;
+    finally
+      FLock.Leave;
+    end;
     FEvent.SetEvent;
     Exit;
   end;
@@ -493,6 +571,8 @@ begin
   try
     FMessages.Add(LWrapped);
     LComplete := FMessages.Count >= FBatch;
+    if LComplete then
+      FClosed := True;
   finally
     FLock.Leave;
   end;
@@ -510,10 +590,25 @@ begin
 
   FLock.Enter;
   try
+    { A cancel means the connection died under us, and that is not the same
+      answer as an empty stream. Unless the batch had already finished - then
+      what was collected is still a valid result, exactly as TNatsRequestWaiter
+      keeps a reply that arrived before Cancel }
+    if FCancelled and not FClosed then
+      raise ENatsException.Create(
+        'The connection was closed while waiting for a batch');
+
     Result := FMessages.ToArray;
   finally
     FLock.Leave;
   end;
+end;
+
+function TJetStreamFetch.GetCloseStatus: Integer;
+begin
+  { Written by Deliver under the lock before the event was set, and read after
+    WaitFor returned - the waiter's own lock acquire orders the read }
+  Result := FCloseStatus;
 end;
 
 { EJetStreamApiError }
@@ -765,6 +860,7 @@ var
   LFetch: IJetStreamFetch;
   LInbox, LSubject: string;
   LId: Integer;
+  LInfo: TJetStreamConsumerInfo;
 begin
   CheckName('stream', AStream);
   CheckName('consumer', AConsumer);
@@ -772,25 +868,59 @@ begin
   if ARequest.Batch < 1 then
     raise ENatsException.CreateFmt('A batch of %d asks for nothing', [ARequest.Batch]);
 
+  { A zero wait returns immediately with an empty array, which reads exactly
+    like "the consumer is empty". It only happens when the context's own
+    Timeout was set to 0 - Fetch(0) and FetchNoWait mean "use the context's
+    Timeout" - and RequestSync refuses the same value, so this does too }
+  if AWaitMs = 0 then
+    raise ENatsException.Create('A fetch timeout of 0 would wait forever');
+
   LSubject := ApiSubject(JetStreamConstants.Api.CONSUMER_MSG_NEXT, [AStream, AConsumer]);
   LInbox := FConnection.GetNewInbox;
   LFetch := TJetStreamFetch.Create(FConnection, ARequest.Batch);
 
-  { A batch is emphatically NOT a RequestSync: the server answers with up to
-    Batch separate messages and then a status to close them out, where
-    RequestSync takes the first reply and stops }
-  LId := FConnection.Subscribe(LInbox,
-    procedure (const AMsg: TNatsArgsMSG)
-    begin
-      LFetch.Deliver(AMsg);
-    end);
+  { Registered with the connection's pending-request machinery BEFORE the
+    subscription exists, exactly as RequestSync does it: a connection torn down
+    at any point from here on releases this wait instead of stranding it until
+    its own timeout. A batch is emphatically NOT a RequestSync - the server
+    answers with up to Batch separate messages and then a status to close them
+    out, where RequestSync takes the first reply and stops - but the teardown
+    contract is the same }
+  FConnection.AddPendingRequest(LFetch);
   try
-    FConnection.Publish(LSubject, TJetStreamJSON.ToJSON<TJetStreamNextRequest>(ARequest), LInbox);
-    Result := LFetch.WaitFor(AWaitMs);
+    LId := FConnection.Subscribe(LInbox,
+      procedure (const AMsg: TNatsArgsMSG)
+      begin
+        LFetch.Deliver(AMsg);
+      end);
+    try
+      FConnection.Publish(LSubject, TJetStreamJSON.ToJSON<TJetStreamNextRequest>(ARequest), LInbox);
+      Result := LFetch.WaitFor(AWaitMs);
+
+      { A batch closed by a 409 with nothing collected deserves a second look:
+        the usual cause is asking a PUSH consumer to pull - a misuse that would
+        otherwise repeat forever, each time looking exactly like an empty
+        consumer. Verify once, only when the result is already suspicious, so
+        the happy path pays nothing and a genuine transient conflict (MaxWaiting
+        exceeded) keeps its documented "short batch is a result" meaning }
+      if (Length(Result) = 0) and
+         (LFetch.GetCloseStatus = NatsConstants.Status.CONFLICT) then
+      begin
+        LInfo := ConsumerInfo(AStream, AConsumer);
+
+        if not LInfo.Config.DeliverSubject.IsEmpty then
+          raise ENatsException.CreateFmt(
+            'Consumer [%s] on stream [%s] is a PUSH consumer - use SubscribePush ' +
+            'instead of Fetch or Next', [AConsumer, AStream]);
+      end;
+    finally
+      { On every exit path, exactly as RequestSync does. Without it each fetch
+        leaves one inbox subscribed here and on the server }
+      FConnection.Unsubscribe(LId, 0);
+    end;
   finally
-    { On every exit path, exactly as RequestSync does. Without it each fetch
-      leaves one inbox subscribed here and on the server }
-    FConnection.Unsubscribe(LId, 0);
+    { No-op when the teardown already emptied the list }
+    FConnection.RemovePendingRequest(LFetch);
   end;
 end;
 
@@ -808,6 +938,14 @@ begin
     LExpiry := LWait - FETCH_EXPIRY_MARGIN
   else
     LExpiry := FETCH_MIN_EXPIRY;
+
+  { ...but never a LONGER one: a request the caller has already given up on
+    would sit against the consumer's MaxWaiting until its own expiry - exactly
+    the accumulation the margin exists to prevent. The floor above can exceed
+    a very short wait, so clamp. For the shortest waits the two deadlines
+    coincide, which is a harmless race: both end at the same instant }
+  if LExpiry > LWait then
+    LExpiry := LWait;
 
   LRequest := Default(TJetStreamNextRequest);
   LRequest.Batch := ABatch;
@@ -874,13 +1012,24 @@ begin
     begin
       if AMsg.HasStatus then
       begin
-        { A flow-control request carries a reply-to and MUST be answered, or
-          the server stops sending on this subject. An idle heartbeat has none
-          and only needs swallowing. Either way it is control, not data, and
-          handing it to the application would give it a phantom empty message
-          it could not ack }
-        if not AMsg.ReplyTo.IsEmpty then
+        { 100 is both the idle heartbeat and the flow-control request, and the
+          reply-to tells them apart: a heartbeat has none, a flow-control
+          request has the subject to answer on. The answer MUST be sent or the
+          server stops delivering on this subject. Any OTHER status is not
+          data either, but answering it would be wrong - swallow it }
+        if (AMsg.Status = NatsConstants.Status.IDLE_HEARTBEAT) and
+           (not AMsg.ReplyTo.IsEmpty) then
           LConnection.Publish(AMsg.ReplyTo, String.Empty);
+        Exit;
+      end;
+
+      { Older servers sent the flow-control request as an ordinary message
+        carrying the Nats-Flow-Control header rather than a status line. Same
+        contract: answer it, do not deliver it }
+      if (not AMsg.ReplyTo.IsEmpty) and
+         (AMsg.Headers.GetHeader(JetStreamConstants.Header.FLOW_CONTROL) <> '') then
+      begin
+        LConnection.Publish(AMsg.ReplyTo, String.Empty);
         Exit;
       end;
 
@@ -1008,14 +1157,46 @@ begin
     ApiSubject(JetStreamConstants.Api.STREAM_LIST, []), LRequest);
 end;
 
-function TJetStreamContext.StreamNames(AOffset: Integer): TArray<string>;
+function TJetStreamContext.CollectAllNames(const ASubject: string; AOffset: Integer): TArray<string>;
 var
   LRequest: TJetStreamListRequest;
+  LResponse: TJetStreamNamesResponse;
+  LResult: TList<string>;
+  LName: string;
 begin
-  LRequest.Offset := AOffset;
+  LResult := TList<string>.Create;
+  try
+    repeat
+      LRequest.Offset := AOffset;
 
-  Result := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
-    ApiSubject(JetStreamConstants.Api.STREAM_NAMES, []), LRequest).Streams;
+      LResponse := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
+        ASubject, LRequest);
+
+      { One record serves both endpoints - STREAM.NAMES fills Streams,
+        CONSUMER.NAMES fills Consumers - so collecting both arrays is safe and
+        keeps this usable by either }
+      for LName in LResponse.Streams do
+        LResult.Add(LName);
+      for LName in LResponse.Consumers do
+        LResult.Add(LName);
+
+      { Advance by what actually came back, not by the server's echoed offset;
+        the empty-page guard stops a server that over-reports Total from
+        looping forever }
+      Inc(AOffset, Length(LResponse.Streams) + Length(LResponse.Consumers));
+    until (AOffset >= LResponse.Total) or
+          (Length(LResponse.Streams) + Length(LResponse.Consumers) = 0);
+
+    Result := LResult.ToArray;
+  finally
+    LResult.Free;
+  end;
+end;
+
+function TJetStreamContext.StreamNames(AOffset: Integer): TArray<string>;
+begin
+  Result := CollectAllNames(
+    ApiSubject(JetStreamConstants.Api.STREAM_NAMES, []), AOffset);
 end;
 
 function TJetStreamContext.GetMsg(const AStream: string;
@@ -1029,12 +1210,14 @@ begin
       ApiSubject(JetStreamConstants.Api.STREAM_MSG_GET, [AStream]), ARequest).Message;
     Result := True;
   except
-    { "No message found" is the ordinary answer to asking for a key that was
-      never set, so it is reported rather than raised. Every OTHER API error -
-      the stream missing, a bad request - still propagates }
+    { "No message found" (err_code 10037) is the ordinary answer to asking for
+      a key that was never set, so it is reported rather than raised. The
+      discrimination has to be on err_code, not on the HTTP-like code:
+      "stream not found" (10059) also carries 404, and a missing bucket is NOT
+      "the key is absent" - it is a real error the caller should see }
     on E: EJetStreamApiError do
     begin
-      if not E.IsNotFound then
+      if E.ErrCode <> JetStreamConstants.ErrCode.NO_MESSAGE_FOUND then
         raise;
       Result := False;
     end;
@@ -1127,14 +1310,11 @@ end;
 
 function TJetStreamContext.ConsumerNames(const AStream: string;
   AOffset: Integer): TArray<string>;
-var
-  LRequest: TJetStreamListRequest;
 begin
   CheckName('stream', AStream);
-  LRequest.Offset := AOffset;
 
-  Result := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
-    ApiSubject(JetStreamConstants.Api.CONSUMER_NAMES, [AStream]), LRequest).Consumers;
+  Result := CollectAllNames(
+    ApiSubject(JetStreamConstants.Api.CONSUMER_NAMES, [AStream]), AOffset);
 end;
 
 end.

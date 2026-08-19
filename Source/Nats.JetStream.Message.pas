@@ -136,6 +136,12 @@ type
     ///   Ack and wait for the server to confirm. BLOCKS, so it must never be
     ///   called from a message handler - see the remarks on TJetStreamContext
     /// </summary>
+    /// <remarks>
+    ///   Raises EJetStreamAckError if there is no confirmation within
+    ///   ATimeoutMs, or if the connection dies while waiting - in both cases
+    ///   the ack was published, so it may or may not have been recorded, and
+    ///   the message stays settled either way
+    /// </remarks>
     procedure AckSync(ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT);
     /// Could not handle it: redeliver, and do not wait out AckWait first
     procedure Nak; overload;
@@ -255,8 +261,15 @@ begin
 
   { Count FIRST, then index. V1 has no domain and no account hash, so reading it
     at V2 positions does not fail - it silently returns the wrong field for
-    every single one, and they all look like plausible values. V2 is a minimum
-    rather than an equality because a later server may append tokens }
+    every single one, and they all look like plausible values. A subject is
+    either exactly V1 (9 tokens) or at least V2 (12: a MINIMUM, not an
+    equality, because a later server may append tokens). The 10-11 gap is
+    refused on purpose: those shapes have no defined layout - the domain and
+    account hash a V2 adds could sit in either order, or one of them could be
+    the trailing random token - so parsing them would be a guess that reports
+    wrong metadata with every field looking plausible. If a real server ever
+    emits 10-11 tokens, lower V2_TOKEN_COUNT's floor and extend the V1
+    normalisation below }
   if (Length(LTokens) <> JetStreamConstants.Ack.V1_TOKEN_COUNT) and
      (Length(LTokens) < JetStreamConstants.Ack.V2_TOKEN_COUNT) then
     Exit;
@@ -404,17 +417,31 @@ end;
 procedure TJetStreamMsg.AckSync(ATimeoutMs: Cardinal);
 var
   LReply: TNatsArgsMSG;
+  LFailure: string;
 begin
   CheckAckable;
   FAcknowledged := True;
 
   { The server answers an ack sent as a request, which is the only way to know
     it was recorded rather than merely written to a socket }
-  if not FConnection.RequestSync(FData.ReplyTo,
-       JetStreamConstants.Ack.PAYLOAD_ACK, LReply, ATimeoutMs) then
+  try
+    if not FConnection.RequestSync(FData.ReplyTo,
+         JetStreamConstants.Ack.PAYLOAD_ACK, LReply, ATimeoutMs) then
+      LFailure := Format('no confirmation within %d ms', [ATimeoutMs]);
+  except
+    { RequestSync raises a bare ENatsException when the connection dies while
+      waiting. That is the same "unconfirmed" failure as a timeout, so it gets
+      the same exception type and the same honest message - before this, the
+      two ways to fail surfaced as two different exception types }
+    on E: ENatsException do
+      LFailure := E.Message;
+  end;
+
+  if LFailure <> '' then
     raise EJetStreamAckError.CreateFmt(
-      'The server did not confirm the ack for message %d of stream [%s] within %d ms',
-      [FMetadata.StreamSeq, FMetadata.Stream, ATimeoutMs]);
+      'Could not confirm the ack for message %d of stream [%s]: %s. The ack ' +
+      'was published, so it may or may not have been recorded',
+      [FMetadata.StreamSeq, FMetadata.Stream, LFailure]);
 end;
 
 procedure TJetStreamMsg.Nak;

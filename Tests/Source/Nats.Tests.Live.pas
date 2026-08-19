@@ -42,6 +42,7 @@ uses
   Nats.Nuid,
   Nats.Exceptions,
   Nats.JetStream.Client,
+  Nats.JetStream.Consts,
   Nats.JetStream.Entities,
   Nats.JetStream.Message,
   Nats.JetStream.KV,
@@ -144,6 +145,9 @@ type
     // back, so anything it did not understand returns as ITS default
     [Test]
     procedure StreamConfig_SurvivesTheServerUnchanged;
+    /// The F7 fix: a page size smaller than the account must not hide streams
+    [Test]
+    procedure StreamNames_PagesThroughEverything;
     [Test]
     procedure Stream_CapturesPublishedMessages;
     [Test]
@@ -219,6 +223,9 @@ type
     procedure Put_Again_OverwritesAndBumpsTheRevision;
     [Test]
     procedure Get_MissingKey_ReportsNotFound;
+    /// The F5 fix: a missing bucket is a 10059, and it must raise, not read as an unset key
+    [Test]
+    procedure Get_MissingBucket_Raises;
     [Test]
     procedure BinaryValue_SurvivesTheBase64RoundTrip;
     [Test]
@@ -243,6 +250,9 @@ type
     procedure History_ShowsEveryRevisionOldestFirst;
     [Test]
     procedure History_IsBoundedByTheBucketsHistorySetting;
+    /// The F6 fix: Values counts keys, not messages, tombstones included
+    [Test]
+    procedure Status_Values_CountsKeysNotMessages;
   end;
 
   /// <summary>
@@ -293,8 +303,17 @@ type
     /// A truncated object must be reported, not returned short
     [Test]
     procedure Get_WithItsChunksPurged_Raises;
+    /// The F13 fix: a failed read must not leave a stream that looks complete
+    [Test]
+    procedure Get_FailedRead_LeavesTheDestinationRolledBack;
     [Test]
     procedure PutFileAndGetFile_RoundTrip;
+    /// The F4 fix: short reads must not truncate an upload
+    [Test]
+    procedure Put_PartialReads_StillStoresTheWholeObject;
+    /// A stream that says EOF while claiming more must be refused, not stored short
+    [Test]
+    procedure Put_StreamEndingEarly_Raises;
   end;
 
 implementation
@@ -327,6 +346,47 @@ begin
   // see UseMockSocket: the registry default is process-wide
   Inc(GLiveSwitchCount);
   TNatsSocketRegistry.Register<TNatsSocketIndy>(Format('IndyLive#%d', [GLiveSwitchCount]), True);
+end;
+
+type
+  { Hands out at most ALimit bytes per Read call. A Put that stops on the first
+    short read - the defect Put_PartialReads_StillStoresTheWholeObject pins -
+    would store only ALimit bytes, with the digest computed over exactly those,
+    so a Get would come back short with nothing having raised. Size is honest,
+    so the store's own completeness check is satisfied once the whole object
+    really has been read. }
+  TShortReadStream = class(TBytesStream)
+  private
+    FLimit: Integer;
+  public
+    constructor Create(const AData: TBytes; ALimit: Integer);
+    function Read(var Buffer; Count: Longint): Longint; override;
+  end;
+
+  { Claims more bytes than it will ever hand out: Read returns 0 while
+    Position is still short of the declared Size. The store must refuse the
+    upload rather than record a digest of the bytes it did manage to read. }
+  TShortStream = class(TBytesStream)
+  public
+    function GetSize: Int64; override;
+  end;
+
+constructor TShortReadStream.Create(const AData: TBytes; ALimit: Integer);
+begin
+  inherited Create(AData);
+  FLimit := ALimit;
+end;
+
+function TShortReadStream.Read(var Buffer; Count: Longint): Longint;
+begin
+  if Count > FLimit then
+    Count := FLimit;
+  Result := inherited Read(Buffer, Count);
+end;
+
+function TShortStream.GetSize: Int64;
+begin
+  Result := inherited GetSize + 1000;
 end;
 
 { TNatsLiveServerTests }
@@ -821,6 +881,60 @@ begin
       FJs.StreamInfo(FStream);
     end,
     EJetStreamApiError);
+end;
+
+procedure TJetStreamLiveTests.StreamNames_PagesThroughEverything;
+const
+  EXTRA = 256;   // one more than the server's fixed page size
+var
+  LConfig: TJetStreamStreamConfig;
+  LNames: TArray<string>;
+  LName: string;
+  LIndex: Integer;
+  LCount: Integer;
+begin
+  Connect;
+
+  { The server fixes the page size at 256 and accepts only offset in the
+    request, so the only honest way to force a second page is to own more
+    streams than one page holds. 256 extra plus FStream = 257 }
+  try
+    for LIndex := 1 to EXTRA do
+    begin
+      LConfig := Default(TJetStreamStreamConfig);
+      LConfig.Name := FStream + '_' + LIndex.ToString;
+      LConfig.Subjects := [LConfig.Name + '.>'];
+      LConfig.Storage := TJetStreamStorage.Memory;
+      FJs.AddStream(LConfig);
+    end;
+
+    LConfig := Default(TJetStreamStreamConfig);
+    LConfig.Name := FStream;
+    LConfig.Subjects := [FStream + '.>'];
+    LConfig.Storage := TJetStreamStorage.Memory;
+    FJs.AddStream(LConfig);
+
+    LNames := FJs.StreamNames;
+
+    { Every one of the 257 must come back, not just the first page of 256.
+      Leftover streams from a crashed run only add names beyond these, so it is
+      OUR streams that are counted, not the total }
+    LCount := 0;
+    for LName in LNames do
+      if LName.StartsWith(FStream + '_') or (LName = FStream) then
+        Inc(LCount);
+
+    Assert.AreEqual(EXTRA + 1, LCount,
+      'a stream past the first page must not be silently missing');
+  finally
+    { FStream itself is dropped by TearDown }
+    for LIndex := 1 to EXTRA do
+      try
+        FJs.DeleteStream(FStream + '_' + LIndex.ToString);
+      except
+        on E: EJetStreamApiError do ;   // never created, or already gone
+      end;
+  end;
 end;
 
 procedure TJetStreamLiveTests.StreamConfig_SurvivesTheServerUnchanged;
@@ -1540,6 +1654,26 @@ begin
   Assert.AreEqual('fallback', FKV.Get('never_set', 'fallback'));
 end;
 
+procedure TJetStreamKVLiveTests.Get_MissingBucket_Raises;
+var
+  LEntry: TKVEntry;
+begin
+  Connect;
+  { Bind WITHOUT creating the bucket - the constructor makes no round trip, so
+    this really is "the bucket does not exist", not a handle on one }
+  FKV := TJetStreamKV.Create(FJs, FBucket);
+
+  { The mock pins the discrimination on err_code 10037 vs 10059; this proves a
+    real server answers STREAM.MSG.GET on a missing stream with 10059 - and
+    that Get therefore raises instead of reading it as an unset key }
+  Assert.WillRaise(
+    procedure
+    begin
+      FKV.Get('name', LEntry);
+    end,
+    EJetStreamApiError);
+end;
+
 procedure TJetStreamKVLiveTests.BinaryValue_SurvivesTheBase64RoundTrip;
 var
   LValue: TBytes;
@@ -1772,6 +1906,33 @@ begin
   Assert.AreEqual(2, Length(LHistory), 'only the configured number of revisions is kept');
   Assert.AreEqual('two', LHistory[0].ValueString, 'the oldest was dropped');
   Assert.AreEqual('three', LHistory[1].ValueString);
+end;
+
+procedure TJetStreamKVLiveTests.Status_Values_CountsKeysNotMessages;
+var
+  LStatus: TJetStreamKVStatus;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 3));
+
+  { Two revisions of a, one each of b and c, then a tombstone for b }
+  FKV.Put('a', 'one');
+  FKV.Put('a', 'two');
+  FKV.Put('b', 'one');
+  FKV.Put('c', 'one');
+  FKV.Delete('b');
+
+  LStatus := FKV.Status;
+
+  { Five messages live in the stream, but only three SUBJECTS hold them: a
+    (two revisions), b (its tombstone), c. Values must be the key count with
+    the tombstoned key still counted - the old code returned the message
+    count, which was right only for a History=1 bucket with no deletes. This
+    also proves nats-server's num_subjects is what the KV layer expects }
+  Assert.AreEqual(UInt64(3), LStatus.Values,
+    'Values counts keys with a message, tombstones included');
+  Assert.IsTrue(LStatus.Bytes > 0, 'the stored bytes are reported');
+  Assert.AreEqual(2, Length(FKV.Keys), 'two live keys besides the tombstone');
 end;
 
 { TJetStreamObjectStoreLiveTests }
@@ -2068,6 +2229,46 @@ begin
     EJetStreamObjectError);
 end;
 
+procedure TJetStreamObjectStoreLiveTests.Get_FailedRead_LeavesTheDestinationRolledBack;
+var
+  LInfo: TJetStreamObjectInfo;
+  LDest: TBytesStream;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LInfo := FOs.Put('doomed.bin', Pattern(5 * 1024));
+
+  { Rewrite the metadata with a WRONG digest - the chunks are all still there,
+    so the read writes every byte to the destination and only then fails the
+    digest check. That is the case the rollback exists for }
+  LInfo.Digest := 'SHA-256=Zm9v';   // deliberately wrong
+  LInfo.Mtime := '2026-08-13T00:00:00Z';
+  FJs.Publish(
+    Format('$O.%s.M.%s', [FBucket, TObjectStoreEncoding.Encode('doomed.bin')]),
+    TJetStreamJSON.ToJSON<TJetStreamObjectInfo>(LInfo),
+    TJetStreamPubOptions.New.WithHeader(
+      JetStreamConstants.Header.ROLLUP, JetStreamConstants.Header.ROLLUP_SUBJECT));
+
+  LDest := TBytesStream.Create;
+  try
+    Assert.WillRaise(
+      procedure
+      begin
+        FOs.Get('doomed.bin', LDest);
+      end,
+      EJetStreamObjectError);
+
+    { All 5 KB reached the destination before the digest check failed - without
+      the rollback a caller catching the exception would be left with a stream
+      that looks exactly like a successful partial download }
+    Assert.AreEqual(Int64(0), LDest.Size, 'the partial bytes must be rolled back');
+    Assert.AreEqual(Int64(0), LDest.Position, 'and the position restored');
+  finally
+    LDest.Free;
+  end;
+end;
+
 procedure TJetStreamObjectStoreLiveTests.PutFileAndGetFile_RoundTrip;
 var
   LSource, LTarget: string;
@@ -2093,6 +2294,64 @@ begin
       TFile.Delete(LSource);
     if TFile.Exists(LTarget) then
       TFile.Delete(LTarget);
+  end;
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Put_PartialReads_StillStoresTheWholeObject;
+var
+  LData, LBack: TBytes;
+  LStream: TShortReadStream;
+  LInfo: TJetStreamObjectInfo;
+  LIndex: Integer;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LData := Pattern(5 * 1024 + 123);
+  LStream := TShortReadStream.Create(LData, 300);
+  try
+    LInfo := FOs.Put('short-reads.bin', LStream);
+  finally
+    LStream.Free;
+  end;
+
+  { The old loop stopped on the FIRST short read, so only 300 of these bytes
+    would have been stored - and the digest was computed over those 300, so a
+    Get would come back short with nothing having raised. The whole object has
+    to land }
+  Assert.AreEqual(UInt64(Length(LData)), LInfo.Size,
+    'a stream that reads in dribs and drabs must still be stored whole');
+  Assert.IsTrue(LInfo.Chunks > 1, 'the short reads must produce several chunks');
+
+  Assert.IsTrue(FOs.Get('short-reads.bin', LBack));
+  Assert.AreEqual(Length(LData), Length(LBack), 'the whole object came back');
+  for LIndex := 0 to High(LData) do
+    if LData[LIndex] <> LBack[LIndex] then
+      Assert.Fail(Format('byte %d differs: stored %d, got %d',
+        [LIndex, LData[LIndex], LBack[LIndex]]));
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Put_StreamEndingEarly_Raises;
+var
+  LStream: TShortStream;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LStream := TShortStream.Create(Pattern(1024));
+  try
+    { A stream that claims a size it will never deliver: storing the bytes it
+      did hand out would produce an object whose digest matches a truncated
+      upload, exactly the silent corruption the completeness check exists to
+      stop }
+    Assert.WillRaise(
+      procedure
+      begin
+        FOs.Put('short.bin', LStream);
+      end,
+      EJetStreamObjectError);
+  finally
+    LStream.Free;
   end;
 end;
 

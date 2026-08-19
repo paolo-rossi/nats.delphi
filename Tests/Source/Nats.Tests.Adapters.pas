@@ -260,6 +260,10 @@ type
 
     [Test]
     procedure MaxPayload_IsTakenFromInfo;
+    // F10: max_payload * 2 overflows Integer above ~1 GiB - the line cap must
+    // be a fixed ceiling, not something derived from max_payload
+    [Test]
+    procedure MaxLineLength_IsNotScaledOffMaxPayload;
     [Test]
     procedure Publish_OversizedPayload_Raises;
     [Test]
@@ -302,6 +306,15 @@ const
   INFO_JSON_SMALL =
     '{"server_id":"NDHJZQZ4YQXQ","server_name":"nats-1","version":"2.10.11",' +
     '"proto":1,"host":"0.0.0.0","port":4222,"headers":true,"max_payload":32,' +
+    '"jetstream":true,"client_id":7,"client_ip":"127.0.0.1"}';
+
+  /// <summary>
+  ///   The same server declaring a max_payload above ~1 GiB, where the old
+  ///   "max_payload * 2" line-cap calculation overflowed Integer
+  /// </summary>
+  INFO_JSON_HUGE_MAX_PAYLOAD =
+    '{"server_id":"NDHJZQZ4YQXQ","server_name":"nats-1","version":"2.10.11",' +
+    '"proto":1,"host":"0.0.0.0","port":4222,"headers":true,"max_payload":2147483647,' +
     '"jetstream":true,"client_id":7,"client_ip":"127.0.0.1"}';
 
 { TNatsSocketRegistryTests }
@@ -1505,6 +1518,22 @@ begin
 
   Assert.AreEqual(SMALL_MAX_PAYLOAD, FConn.MaxPayload,
     'the limit must be taken from the server''s INFO');
+end;
+
+procedure TNatsConnectionProtocolTests.MaxLineLength_IsNotScaledOffMaxPayload;
+var
+  LSocket: INatsSocket;
+begin
+  { max_payload * 2 overflows Integer above ~1 GiB: the old code wrapped to a
+    negative value and assigned a nonsense Cardinal cap (here: 4294967294).
+    Control lines never carry payloads, so the cap must be a fixed, generous
+    ceiling whatever the server declares }
+  LSocket := FSocket;
+
+  OpenAndHandshake(INFO_JSON_HUGE_MAX_PAYLOAD);
+
+  Assert.AreEqual(Cardinal(1024 * 1024), LSocket.MaxLineLength,
+    'the line cap must be the fixed constant, not something derived from max_payload');
 end;
 
 procedure TNatsConnectionProtocolTests.Publish_OversizedPayload_Raises;
