@@ -198,6 +198,14 @@ type
     ///   dot in it would address a different endpoint, not fail
     /// </summary>
     procedure CheckName(const AKind, AName: string);
+    /// <summary>
+    ///   Pages through a *.NAMES endpoint until the server's Total is reached,
+    ///   collecting every name. The server fixes the page size (256), so the
+    ///   loop advances by what came back and stops on Total. A bare names
+    ///   array carries no metadata, so a single page would silently drop
+    ///   everything past it
+    /// </summary>
+    function CollectAllNames(const ASubject: string; AOffset: Integer): TArray<string>;
   public
     constructor Create(AConnection: TNatsConnection; const ADomain: string = '');
 
@@ -344,7 +352,18 @@ type
     /// </summary>
     function PurgeStream(const AStream: string;
       const ARequest: TJetStreamPurgeRequest): UInt64; overload;
+    /// <summary>
+    ///   ONE page of streams, starting at AOffset. The response carries Total,
+    ///   so a caller pages with ListStreams(AOffset + Length(Streams)) - or
+    ///   uses StreamNames for the whole list without the envelope
+    /// </summary>
     function ListStreams(AOffset: Integer = 0): TJetStreamStreamListResponse;
+    /// <summary>
+    ///   Every stream name, paged through internally until the server's Total
+    ///   is reached. A single page (the server fixes it at 256) would silently
+    ///   drop everything past it, and a bare name array has no metadata to
+    ///   notice the truncation with
+    /// </summary>
     function StreamNames(AOffset: Integer = 0): TArray<string>;
 
     /// <summary>
@@ -377,7 +396,15 @@ type
       const AConfig: TJetStreamConsumerConfig): TJetStreamConsumerInfo;
     function ConsumerInfo(const AStream, AConsumer: string): TJetStreamConsumerInfo;
     function DeleteConsumer(const AStream, AConsumer: string): Boolean;
+    /// <summary>
+    ///   ONE page of consumers on AStream, starting at AOffset - page with the
+    ///   returned Total, or use ConsumerNames for the whole list
+    /// </summary>
     function ListConsumers(const AStream: string; AOffset: Integer = 0): TJetStreamConsumerListResponse;
+    /// <summary>
+    ///   Every consumer name on AStream, paged through internally until the
+    ///   server's Total is reached
+    /// </summary>
     function ConsumerNames(const AStream: string; AOffset: Integer = 0): TArray<string>;
 
     /// Empty unless this context was built for a JetStream domain
@@ -1065,14 +1092,46 @@ begin
     ApiSubject(JetStreamConstants.Api.STREAM_LIST, []), LRequest);
 end;
 
-function TJetStreamContext.StreamNames(AOffset: Integer): TArray<string>;
+function TJetStreamContext.CollectAllNames(const ASubject: string; AOffset: Integer): TArray<string>;
 var
   LRequest: TJetStreamListRequest;
+  LResponse: TJetStreamNamesResponse;
+  LResult: TList<string>;
+  LName: string;
 begin
-  LRequest.Offset := AOffset;
+  LResult := TList<string>.Create;
+  try
+    repeat
+      LRequest.Offset := AOffset;
 
-  Result := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
-    ApiSubject(JetStreamConstants.Api.STREAM_NAMES, []), LRequest).Streams;
+      LResponse := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
+        ASubject, LRequest);
+
+      { One record serves both endpoints - STREAM.NAMES fills Streams,
+        CONSUMER.NAMES fills Consumers - so collecting both arrays is safe and
+        keeps this usable by either }
+      for LName in LResponse.Streams do
+        LResult.Add(LName);
+      for LName in LResponse.Consumers do
+        LResult.Add(LName);
+
+      { Advance by what actually came back, not by the server's echoed offset;
+        the empty-page guard stops a server that over-reports Total from
+        looping forever }
+      Inc(AOffset, Length(LResponse.Streams) + Length(LResponse.Consumers));
+    until (AOffset >= LResponse.Total) or
+          (Length(LResponse.Streams) + Length(LResponse.Consumers) = 0);
+
+    Result := LResult.ToArray;
+  finally
+    LResult.Free;
+  end;
+end;
+
+function TJetStreamContext.StreamNames(AOffset: Integer): TArray<string>;
+begin
+  Result := CollectAllNames(
+    ApiSubject(JetStreamConstants.Api.STREAM_NAMES, []), AOffset);
 end;
 
 function TJetStreamContext.GetMsg(const AStream: string;
@@ -1186,14 +1245,11 @@ end;
 
 function TJetStreamContext.ConsumerNames(const AStream: string;
   AOffset: Integer): TArray<string>;
-var
-  LRequest: TJetStreamListRequest;
 begin
   CheckName('stream', AStream);
-  LRequest.Offset := AOffset;
 
-  Result := ApiRequest<TJetStreamListRequest, TJetStreamNamesResponse>(
-    ApiSubject(JetStreamConstants.Api.CONSUMER_NAMES, [AStream]), LRequest).Consumers;
+  Result := CollectAllNames(
+    ApiSubject(JetStreamConstants.Api.CONSUMER_NAMES, [AStream]), AOffset);
 end;
 
 end.

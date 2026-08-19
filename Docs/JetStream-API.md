@@ -208,7 +208,8 @@ LPurge.Keep := 100;                               // ...keeping the last 100
 LJs.PurgeStream('EVENTS', LPurge);
 ```
 
-Listing is paged. `Total` is how many exist, not how many are in this page:
+Listing is paged. `ListStreams` / `ListConsumers` return ONE page and
+`Total` is how many exist, not how many are in this page — so page manually:
 
 ```pascal
 var LOffset := 0;
@@ -219,6 +220,9 @@ repeat
   Inc(LOffset, Length(LPage.Streams));
 until (LOffset >= LPage.Total) or (Length(LPage.Streams) = 0);
 ```
+
+`StreamNames` and `ConsumerNames` page through internally — they return the
+whole list, so the loop above is only needed for the `List*` forms.
 
 **Names are checked before they go anywhere.** A stream or consumer name goes
 into the API subject verbatim, so a `.`, `*`, `>` or whitespace would address a

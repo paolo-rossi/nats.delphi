@@ -144,6 +144,9 @@ type
     // back, so anything it did not understand returns as ITS default
     [Test]
     procedure StreamConfig_SurvivesTheServerUnchanged;
+    /// The F7 fix: a page size smaller than the account must not hide streams
+    [Test]
+    procedure StreamNames_PagesThroughEverything;
     [Test]
     procedure Stream_CapturesPublishedMessages;
     [Test]
@@ -874,6 +877,60 @@ begin
       FJs.StreamInfo(FStream);
     end,
     EJetStreamApiError);
+end;
+
+procedure TJetStreamLiveTests.StreamNames_PagesThroughEverything;
+const
+  EXTRA = 256;   // one more than the server's fixed page size
+var
+  LConfig: TJetStreamStreamConfig;
+  LNames: TArray<string>;
+  LName: string;
+  LIndex: Integer;
+  LCount: Integer;
+begin
+  Connect;
+
+  { The server fixes the page size at 256 and accepts only offset in the
+    request, so the only honest way to force a second page is to own more
+    streams than one page holds. 256 extra plus FStream = 257 }
+  try
+    for LIndex := 1 to EXTRA do
+    begin
+      LConfig := Default(TJetStreamStreamConfig);
+      LConfig.Name := FStream + '_' + LIndex.ToString;
+      LConfig.Subjects := [LConfig.Name + '.>'];
+      LConfig.Storage := TJetStreamStorage.Memory;
+      FJs.AddStream(LConfig);
+    end;
+
+    LConfig := Default(TJetStreamStreamConfig);
+    LConfig.Name := FStream;
+    LConfig.Subjects := [FStream + '.>'];
+    LConfig.Storage := TJetStreamStorage.Memory;
+    FJs.AddStream(LConfig);
+
+    LNames := FJs.StreamNames;
+
+    { Every one of the 257 must come back, not just the first page of 256.
+      Leftover streams from a crashed run only add names beyond these, so it is
+      OUR streams that are counted, not the total }
+    LCount := 0;
+    for LName in LNames do
+      if LName.StartsWith(FStream + '_') or (LName = FStream) then
+        Inc(LCount);
+
+    Assert.AreEqual(EXTRA + 1, LCount,
+      'a stream past the first page must not be silently missing');
+  finally
+    { FStream itself is dropped by TearDown }
+    for LIndex := 1 to EXTRA do
+      try
+        FJs.DeleteStream(FStream + '_' + LIndex.ToString);
+      except
+        on E: EJetStreamApiError do ;   // never created, or already gone
+      end;
+  end;
 end;
 
 procedure TJetStreamLiveTests.StreamConfig_SurvivesTheServerUnchanged;

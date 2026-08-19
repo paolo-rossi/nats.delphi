@@ -250,6 +250,8 @@ type
     [Test]
     procedure StreamNames_ReturnsTheNames;
     [Test]
+    procedure StreamNames_PagesUntilTotalIsReached;
+    [Test]
     procedure AccountInfo_ParsesLimitsAndUsage;
 
     { errors - the reason ApiRequest is a choke point }
@@ -1773,6 +1775,91 @@ begin
   Assert.AreEqual(2, Length(LNames));
   Assert.AreEqual('ORDERS', LNames[0]);
   Assert.AreEqual('EVENTS', LNames[1]);
+end;
+
+procedure TJetStreamContextTests.StreamNames_PagesUntilTotalIsReached;
+var
+  LSocket: TNatsMockSocket;
+  LNames: TArray<string>;
+begin
+  OpenAndHandshake;
+  LSocket := FSocket;
+
+  { Serves TWO pages: the first carries 2 of the 4 names, the second the rest.
+    The old code returned the first page and stopped, so a caller with more
+    than one page of streams silently lost the tail }
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LPage, LSubCount, LIdx: Integer;
+      LDeadline: UInt64;
+      LLines, LParts: TArray<string>;
+      LLine: string;
+    begin
+      for LPage := 0 to 1 do
+      begin
+        { Wait until this request's SUB is on the wire; ClientText accumulates,
+          so the page's SUB is the (LPage+1)-th one. Bounded so a failed test
+          cannot leave TearDown joining a thread that spins forever }
+        LDeadline := TThread.GetTickCount64 + 3000;
+        while True do
+        begin
+          LSubCount := 0;
+          LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+          for LLine in LLines do
+            if LLine.StartsWith(NatsConstants.Protocol.SUB + ' ') then
+              Inc(LSubCount);
+          if LSubCount > LPage then
+            Break;
+          if TThread.GetTickCount64 > LDeadline then
+            Exit;
+          Sleep(10);
+        end;
+
+        { Find that SUB line for the inbox and sid of THIS request }
+        LSubCount := 0;
+        for LIdx := 0 to High(LLines) do
+          if LLines[LIdx].StartsWith(NatsConstants.Protocol.SUB + ' ') then
+          begin
+            Inc(LSubCount);
+            if LSubCount = LPage + 1 then
+            begin
+              LParts := LLines[LIdx].Split([NatsConstants.SPC]);
+              Break;
+            end;
+          end;
+
+        if LPage = 0 then
+          LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+            [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+             Length(TEncoding.UTF8.GetBytes(
+               '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":0,"limit":2,"streams":["A","B"]}')),
+             '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":0,"limit":2,"streams":["A","B"]}']))
+        else
+          LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+            [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+             Length(TEncoding.UTF8.GetBytes(
+               '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":2,"limit":2,"streams":["C","D"]}')),
+             '{"type":"io.nats.jetstream.api.v1.stream_names_response",' +
+               '"total":4,"offset":2,"limit":2,"streams":["C","D"]}']));
+      end;
+    end);
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+
+  { The server fixes the page size, so the mock returns 2-item pages with a
+    Total of 4 - without the paging loop the caller would see two names and
+    never learn there were four }
+  LNames := FJs.StreamNames;
+
+  Assert.AreEqual(4, Length(LNames), 'every page must be collected');
+  Assert.AreEqual('A', LNames[0]);
+  Assert.AreEqual('B', LNames[1]);
+  Assert.AreEqual('C', LNames[2]);
+  Assert.AreEqual('D', LNames[3]);
 end;
 
 procedure TJetStreamContextTests.AccountInfo_ParsesLimitsAndUsage;

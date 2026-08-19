@@ -389,8 +389,13 @@ type
     Config: TJetStreamConsumerConfig;
   end;
 
-  /// The body of the paged LIST and NAMES requests
+  /// <summary>
+  ///   The body of the paged LIST and NAMES requests. Offset is the only thing
+  ///   the server honours - the page size is fixed on its side (256) - so the
+  ///   paging loop terminates on the response's Total
+  /// </summary>
   TJetStreamListRequest = record
+    [NeonInclude(IncludeIf.NotDefault)]
     Offset: Integer;
   end;
 
