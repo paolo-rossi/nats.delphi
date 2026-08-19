@@ -79,6 +79,8 @@ type
     [Test]
     procedure TenTokens_Fails;
     [Test]
+    procedure ElevenTokens_Fails;
+    [Test]
     procedure NonNumericSequence_Fails;
     [Test]
     procedure FailedParse_LeavesMetadataEmpty;
@@ -850,6 +852,20 @@ begin
     which fields are missing }
   Assert.IsFalse(TJetStreamMsgMetadata.TryParse(
     '$JS.ACK.ORDERS.workers.3.42.7.1700000000123456789.5.extra', LMeta),
+    'a count between the two layouts is not a subject we can read');
+end;
+
+procedure TJetStreamMetadataTests.ElevenTokens_Fails;
+var
+  LMeta: TJetStreamMsgMetadata;
+begin
+  { The other half of the 10-11 gap, pinned so the boundary is explicit: the
+    domain and account hash a V2 adds could sit in either order in an
+    11-token subject, or one could be the trailing random token - no layout
+    to index, so refuse rather than report plausible-looking wrong metadata }
+  Assert.IsFalse(TJetStreamMsgMetadata.TryParse(
+    '$JS.ACK.hub.ORDERS.workers.3.42.7.1700000000123456789.5.extra1',
+    LMeta),
     'a count between the two layouts is not a subject we can read');
 end;
 

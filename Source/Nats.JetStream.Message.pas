@@ -261,8 +261,15 @@ begin
 
   { Count FIRST, then index. V1 has no domain and no account hash, so reading it
     at V2 positions does not fail - it silently returns the wrong field for
-    every single one, and they all look like plausible values. V2 is a minimum
-    rather than an equality because a later server may append tokens }
+    every single one, and they all look like plausible values. A subject is
+    either exactly V1 (9 tokens) or at least V2 (12: a MINIMUM, not an
+    equality, because a later server may append tokens). The 10-11 gap is
+    refused on purpose: those shapes have no defined layout - the domain and
+    account hash a V2 adds could sit in either order, or one of them could be
+    the trailing random token - so parsing them would be a guess that reports
+    wrong metadata with every field looking plausible. If a real server ever
+    emits 10-11 tokens, lower V2_TOKEN_COUNT's floor and extend the V1
+    normalisation below }
   if (Length(LTokens) <> JetStreamConstants.Ack.V1_TOKEN_COUNT) and
      (Length(LTokens) < JetStreamConstants.Ack.V2_TOKEN_COUNT) then
     Exit;

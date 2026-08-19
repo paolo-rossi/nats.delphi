@@ -275,7 +275,10 @@ type
       /// <summary>
       ///   V2 adds &lt;domain&gt;.&lt;account hash&gt; after ACK and a random
       ///   token at the end. This is a MINIMUM, not an equality: a later server
-      ///   may append further tokens, and appending must not break parsing
+      ///   may append further tokens, and appending must not break parsing. The
+      ///   10-11 gap below this floor is deliberately refused in TryParse -
+      ///   those shapes have no defined layout; lower the floor only if a real
+      ///   server ever emits them
       /// </summary>
       V2_TOKEN_COUNT = 12;
 
