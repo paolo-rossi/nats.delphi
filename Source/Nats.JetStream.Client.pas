@@ -904,6 +904,14 @@ begin
   else
     LExpiry := FETCH_MIN_EXPIRY;
 
+  { ...but never a LONGER one: a request the caller has already given up on
+    would sit against the consumer's MaxWaiting until its own expiry - exactly
+    the accumulation the margin exists to prevent. The floor above can exceed
+    a very short wait, so clamp. For the shortest waits the two deadlines
+    coincide, which is a harmless race: both end at the same instant }
+  if LExpiry > LWait then
+    LExpiry := LWait;
+
   LRequest := Default(TJetStreamNextRequest);
   LRequest.Batch := ABatch;
   LRequest.Expires := TJetStreamDuration.FromMillis(LExpiry);

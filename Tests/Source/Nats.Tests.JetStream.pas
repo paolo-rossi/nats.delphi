@@ -301,6 +301,8 @@ type
     [Test]
     procedure Fetch_ExpiryIsShorterThanTheCallersWait;
     [Test]
+    procedure Fetch_ServerExpiry_NeverExceedsTheCallersWait;
+    [Test]
     procedure Fetch_CollectsTheWholeBatch;
     [Test]
     procedure Fetch_MessagesCarryTheirMetadata;
@@ -2263,6 +2265,32 @@ begin
 
     { and nanoseconds, not milliseconds - a factor of a million }
     Assert.AreEqual(Int64(TJetStreamDuration.FromMillis(900)), LExpiresNanos);
+  finally
+    LBody.Free;
+  end;
+end;
+
+procedure TJetStreamContextTests.Fetch_ServerExpiry_NeverExceedsTheCallersWait;
+var
+  LBody: TJSONObject;
+begin
+  OpenAndHandshake;
+
+  CaptureRequest(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10, 10);   // a 10 ms wait
+    end);
+
+  { The floor used to be 50 ms even for a shorter wait, so a 10 ms wait gave
+    the server a 50 ms deadline: the caller gave up and unsubscribed while the
+    request kept counting against MaxWaiting until its own expiry. The server's
+    deadline must never outlive the caller's - 10 ms wait, 10 ms expiry }
+  LBody := TJSONObject.ParseJSONValue(RequestBody) as TJSONObject;
+  try
+    Assert.AreEqual(Int64(TJetStreamDuration.FromMillis(10)),
+      LBody.GetValue<Int64>('expires'),
+      'the server''s deadline must never exceed the caller''s own wait');
   finally
     LBody.Free;
   end;
