@@ -199,6 +199,11 @@ type
     /// </summary>
     procedure ReplyWithBatch(const APayloads: TArray<string>; AStatus: Integer;
       const ADescription: string; ALeadingStatus: Integer = 0);
+    /// <summary>
+    ///   Answers a pull request with a 409 conflict, then the CONSUMER.INFO
+    ///   request FetchRaw makes to verify whether the conflict was push-misuse
+    /// </summary>
+    procedure ReplyFetchConflictThenInfo(const AInfoJson: string);
     /// The subject of the PUB the client wrote
     function RequestSubject: string;
     /// The body of the PUB the client wrote
@@ -303,6 +308,10 @@ type
     [Test]
     procedure Fetch_ServerExpiry_NeverExceedsTheCallersWait;
     [Test]
+    procedure Fetch_OnAPushConsumer_Raises;
+    [Test]
+    procedure Fetch_TransientConflictOnPullConsumer_ReturnsEmpty;
+    [Test]
     procedure Fetch_CollectsTheWholeBatch;
     [Test]
     procedure Fetch_MessagesCarryTheirMetadata;
@@ -337,6 +346,10 @@ type
     procedure SubscribePush_DeliversWrappedMessages;
     [Test]
     procedure SubscribePush_FlowControl_IsAnswered;
+    [Test]
+    procedure SubscribePush_FlowControlHeader_IsAnswered;
+    [Test]
+    procedure SubscribePush_OtherStatusWithReplyTo_IsNotAnswered;
     [Test]
     procedure SubscribePush_StatusNeverReachesTheHandler;
   end;
@@ -1513,6 +1526,89 @@ begin
   FServerThread.Start;
 end;
 
+procedure TJetStreamContextTests.ReplyFetchConflictThenInfo(const AInfoJson: string);
+var
+  LSocket: TNatsMockSocket;
+begin
+  LSocket := FSocket;
+
+  { Two exchanges: the pull request first (answered with a 409 conflict, which
+    is how a push consumer rejects a pull request), then the CONSUMER.INFO that
+    FetchRaw performs to decide whether the conflict was push-misuse }
+  FServerThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LSubCount, LIdx: Integer;
+      LDeadline: UInt64;
+      LLines, LParts: TArray<string>;
+      LLine: string;
+    begin
+      { Wait for this request's SUB; ClientText accumulates, so the k-th SUB
+        line is the k-th request. Bounded so a failed test cannot leave
+        TearDown joining a thread that spins forever }
+      LDeadline := TThread.GetTickCount64 + 3000;
+      while True do
+      begin
+        LSubCount := 0;
+        LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+        for LLine in LLines do
+          if LLine.StartsWith(NatsConstants.Protocol.SUB + ' ') then
+            Inc(LSubCount);
+        if LSubCount > 0 then
+          Break;
+        if TThread.GetTickCount64 > LDeadline then
+          Exit;
+        Sleep(10);
+      end;
+
+      LParts := nil;
+      for LIdx := 0 to High(LLines) do
+        if LLines[LIdx].StartsWith(NatsConstants.Protocol.SUB + ' ') then
+        begin
+          LParts := LLines[LIdx].Split([NatsConstants.SPC]);
+          Break;
+        end;
+
+      LSocket.ServerSend(StatusFrame(LParts[1], LParts[2],
+        NatsConstants.Status.CONFLICT, 'Consumer is push based'));
+
+      { the verification's CONSUMER.INFO request }
+      LDeadline := TThread.GetTickCount64 + 3000;
+      while True do
+      begin
+        LSubCount := 0;
+        LLines := LSocket.ClientText.Split([NatsConstants.CR_LF]);
+        for LLine in LLines do
+          if LLine.StartsWith(NatsConstants.Protocol.SUB + ' ') then
+            Inc(LSubCount);
+        if LSubCount > 1 then
+          Break;
+        if TThread.GetTickCount64 > LDeadline then
+          Exit;
+        Sleep(10);
+      end;
+
+      LSubCount := 0;
+      for LIdx := 0 to High(LLines) do
+        if LLines[LIdx].StartsWith(NatsConstants.Protocol.SUB + ' ') then
+        begin
+          Inc(LSubCount);
+          if LSubCount = 2 then
+          begin
+            LParts := LLines[LIdx].Split([NatsConstants.SPC]);
+            Break;
+          end;
+        end;
+
+      LSocket.ServerSend(Format('%s %s %s %d'#13#10'%s'#13#10,
+        [NatsConstants.Protocol.MSG, LParts[1], LParts[2],
+         Length(TEncoding.UTF8.GetBytes(AInfoJson)), AInfoJson]));
+    end);
+
+  FServerThread.FreeOnTerminate := False;
+  FServerThread.Start;
+end;
+
 function TJetStreamContextTests.RequestSubject: string;
 var
   LLine: string;
@@ -2296,6 +2392,38 @@ begin
   end;
 end;
 
+procedure TJetStreamContextTests.Fetch_OnAPushConsumer_Raises;
+begin
+  OpenAndHandshake;
+  { The server answers the pull request with a 409 - it is a PUSH consumer -
+    and the verification CONSUMER.INFO confirms it. Asking a push consumer to
+    pull must raise, not come back empty forever }
+  ReplyFetchConflictThenInfo(CONSUMER_INFO_PUSH_JSON);
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'pushers', 10, 5000);
+    end,
+    ENatsException,
+    'a push consumer cannot be pulled, and that must not look like emptiness');
+end;
+
+procedure TJetStreamContextTests.Fetch_TransientConflictOnPullConsumer_ReturnsEmpty;
+var
+  LMsgs: TArray<IJetStreamMsg>;
+begin
+  OpenAndHandshake;
+  { A 409 can also be transient - MaxWaiting exceeded, say. The verification
+    shows the consumer is pull, so the conflict keeps its documented meaning:
+    a short batch is a result, not an error }
+  ReplyFetchConflictThenInfo(CONSUMER_INFO_JSON);
+
+  LMsgs := FJs.Fetch('ORDERS', 'workers', 10, 5000);
+
+  Assert.AreEqual(0, Length(LMsgs), 'a transient conflict is still an empty result');
+end;
+
 procedure TJetStreamContextTests.Fetch_CollectsTheWholeBatch;
 var
   LMsgs: TArray<IJetStreamMsg>;
@@ -2632,6 +2760,67 @@ begin
   Assert.IsTrue(FSocket.WaitForClientText(
     NatsConstants.Protocol.PUB + ' $JS.FC.token'),
     'a flow-control request must be answered, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_FlowControlHeader_IsAnswered;
+var
+  LSid: Integer;
+  LBlock: string;
+  LLen: Integer;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSid := FJs.SubscribePush('ORDERS', 'pushers',
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+    end);
+
+  FSocket.ClearClientData;
+
+  { Older servers sent the flow-control request as an ordinary HMSG carrying
+    the Nats-Flow-Control header instead of a status line - it still has a
+    reply-to that must be answered, and it must not reach the handler }
+  LBlock := NatsConstants.CLIENT_HEADER_VERSION + #13#10 +
+    JetStreamConstants.Header.FLOW_CONTROL + ': 1'#13#10;
+  LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+  FSocket.ServerSend(Format('%s deliver.pushers %d $JS.FC.token %d %d'#13#10,
+    [NatsConstants.Protocol.HMSG, LSid, LLen, LLen]) + LBlock + #13#10 + #13#10);
+
+  Assert.IsTrue(FSocket.WaitForClientText(
+    NatsConstants.Protocol.PUB + ' $JS.FC.token'),
+    'a flow-control header must be answered, wrote: ' + FSocket.ClientText);
+end;
+
+procedure TJetStreamContextTests.SubscribePush_OtherStatusWithReplyTo_IsNotAnswered;
+var
+  LSid: Integer;
+  LBlock: string;
+  LLen: Integer;
+begin
+  OpenAndHandshake;
+  ReplyWith(CONSUMER_INFO_PUSH_JSON);
+
+  LSid := FJs.SubscribePush('ORDERS', 'pushers',
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+    end);
+
+  FSocket.ClearClientData;
+
+  { A status that is NOT the flow-control one: it is still control, not data,
+    so it must not reach the handler - but answering it as a flow-control
+    request would be wrong, so nothing may be published to its reply-to }
+  LBlock := NatsConstants.CLIENT_HEADER_VERSION + ' 404 No Messages'#13#10;
+  LLen := Length(TEncoding.UTF8.GetBytes(LBlock)) + NatsConstants.CR_LF_LEN;
+
+  FSocket.ServerSend(Format('%s deliver.pushers %d $JS.other.token %d %d'#13#10,
+    [NatsConstants.Protocol.HMSG, LSid, LLen, LLen]) + LBlock + #13#10 + #13#10);
+
+  Assert.IsFalse(FSocket.WaitForClientText(
+    NatsConstants.Protocol.PUB + ' $JS.other.token', 300),
+    'a non-flow-control status must not be answered as one');
 end;
 
 procedure TJetStreamContextTests.SubscribePush_StatusNeverReachesTheHandler;

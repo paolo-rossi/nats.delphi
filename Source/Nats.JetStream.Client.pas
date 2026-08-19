@@ -461,6 +461,11 @@ type
     ///   collected is returned in every non-fatal case
     /// </summary>
     function WaitFor(ATimeoutMs: Cardinal): TArray<IJetStreamMsg>;
+    /// <summary>
+    ///   The status that closed the batch out - 0 when it filled or timed out.
+    ///   Lets FetchRaw tell a batch closed by a 409 from an ordinary result
+    /// </summary>
+    function GetCloseStatus: Integer;
   end;
 
   TJetStreamFetch = class(TInterfacedObject, IJetStreamFetch)
@@ -479,6 +484,8 @@ type
     ///   landed before Cancel
     /// </summary>
     FClosed: Boolean;
+    /// The status that closed the batch, 0 if it filled or the wait elapsed
+    FCloseStatus: Integer;
   public
     constructor Create(AConnection: TNatsConnection; ABatch: Integer);
     destructor Destroy; override;
@@ -486,6 +493,7 @@ type
     procedure Cancel;
     procedure Deliver(const AMsg: TNatsArgsMSG);
     function WaitFor(ATimeoutMs: Cardinal): TArray<IJetStreamMsg>;
+    function GetCloseStatus: Integer;
   end;
 
 { TJetStreamFetch }
@@ -540,10 +548,12 @@ begin
     { Everything else closes the batch: 404 nothing there, 408 the request's
       own expiry, 409 the consumer went away or MaxWaiting was exceeded. None
       of them is an error - whatever arrived before it is still a valid result,
-      so the wait ends and the caller gets a short batch }
+      so the wait ends and the caller gets a short batch. The status is kept so
+      FetchRaw can tell a 409 from an ordinary result }
     FLock.Enter;
     try
       FClosed := True;
+      FCloseStatus := AMsg.Status;
     finally
       FLock.Leave;
     end;
@@ -592,6 +602,13 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+function TJetStreamFetch.GetCloseStatus: Integer;
+begin
+  { Written by Deliver under the lock before the event was set, and read after
+    WaitFor returned - the waiter's own lock acquire orders the read }
+  Result := FCloseStatus;
 end;
 
 { EJetStreamApiError }
@@ -843,6 +860,7 @@ var
   LFetch: IJetStreamFetch;
   LInbox, LSubject: string;
   LId: Integer;
+  LInfo: TJetStreamConsumerInfo;
 begin
   CheckName('stream', AStream);
   CheckName('consumer', AConsumer);
@@ -878,6 +896,23 @@ begin
     try
       FConnection.Publish(LSubject, TJetStreamJSON.ToJSON<TJetStreamNextRequest>(ARequest), LInbox);
       Result := LFetch.WaitFor(AWaitMs);
+
+      { A batch closed by a 409 with nothing collected deserves a second look:
+        the usual cause is asking a PUSH consumer to pull - a misuse that would
+        otherwise repeat forever, each time looking exactly like an empty
+        consumer. Verify once, only when the result is already suspicious, so
+        the happy path pays nothing and a genuine transient conflict (MaxWaiting
+        exceeded) keeps its documented "short batch is a result" meaning }
+      if (Length(Result) = 0) and
+         (LFetch.GetCloseStatus = NatsConstants.Status.CONFLICT) then
+      begin
+        LInfo := ConsumerInfo(AStream, AConsumer);
+
+        if not LInfo.Config.DeliverSubject.IsEmpty then
+          raise ENatsException.CreateFmt(
+            'Consumer [%s] on stream [%s] is a PUSH consumer - use SubscribePush ' +
+            'instead of Fetch or Next', [AConsumer, AStream]);
+      end;
     finally
       { On every exit path, exactly as RequestSync does. Without it each fetch
         leaves one inbox subscribed here and on the server }
@@ -977,13 +1012,24 @@ begin
     begin
       if AMsg.HasStatus then
       begin
-        { A flow-control request carries a reply-to and MUST be answered, or
-          the server stops sending on this subject. An idle heartbeat has none
-          and only needs swallowing. Either way it is control, not data, and
-          handing it to the application would give it a phantom empty message
-          it could not ack }
-        if not AMsg.ReplyTo.IsEmpty then
+        { 100 is both the idle heartbeat and the flow-control request, and the
+          reply-to tells them apart: a heartbeat has none, a flow-control
+          request has the subject to answer on. The answer MUST be sent or the
+          server stops delivering on this subject. Any OTHER status is not
+          data either, but answering it would be wrong - swallow it }
+        if (AMsg.Status = NatsConstants.Status.IDLE_HEARTBEAT) and
+           (not AMsg.ReplyTo.IsEmpty) then
           LConnection.Publish(AMsg.ReplyTo, String.Empty);
+        Exit;
+      end;
+
+      { Older servers sent the flow-control request as an ordinary message
+        carrying the Nats-Flow-Control header rather than a status line. Same
+        contract: answer it, do not deliver it }
+      if (not AMsg.ReplyTo.IsEmpty) and
+         (AMsg.Headers.GetHeader(JetStreamConstants.Header.FLOW_CONTROL) <> '') then
+      begin
+        LConnection.Publish(AMsg.ReplyTo, String.Empty);
         Exit;
       end;
 

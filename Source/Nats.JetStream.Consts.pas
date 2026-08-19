@@ -101,6 +101,15 @@ type
       ROLLUP = 'Nats-Rollup';
       ROLLUP_SUBJECT = 'sub';
       ROLLUP_ALL = 'all';
+
+      /// <summary>
+      ///   The server-to-client counterpart of the publish headers above: a
+      ///   PUSH delivery marked as a flow-control request. Modern nats-server
+      ///   sends those as status lines instead, but older versions used this
+      ///   header on an ordinary message - either way the delivery carries a
+      ///   reply subject that MUST be answered
+      /// </summary>
+      FLOW_CONTROL = 'Nats-Flow-Control';
     end;
 
     /// <summary>
