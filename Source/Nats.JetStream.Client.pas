@@ -259,7 +259,9 @@ type
     ///   <para>
     ///     ATimeoutMs of 0 means this context's Timeout. The request carries
     ///     its own, slightly shorter expiry so the SERVER closes the batch and
-    ///     stops holding it open; see FETCH_EXPIRY_MARGIN.
+    ///     stops holding it open; see FETCH_EXPIRY_MARGIN. A Timeout of 0 on
+    ///     the context itself is refused: the wait would return immediately
+    ///     with an empty array, indistinguishable from an empty consumer.
     ///   </para>
     ///   <para>
     ///     Blocks, so never call it from a message, connect or disconnect
@@ -270,7 +272,9 @@ type
       ATimeoutMs: Cardinal = 0): TArray<IJetStreamMsg>;
     /// <summary>
     ///   As Fetch, but returns with whatever is already waiting instead of
-    ///   holding the request open. Ideal for draining, wrong for polling
+    ///   holding the request open. Ideal for draining, wrong for polling. Uses
+    ///   this context's Timeout as the wait for the replies to travel back, so
+    ///   a Timeout of 0 raises here too
     /// </summary>
     function FetchNoWait(const AStream, AConsumer: string;
       ABatch: Integer = 1): TArray<IJetStreamMsg>;
@@ -845,6 +849,13 @@ begin
 
   if ARequest.Batch < 1 then
     raise ENatsException.CreateFmt('A batch of %d asks for nothing', [ARequest.Batch]);
+
+  { A zero wait returns immediately with an empty array, which reads exactly
+    like "the consumer is empty". It only happens when the context's own
+    Timeout was set to 0 - Fetch(0) and FetchNoWait mean "use the context's
+    Timeout" - and RequestSync refuses the same value, so this does too }
+  if AWaitMs = 0 then
+    raise ENatsException.Create('A fetch timeout of 0 would wait forever');
 
   LSubject := ApiSubject(JetStreamConstants.Api.CONSUMER_MSG_NEXT, [AStream, AConsumer]);
   LInbox := FConnection.GetNewInbox;

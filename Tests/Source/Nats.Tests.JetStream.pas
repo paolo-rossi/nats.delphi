@@ -315,6 +315,8 @@ type
     [Test]
     procedure Fetch_EmptyBatch_Raises;
     [Test]
+    procedure Fetch_ZeroTimeout_Raises;
+    [Test]
     procedure FetchNoWait_SetsNoWaitAndNoExpiry;
     [Test]
     procedure Next_ReturnsTheFirstMessage;
@@ -2388,6 +2390,31 @@ begin
       FJs.Fetch('ORDERS', 'workers', 0);
     end,
     ENatsException, 'a batch of zero asks the server for nothing');
+end;
+
+procedure TJetStreamContextTests.Fetch_ZeroTimeout_Raises;
+begin
+  OpenAndHandshake;
+
+  { Fetch(0) means "use the context's Timeout", so a Timeout of 0 is a
+    misconfiguration rather than a request to wait nothing. Before the fix a
+    zero wait returned immediately with an empty array - indistinguishable
+    from a consumer with nothing to say }
+  FJs.Timeout := 0;
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.Fetch('ORDERS', 'workers', 10);
+    end,
+    ENatsException, 'a zero wait must be refused, not read as an empty consumer');
+
+  Assert.WillRaise(
+    procedure
+    begin
+      FJs.FetchNoWait('ORDERS', 'workers', 10);
+    end,
+    ENatsException, 'FetchNoWait uses the context''s Timeout too');
 end;
 
 procedure TJetStreamContextTests.FetchNoWait_SetsNoWaitAndNoExpiry;
