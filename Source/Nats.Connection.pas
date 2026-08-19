@@ -415,6 +415,13 @@ uses
 const
   /// How long the consumer waits on the queue before re-checking Terminated
   QUEUE_WAIT_MS = 250;
+  /// <summary>
+  ///   The cap on a single control line (INFO, MSG, HMSG, ...). Control lines
+  ///   never carry payloads - those come back through ReceiveExactBytes - and
+  ///   the longest of them, INFO, is a few kilobytes at most. A fixed generous
+  ///   ceiling is therefore all the reader needs
+  /// </summary>
+  MAX_CONTROL_LINE_LENGTH = 1024 * 1024;
 
 type
   /// <summary>
@@ -822,9 +829,13 @@ end;
 
 procedure TNatsConnection.HandleInfo(const AInfo: TNatsServerInfo);
 begin
+  { Control lines never carry payloads - the reader reads those by exact byte
+    count via ReceiveExactBytes - so sizing the line cap off max_payload was
+    wrong, and max_payload * 2 overflows Integer for a server configured above
+    ~1 GiB, wrapping to a nonsense Cardinal cap. A fixed, generous ceiling is
+    what a control line actually needs }
   if FChannel.MaxLineLength > 0 then
-    if AInfo.MaxPayload > 0 then
-      FChannel.MaxLineLength := AInfo.MaxPayload * 2;
+    FChannel.MaxLineLength := MAX_CONTROL_LINE_LENGTH;
 
   { Remembered for CheckPayloadSize. Updated on EVERY INFO, not just the first:
     a cluster reconfiguration can change the limit mid-session, and the handshake
