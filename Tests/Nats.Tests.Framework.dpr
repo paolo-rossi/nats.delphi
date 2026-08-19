@@ -42,7 +42,8 @@ uses
   Nats.Tests.Adapters in 'Source\Nats.Tests.Adapters.pas',
   Nats.Tests.Concurrency in 'Source\Nats.Tests.Concurrency.pas',
   Nats.Tests.JetStream in 'Source\Nats.Tests.JetStream.pas',
-  Nats.Tests.Live in 'Source\Nats.Tests.Live.pas';
+  Nats.Tests.Live in 'Source\Nats.Tests.Live.pas',
+  Nats.Tests.Redis in 'Source\Nats.Tests.Redis.pas';
 
 var
   LRunner : ITestRunner;

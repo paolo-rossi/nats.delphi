@@ -61,6 +61,7 @@ contains
   Nats.Nuid in '..\Source\Nats.Nuid.pas',
   Nats.Parser in '..\Source\Nats.Parser.pas',
   Nats.Rand in '..\Source\Nats.Rand.pas',
+  Nats.Redis in '..\Source\Nats.Redis.pas',
   Nats.Socket.Indy in '..\Source\Nats.Socket.Indy.pas',
   Nats.Socket in '..\Source\Nats.Socket.pas';
 

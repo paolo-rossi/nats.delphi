@@ -1,4 +1,4 @@
-{******************************************************************************}
+﻿{******************************************************************************}
 {                                                                              }
 {  nats.delphi: Delphi Client Library for NATS                                 }
 {  Copyright (c) 2022 Paolo Rossi                                              }
@@ -294,6 +294,8 @@ type
     /// </summary>
     function SetChannel(const AHost: string; APort, AConnectTimeout: Integer;
       AReadTimeout: Integer = 0): TNatsConnection;
+    function SetName(const AName: string): TNatsConnection;
+
     procedure Open(AConnectHandler: TNatsConnectHandler; ADisconnectHandler: TNatsDisconnectHandler = nil); overload;
     procedure Close();
 
@@ -1265,6 +1267,12 @@ begin
   if AReadTimeout > 0 then
     FChannel.ReadTimeout := AReadTimeout;
 
+  Result := Self;
+end;
+
+function TNatsConnection.SetName(const AName: string): TNatsConnection;
+begin
+  FName := AName;
   Result := Self;
 end;
 

@@ -132,7 +132,6 @@ type
     FBucket: string;
     FStream: string;
 
-    function KeySubject(const AKey: string): string;
     /// The key a '$KV.<bucket>.<key>' subject names
     function SubjectKey(const ASubject: string): string;
     /// <summary>
@@ -181,6 +180,10 @@ type
     ///   neither begin nor end with a dot
     /// </summary>
     class procedure CheckKey(const AKey: string); static;
+    /// The subject '$KV.<bucket>.<key>' that AKey is stored on - the bucket's
+    /// stream captures it. Needed by anything that purges or scans the stream
+    /// directly rather than going through this class
+    function KeySubject(const AKey: string): string;
 
     { reading }
 
