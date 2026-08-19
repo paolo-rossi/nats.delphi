@@ -42,6 +42,7 @@ uses
   Nats.Nuid,
   Nats.Exceptions,
   Nats.JetStream.Client,
+  Nats.JetStream.Consts,
   Nats.JetStream.Entities,
   Nats.JetStream.Message,
   Nats.JetStream.KV,
@@ -302,6 +303,9 @@ type
     /// A truncated object must be reported, not returned short
     [Test]
     procedure Get_WithItsChunksPurged_Raises;
+    /// The F13 fix: a failed read must not leave a stream that looks complete
+    [Test]
+    procedure Get_FailedRead_LeavesTheDestinationRolledBack;
     [Test]
     procedure PutFileAndGetFile_RoundTrip;
     /// The F4 fix: short reads must not truncate an upload
@@ -2223,6 +2227,46 @@ begin
       FOs.Get('doomed.bin', LData);
     end,
     EJetStreamObjectError);
+end;
+
+procedure TJetStreamObjectStoreLiveTests.Get_FailedRead_LeavesTheDestinationRolledBack;
+var
+  LInfo: TJetStreamObjectInfo;
+  LDest: TBytesStream;
+begin
+  Connect;
+  CreateBucket(1024);
+
+  LInfo := FOs.Put('doomed.bin', Pattern(5 * 1024));
+
+  { Rewrite the metadata with a WRONG digest - the chunks are all still there,
+    so the read writes every byte to the destination and only then fails the
+    digest check. That is the case the rollback exists for }
+  LInfo.Digest := 'SHA-256=Zm9v';   // deliberately wrong
+  LInfo.Mtime := '2026-08-13T00:00:00Z';
+  FJs.Publish(
+    Format('$O.%s.M.%s', [FBucket, TObjectStoreEncoding.Encode('doomed.bin')]),
+    TJetStreamJSON.ToJSON<TJetStreamObjectInfo>(LInfo),
+    TJetStreamPubOptions.New.WithHeader(
+      JetStreamConstants.Header.ROLLUP, JetStreamConstants.Header.ROLLUP_SUBJECT));
+
+  LDest := TBytesStream.Create;
+  try
+    Assert.WillRaise(
+      procedure
+      begin
+        FOs.Get('doomed.bin', LDest);
+      end,
+      EJetStreamObjectError);
+
+    { All 5 KB reached the destination before the digest check failed - without
+      the rollback a caller catching the exception would be left with a stream
+      that looks exactly like a successful partial download }
+    Assert.AreEqual(Int64(0), LDest.Size, 'the partial bytes must be rolled back');
+    Assert.AreEqual(Int64(0), LDest.Position, 'and the position restored');
+  finally
+    LDest.Free;
+  end;
 end;
 
 procedure TJetStreamObjectStoreLiveTests.PutFileAndGetFile_RoundTrip;

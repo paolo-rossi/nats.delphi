@@ -148,6 +148,14 @@ type
     ///   read loop in Put is the guarantee there
     /// </summary>
     procedure CheckStreamComplete(const AStream: TStream);
+    /// <summary>
+    ///   Best-effort rollback of ADest to where it was before a failed Get:
+    ///   rewind to APosition and truncate what was written. A stream that
+    ///   cannot seek or truncate is left alone - the exception the caller
+    ///   already has is the real answer, and Get's docs say the destination may
+    ///   hold partial bytes in that case
+    /// </summary>
+    procedure RollBackDestination(const ADest: TStream; APosition: Int64);
   public
     /// <summary>
     ///   Binds to an EXISTING bucket without a round trip. Use Status to
@@ -193,6 +201,12 @@ type
     ///   match the stored digest, and EJetStreamApiError if the bucket's stream
     ///   does not exist at all
     /// </summary>
+    /// <remarks>
+    ///   When a read fails part-way, ADest is rewound and truncated to where it
+    ///   was before the call (best effort - a stream that cannot seek or
+    ///   truncate is left holding the partial bytes). Either way, a raise means
+    ///   "no object" and a return of True means "the whole object"
+    /// </remarks>
     function Get(const AName: string; ADest: TStream): Boolean; overload;
     function Get(const AName: string; out AData: TBytes): Boolean; overload;
     function GetString(const AName: string; const ADefault: string = ''): string;
@@ -592,6 +606,7 @@ var
   LHash: THashSHA2;
   LChunks: Integer;
   LDigest: string;
+  LStartPos: Int64;
 begin
   if not Assigned(ADest) then
     raise EJetStreamObjectError.Create('There is nowhere to put the object');
@@ -599,41 +614,70 @@ begin
   if not Info(AName, LInfo) then
     Exit(False);
 
-  LHash := THashSHA2.Create(SHA256);
-  LChunks := 0;
+  { Where ADest stood before any bytes were written, so a failed read can be
+    rolled back: a caller who catches the exception must not be left with a
+    stream that looks like a successful partial download }
+  LStartPos := ADest.Position;
 
-  { Every chunk is on one subject, so stream order IS chunk order and there is
-    no reassembly to get wrong - only the counting and the digest }
-  FContext.ScanSubject(FStream, ChunkSubject(LInfo.Nuid), False, False,
-    procedure (AMsg: IJetStreamMsg)
-    var
-      LData: TBytes;
+  try
+    LHash := THashSHA2.Create(SHA256);
+    LChunks := 0;
+
+    { Every chunk is on one subject, so stream order IS chunk order and there
+      is no reassembly to get wrong - only the counting and the digest }
+    FContext.ScanSubject(FStream, ChunkSubject(LInfo.Nuid), False, False,
+      procedure (AMsg: IJetStreamMsg)
+      var
+        LData: TBytes;
+      begin
+        LData := AMsg.PayloadData;
+        LHash.Update(LData, Length(LData));
+        ADest.WriteBuffer(LData, Length(LData));
+        Inc(LChunks);
+      end);
+
+    { Two independent checks, because they fail differently. A short read - the
+      stream expired chunks under a MaxAge, say - shows up as a chunk count
+      that does not match; a corrupted or interleaved one shows up in the
+      digest. Neither would otherwise be reported: the caller would just get
+      less than it asked for, with nothing having raised }
+    if LChunks <> LInfo.Chunks then
+      raise EJetStreamObjectError.CreateFmt(
+        'Object [%s] in bucket [%s] came back in %d chunks but its metadata says ' +
+        '%d - part of it is missing from the stream', [AName, FBucket, LChunks, LInfo.Chunks]);
+
+    LDigest := JetStreamConstants.Obj.DIGEST_PREFIX +
+      TObjectStoreEncoding.Encode(LHash.HashAsBytes);
+
+    if not LInfo.Digest.IsEmpty and (LDigest <> LInfo.Digest) then
+      raise EJetStreamObjectError.CreateFmt(
+        'Object [%s] in bucket [%s] failed its digest check: stored %s, got %s',
+        [AName, FBucket, LInfo.Digest, LDigest]);
+
+    Result := True;
+  except
+    { Any failure - the checks above, or the connection dying mid-scan - leaves
+      ADest holding partial bytes. Undo them, then hand the exception on }
+    on E: Exception do
     begin
-      LData := AMsg.PayloadData;
-      LHash.Update(LData, Length(LData));
-      ADest.WriteBuffer(LData, Length(LData));
-      Inc(LChunks);
-    end);
+      RollBackDestination(ADest, LStartPos);
+      raise;
+    end;
+  end;
+end;
 
-  { Two independent checks, because they fail differently. A short read - the
-    stream expired chunks under a MaxAge, say - shows up as a chunk count that
-    does not match; a corrupted or interleaved one shows up in the digest.
-    Neither would otherwise be reported: the caller would just get less than it
-    asked for, with nothing having raised }
-  if LChunks <> LInfo.Chunks then
-    raise EJetStreamObjectError.CreateFmt(
-      'Object [%s] in bucket [%s] came back in %d chunks but its metadata says ' +
-      '%d - part of it is missing from the stream', [AName, FBucket, LChunks, LInfo.Chunks]);
-
-  LDigest := JetStreamConstants.Obj.DIGEST_PREFIX +
-    TObjectStoreEncoding.Encode(LHash.HashAsBytes);
-
-  if not LInfo.Digest.IsEmpty and (LDigest <> LInfo.Digest) then
-    raise EJetStreamObjectError.CreateFmt(
-      'Object [%s] in bucket [%s] failed its digest check: stored %s, got %s',
-      [AName, FBucket, LInfo.Digest, LDigest]);
-
-  Result := True;
+procedure TJetStreamObjectStore.RollBackDestination(const ADest: TStream; APosition: Int64);
+begin
+  { Only what this call wrote is removed: everything after where the caller's
+    stream stood. A stream that cannot seek or truncate is left alone - the
+    exception that triggered this is the real answer }
+  try
+    ADest.Seek(APosition, soBeginning);
+    ADest.Size := APosition;
+  except
+    on E: Exception do
+      ;   // cannot roll back: the caller still gets the exception above
+  end;
 end;
 
 function TJetStreamObjectStore.Get(const AName: string; out AData: TBytes): Boolean;
