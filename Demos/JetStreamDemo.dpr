@@ -77,46 +77,41 @@ begin
 end;
 
 procedure DemoStreams;
-var
-  LConfig: TJetStreamStreamConfig;
-  LInfo: TJetStreamStreamInfo;
-  LAck: TJetStreamPubAck;
-  LSeq: UInt64;
 begin
   Banner('Streams and publishing');
   GStream := 'ORDERS_' + TNUID.NextNuid;
 
-  LConfig := Default(TJetStreamStreamConfig);
-  LConfig.Name := GStream;
-  LConfig.Subjects := [GStream + '.>'];
-  LConfig.Storage := TJetStreamStorage.Memory;   { no files left behind }
-  LInfo := GJs.AddStream(LConfig);
-  Writeln('  created stream ', LInfo.Config.Name);
+  var cfg := Default(TJetStreamStreamConfig);
+  cfg.Name := GStream;
+  cfg.Subjects := [GStream + '.>'];
+  cfg.Storage := TJetStreamStorage.Memory;   { no files left behind }
+  var info := GJs.AddStream(cfg);
+  Writeln('  created stream ', info.Config.Name);
 
   { Publishing WAITS for the stream's PubAck - the guarantee that the message
     was stored, not merely accepted and dropped }
-  LAck := GJs.Publish(GStream + '.new', '{"id":1,"sku":"A"}');
-  Writeln('  published to seq ', LAck.Seq, ' on stream ', LAck.Stream);
+  var ack := GJs.Publish(GStream + '.new', '{"id":1,"sku":"A"}');
+  Writeln('  published to seq ', ack.Seq, ' on stream ', ack.Stream);
 
   { A Nats-Msg-Id deduplicates: publishing the same id again inside the
     duplicate window is NOT stored - the ack reports it }
   GJs.Publish(GStream + '.new', '{"id":2,"sku":"B"}',
     TJetStreamPubOptions.New.WithMsgId('order-2'));
-  LAck := GJs.Publish(GStream + '.new', '{"id":2,"sku":"B"}',
+  ack := GJs.Publish(GStream + '.new', '{"id":2,"sku":"B"}',
     TJetStreamPubOptions.New.WithMsgId('order-2'));
-  Writeln('  duplicate publish: stored=', not LAck.Duplicate,
-    ' (seq ', LAck.Seq, ' is the original)');
+  Writeln('  duplicate publish: stored=', not ack.Duplicate,
+    ' (seq ', ack.Seq, ' is the original)');
 
   { An expectation makes the server REJECT a publish that would break the
     sequence - the optimistic-concurrency primitive of streams }
-  LAck := GJs.Publish(GStream + '.new', '{"id":3,"sku":"C"}');
-  LSeq := LAck.Seq;
-  LAck := GJs.Publish(GStream + '.new', '{"id":4,"sku":"D"}',
-    TJetStreamPubOptions.New.WithExpectedLastSeq(LSeq));
-  Writeln('  expected-last-seq held: stored at seq ', LAck.Seq);
+  ack := GJs.Publish(GStream + '.new', '{"id":3,"sku":"C"}');
+  var seq := ack.Seq;
+  ack := GJs.Publish(GStream + '.new', '{"id":4,"sku":"D"}',
+    TJetStreamPubOptions.New.WithExpectedLastSeq(seq));
+  Writeln('  expected-last-seq held: stored at seq ', ack.Seq);
 
-  LInfo := GJs.StreamInfo(GStream);
-  Writeln('  the stream now holds ', LInfo.State.Messages, ' message(s)');
+  info := GJs.StreamInfo(GStream);
+  Writeln('  the stream now holds ', info.State.Messages, ' message(s)');
 end;
 
 procedure DemoPullConsume;

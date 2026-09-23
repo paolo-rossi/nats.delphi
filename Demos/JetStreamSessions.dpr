@@ -7,21 +7,21 @@
 {  Licensed under the MIT license                                              }
 {******************************************************************************}
 {                                                                              }
-{  JetStream as a session store, using the same patterns you would use        }
-{  Redis for: every HTTP session is a key in a Key/Value bucket, and the       }
-{  bucket's TTL is the session lifetime. The mapping:                           }
+{  JetStream as a session store, straight on the NATS JetStream API. Every     }
+{  HTTP session is a key in a Key/Value bucket, and the bucket's TTL is the    }
+{  session lifetime:                                                            }
 {                                                                              }
-{    Redis SET session:<id> data EX ttl  ->  bucket TTL + Put                  }
-{    Redis GET session:<id>              ->  Get                               }
-{    Redis DEL session:<id>              ->  Delete (a tombstone, not removal) }
-{    Redis SETNX session:<id> data       ->  PutIfAbsent                       }
-{    Redis EXPIRE session:<id> ttl       ->  Touch (re-Put: fresh TTL)         }
-{    Redis WATCH/MULTI optimistic CAS    ->  Update on a revision              }
-{    Redis KEYS session:*                ->  Keys                              }
+{    create only if new        PutIfAbsent (revision on success)               }
+{    create or overwrite       Put                                                }
+{    read                     Get                                                  }
+{    sliding TTL               Touch (re-Put: fresh bucket TTL)                }
+{    optimistic concurrency    Update on a revision                            }
+{    remove                    Delete (a tombstone, not a removal)             }
+{    list                      Keys                                            }
 {                                                                              }
-{  One difference worth knowing: Redis gives every key its own TTL, nats KV    }
-{  gives the whole BUCKET one - so sessions with different lifetimes need      }
-{  separate buckets (the expiry demo below uses a 5-second bucket on purpose). }
+{  The TTL belongs to the BUCKET, not to one key - so sessions with different  }
+{  lifetimes need separate buckets (the expiry demo below uses a 5-second      }
+{  bucket on purpose).                                                          }
 {                                                                              }
 {  Requires a nats-server with JetStream enabled, e.g.:                        }
 {      nats-server -js                                                         }
@@ -49,10 +49,9 @@ uses
   Nats.JetStream.KV in '..\Source\Nats.JetStream.KV.pas';
 
 type
-  { A session store over JetStream Key/Value. Keys are stored as             
-    "session.<id>" - dots are fine in a KV key, so the Redis convention      
-    survives. Callers pass the bare id; the store owns the prefix and strips 
-    it again when listing.                                                   }
+  { A session store over JetStream Key/Value. Keys are stored as "session.<id>"
+    - dots are fine in a KV key. Callers pass the bare id; the store owns the
+    prefix and strips it again when listing. }
   TSessionStore = class
   private
     FKV: TJetStreamKV;
@@ -62,20 +61,20 @@ type
       const ATTL: TJetStreamDuration);
     destructor Destroy; override;
 
-    { SETNX: only succeeds if the session id does not exist yet }
+    { creates the session only if the id is not taken yet }
     function CreateSession(const ASessionId: string; const AData: string): UInt64;
-    { SET: create or overwrite }
+    { creates or overwrites }
     function PutSession(const ASessionId: string; const AData: string): UInt64;
-    { GET: False when the session does not exist or has expired }
+    { False when the session does not exist or has expired }
     function GetSession(const ASessionId: string; out AData: string): Boolean;
-    { EXPIRE with a sliding window: re-Put resets the TTL and bumps the revision }
+    { sliding window: re-Put resets the TTL and bumps the revision }
     function TouchSession(const ASessionId: string): UInt64;
-    { Optimistic CAS on the revision - Redis WATCH/MULTI without the ceremony }
+    { optimistic concurrency on the revision }
     function UpdateSession(const ASessionId: string; const AData: string;
       ARevision: UInt64): UInt64;
-    { DEL: a tombstone, so the history survives }
+    { a tombstone, so the history survives }
     procedure DeleteSession(const ASessionId: string);
-    { KEYS session:* }
+    { every session still held }
     function ListSessions: TArray<string>;
 
     property Bucket: TJetStreamKV read FKV;
@@ -106,7 +105,7 @@ begin
 
   LConfig := Default(TJetStreamKVConfig);
   LConfig.Bucket := ABucket;
-  LConfig.TTL := ATTL;            { the session lifetime - Redis's EX }
+  LConfig.TTL := ATTL;            { the session lifetime }
   LConfig.History := 5;           { keep a few revisions per session }
   FKV := TJetStreamKV.CreateBucket(AContext, LConfig);
 end;
@@ -140,7 +139,7 @@ function TSessionStore.TouchSession(const ASessionId: string): UInt64;
 var
   LData: string;
 begin
-  { The sliding window: every access buys the session another full lifetime. 
+  { The sliding window: every access buys the session another full lifetime.
     Touching a session that is not there is an error, not a way to create one }
   if not GetSession(ASessionId, LData) then
     raise ENatsException.CreateFmt(
@@ -180,8 +179,11 @@ procedure DemoConnect;
 begin
   Banner('Connecting');
   GConn := TNatsConnection.Create;
-  GConn.Name := 'JetStreamSessions';
-  GConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, 5000).Open(nil);
+  GConn
+    .SetName('JetStreamSessions')
+    .SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, 5000)
+    .Open(nil);
+
   if not GConn.WaitForReady(5000) then
     raise Exception.Create('The handshake did not complete: ' + GConn.LastError);
 
@@ -196,24 +198,25 @@ var
   LJson: TJSONObject;
   LRev: UInt64;
 begin
-  Banner('Sessions: SETNX / GET / EXPIRE / CAS');
+  Banner('Sessions: create / read / touch / update');
 
-  { A new HTTP client logs in: SETNX creates the session only if the id is free }
+  { A new HTTP client logs in: create the session only if the id is free }
   LId := 'a1b2c3';
   LData := '{"user":42,"role":"admin","logged_in_at":"2026-08-13T10:00:00Z"}';
   LRev := GSessions.CreateSession(LId, LData);
-  Writeln('  SETNX session.', LId, ' -> revision ', LRev);
+  Writeln('  create session.', LId, ' -> revision ', LRev);
 
-  { A second login with the same id is a collision - exactly what SETNX is for }
+  { A second login with the same id is a collision - exactly what PutIfAbsent
+    is for }
   try
     GSessions.CreateSession(LId, LData);
     Writeln('  !! a duplicate session id was accepted');
   except
     on E: EJetStreamKVError do
-      Writeln('  SETNX on an existing session correctly failed');
+      Writeln('  create on an existing session correctly failed');
   end;
 
-  { Every request reads the session: GET }
+  { Every request reads the session }
   if GSessions.GetSession(LId, LBack) then
   begin
     LJson := TJSONObject.ParseJSONValue(LBack) as TJSONObject;
@@ -229,17 +232,17 @@ begin
 
   { Sliding expiration: touching resets the TTL and bumps the revision }
   LRev := GSessions.TouchSession(LId);
-  Writeln('  EXPIRE session.', LId, ' -> revision ', LRev, ' (TTL restarted)');
+  Writeln('  touch session.', LId, ' -> revision ', LRev, ' (TTL restarted)');
 
-  { Optimistic CAS: nobody may have changed the session between read and write }
+  { Optimistic concurrency: nobody may have changed the session between read
+    and write }
   LRev := GSessions.UpdateSession(LId, '{"user":42,"role":"banned"}', LRev);
   Writeln('  CAS update -> revision ', LRev);
 
-  { A second session, so KEYS has something to list }
+  { A second session, so listing has something to show }
   GSessions.CreateSession('x9y8z7', '{"user":7,"role":"guest"}');
 
-  { KEYS session:* }
-  Writeln('  KEYS session:* -> ', Length(GSessions.ListSessions), ' active');
+  Writeln('  list -> ', Length(GSessions.ListSessions), ' active');
   for LId in GSessions.ListSessions do
     Writeln('    ', LId);
 end;
@@ -248,18 +251,18 @@ procedure DemoLogout;
 var
   LData: string;
 begin
-  Banner('Logout (DEL)');
+  Banner('Logout (delete)');
 
   GSessions.DeleteSession('a1b2c3');
 
-  { DEL is a tombstone: the reader no longer sees the session, but its 
+  { Delete is a tombstone: the reader no longer sees the session, but its
     history is still there }
   if GSessions.GetSession('a1b2c3', LData) then
     Writeln('  !! the deleted session is still readable')
   else
-    Writeln('  GET after DEL -> session not found (tombstone)');
+    Writeln('  GET after delete -> session not found (tombstone)');
 
-  Writeln('  KEYS session:* -> ', Length(GSessions.ListSessions), ' active');
+  Writeln('  list -> ', Length(GSessions.ListSessions), ' active');
 end;
 
 procedure DemoExpiry;
@@ -269,7 +272,7 @@ begin
   Banner('Session expiry (bucket TTL)');
 
   GShortTTL.CreateSession('temp', '{"user":99}');
-  Writeln('  SETNX session.temp with a 5 second TTL');
+  Writeln('  created session.temp with a 5 second TTL');
 
   if GShortTTL.GetSession('temp', LData) then
     Writeln('  GET immediately -> found');
@@ -277,12 +280,11 @@ begin
   Writeln('  waiting 6.5 s for the TTL to elapse...');
   Sleep(6500);
 
-  { The server dropped the message when MaxAge elapsed - the same answer 
-    Redis gives for an expired key }
+  { The server dropped the message when MaxAge elapsed }
   if GShortTTL.GetSession('temp', LData) then
     Writeln('  !! the expired session is still readable')
   else
-    Writeln('  GET after 6.5 s -> gone, exactly like an expired Redis key');
+    Writeln('  GET after 6.5 s -> gone, the TTL elapsed');
 end;
 
 procedure Cleanup;
@@ -310,7 +312,7 @@ begin
 end;
 
 begin
-  Writeln('nats.delphi - JetStream as a session store (Redis pattern)');
+  Writeln('nats.delphi - JetStream as a session store');
   Writeln(StringOfChar('=', 56));
   try
     try
@@ -318,7 +320,7 @@ begin
 
       GSessions := TSessionStore.Create(GJs, 'sessions_' + TNUID.NextNuid,
         TJetStreamDuration.FromMinutes(30));
-      Writeln('  session bucket TTL: 30 min (Redis "EX 1800")');
+      Writeln('  session bucket TTL: 30 min');
       DemoCreateAndRead;
       DemoLogout;
 
@@ -327,7 +329,7 @@ begin
       DemoExpiry;
 
       Banner('Done');
-      Writeln('  everything worked. Sessions in JetStream behave like sessions in Redis.');
+      Writeln('  everything worked. Sessions live in a JetStream Key/Value bucket.');
     except
       on E: Exception do
       begin

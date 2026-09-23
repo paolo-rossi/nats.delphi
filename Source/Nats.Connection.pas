@@ -24,14 +24,6 @@ uses
   Nats.Socket;
 
 type
-  (*
-  INatsConnection = interface
-  ['{8630DB26-6324-4E33-8342-85BF42A34FC2}']
-    procedure Publish(const ASubject, AMessage: string);
-    procedure Subscribe(const ASubject: string);
-  end;
-  *)
-
   TNatsConnection = class;
 
   /// <summary>
@@ -61,6 +53,7 @@ type
   /// </summary>
   INatsRequestCancellable = interface
   ['{A3E5C1D8-4B72-4E9F-8C1A-6F2D9B0E57A3}']
+
     /// <summary>
     ///   Releases the waiter because the connection is going away. Runs on
     ///   whichever thread discovered the failure. A result that already landed
@@ -72,11 +65,13 @@ type
 
   INatsRequestWaiter = interface(INatsRequestCancellable)
   ['{4F0D1C7A-9E3B-4A16-8D2F-1B7C6E5A9042}']
+
     /// <summary>
     ///   Delivers the reply. Runs on the consumer thread; the first reply wins
     ///   and any later one is discarded
     /// </summary>
     procedure Signal(const AMsg: TNatsArgsMSG);
+
     /// <summary>
     ///   Blocks for up to ATimeoutMs. False means the time ran out with no
     ///   reply; a connection torn down while waiting raises instead, because
@@ -230,6 +225,7 @@ type
     FPendingRequests: TList<INatsRequestCancellable>;
     FState: Integer;
     FPingOutstanding: Integer;
+
     /// <summary>
     ///   The server's declared max_payload, or 0 before INFO has arrived. Read
     ///   from the caller's thread and written from the consumer's, so writes go
@@ -254,6 +250,7 @@ type
     ///   is far harder to diagnose than an exception at the call site
     /// </summary>
     procedure CheckSubject(const ASubject: string);
+
     /// <summary>
     ///   Raises if ASize exceeds the server's max_payload. ASize is what the
     ///   server counts: the payload for PUB, and the header block PLUS the
@@ -278,6 +275,7 @@ type
     procedure TearDown; overload;
     procedure TearDown(const AError: string); overload;
     procedure HandleInfo(const AInfo: TNatsServerInfo);
+
     /// <summary>
     ///   Called by the reader when a read times out: an idle connection is not
     ///   a dead one, so probe it rather than tearing it down
@@ -287,6 +285,7 @@ type
     constructor Create;
     destructor Destroy; override;
   public
+
     /// <summary>
     ///   AConnectTimeout bounds establishing the connection; AReadTimeout (0 =
     ///   keep the socket's default) bounds a single read. They are not the same
@@ -332,6 +331,7 @@ type
       ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT): Boolean; overload;
     function RequestSync(const ASubject: string; const AData: TBytes; out AReply: TNatsArgsMSG;
       ATimeoutMs: Cardinal = NatsConstants.DEFAULT_REQUEST_TIMEOUT): Boolean; overload;
+
     /// <summary>
     ///   The form JetStream needs: a binary payload and headers in the same
     ///   call, because a JetStream publish carries Nats-Msg-Id / Nats-Expected-*
@@ -349,6 +349,7 @@ type
     ///   RemovePendingRequest on every exit path
     /// </summary>
     procedure AddPendingRequest(const AWaiter: INatsRequestCancellable);
+
     /// <summary>
     ///   The other half of AddPendingRequest. Removing something the teardown
     ///   already emptied is a no-op, which is what makes this safe to call
@@ -374,24 +375,29 @@ type
     function WaitForReady(ATimeoutMs: Cardinal = 5000): Boolean;
   public
     ConnectOptions: TNatsConnectOptions;
-    property Name: string read FName write FName;
+    property Name: string read FName;
+
     /// <summary>
     ///   True once the handshake has completed. A socket that is up but has not
     ///   exchanged INFO/CONNECT yet does not count: the server does not know
     ///   this client's options, and nothing may be published over it
     /// </summary>
     property Connected: Boolean read GetConnected;
+
     property Ready: Boolean read GetReady;
+
     /// <summary>
     ///   The largest message this server accepts, from INFO, or 0 before the
     ///   handshake. Publishing more than this raises ENatsMaxPayloadError
     ///   rather than letting the server close the connection over it
     /// </summary>
     property MaxPayload: Integer read GetMaxPayload;
+
     /// <summary>
     ///   Why the connection last failed; empty after a clean Close
     /// </summary>
     property LastError: string read GetLastError;
+
     /// <summary>
     ///   Fires on a protocol error, a dead socket or an -ERR from the server -
     ///   the failures an application would otherwise never see. Runs on a
@@ -1492,8 +1498,7 @@ end;
 
 function TNatsNetwork.NewConnection(const AName: string): TNatsConnection;
 begin
-  Result := TNatsConnection.Create;
-  Result.Name := AName;
+  Result := TNatsConnection.Create.SetName(AName);
   Self.Add(AName, Result);
 end;
 

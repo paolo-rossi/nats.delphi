@@ -1,4 +1,4 @@
-<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{85777F10-9634-4002-B34B-2EE00ECE4638}</ProjectGuid>
         <ProjectVersion>20.4</ProjectVersion>
@@ -72,11 +72,8 @@
         <DCCReference Include="..\Source\Nats.Exceptions.pas"/>
         <DCCReference Include="..\Source\Nats.Nuid.pas"/>
         <DCCReference Include="..\Source\Nats.JetStream.Client.pas"/>
-        <DCCReference Include="..\Source\Nats.JetStream.Consts.pas"/>
         <DCCReference Include="..\Source\Nats.JetStream.Entities.pas"/>
-        <DCCReference Include="..\Source\Nats.JetStream.Message.pas"/>
         <DCCReference Include="..\Source\Nats.JetStream.KV.pas"/>
-        <DCCReference Include="..\Source\Nats.JetStream.ObjectStore.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -110,4 +107,3 @@
     <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
     <Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
 </Project>
-
