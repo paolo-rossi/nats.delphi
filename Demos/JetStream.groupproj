@@ -1,0 +1,96 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{78568FAD-212E-4505-BF98-D2B4A6F32DEE}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="JetStream\JetStreamBench.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="JetStream\JetStreamDemo.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="JetStream\JetStreamJson.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="JetStream\JetStreamSessions.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="JetStream\JetStreamShop.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="JetStream\PullConsumer.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="JetStreamBench">
+        <MSBuild Projects="JetStream\JetStreamBench.dproj"/>
+    </Target>
+    <Target Name="JetStreamBench:Clean">
+        <MSBuild Projects="JetStream\JetStreamBench.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="JetStreamBench:Make">
+        <MSBuild Projects="JetStream\JetStreamBench.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="JetStreamDemo">
+        <MSBuild Projects="JetStream\JetStreamDemo.dproj"/>
+    </Target>
+    <Target Name="JetStreamDemo:Clean">
+        <MSBuild Projects="JetStream\JetStreamDemo.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="JetStreamDemo:Make">
+        <MSBuild Projects="JetStream\JetStreamDemo.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="JetStreamJson">
+        <MSBuild Projects="JetStream\JetStreamJson.dproj"/>
+    </Target>
+    <Target Name="JetStreamJson:Clean">
+        <MSBuild Projects="JetStream\JetStreamJson.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="JetStreamJson:Make">
+        <MSBuild Projects="JetStream\JetStreamJson.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="JetStreamSessions">
+        <MSBuild Projects="JetStream\JetStreamSessions.dproj"/>
+    </Target>
+    <Target Name="JetStreamSessions:Clean">
+        <MSBuild Projects="JetStream\JetStreamSessions.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="JetStreamSessions:Make">
+        <MSBuild Projects="JetStream\JetStreamSessions.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="JetStreamShop">
+        <MSBuild Projects="JetStream\JetStreamShop.dproj"/>
+    </Target>
+    <Target Name="JetStreamShop:Clean">
+        <MSBuild Projects="JetStream\JetStreamShop.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="JetStreamShop:Make">
+        <MSBuild Projects="JetStream\JetStreamShop.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="PullConsumer">
+        <MSBuild Projects="JetStream\PullConsumer.dproj"/>
+    </Target>
+    <Target Name="PullConsumer:Clean">
+        <MSBuild Projects="JetStream\PullConsumer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="PullConsumer:Make">
+        <MSBuild Projects="JetStream\PullConsumer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="JetStreamBench;JetStreamDemo;JetStreamJson;JetStreamSessions;JetStreamShop;PullConsumer"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="JetStreamBench:Clean;JetStreamDemo:Clean;JetStreamJson:Clean;JetStreamSessions:Clean;JetStreamShop:Clean;PullConsumer:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="JetStreamBench:Make;JetStreamDemo:Make;JetStreamJson:Make;JetStreamSessions:Make;JetStreamShop:Make;PullConsumer:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>
