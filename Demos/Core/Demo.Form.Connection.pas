@@ -251,7 +251,7 @@ class function TfrmConnection.CreateAndShow(const AName: string; AParent: TWinCo
 begin
   Result := TfrmConnection.Create(AParent);
   try
-    Result.FConnection.Name := AName;
+    Result.FConnection.SetName(AName);
     Result.FLog := ALog;
     Result.Top := 0;
     Result.Left := 0;
