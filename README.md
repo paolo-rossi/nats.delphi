@@ -347,6 +347,18 @@ var LKV := TJetStreamKV.CreateBucket(LJs, 'config');
 LKV.Put('db.host', 'localhost');
 Writeln(LKV.Get('db.host', '(unset)'));
 
+// Live change notifications: the current values first, then every change.
+// The handler runs on the consumer thread; releasing the watcher stops it
+var LWatcher := LKV.Watch('db.>',
+  procedure (const AEntry: TKVEntry)
+  begin
+    if AEntry.IsDelete then
+      Writeln(AEntry.Key, ' removed')
+    else
+      Writeln(AEntry.Key, ' = ', AEntry.ValueString);
+  end);
+LWatcher.WaitForInitialValues(5000);
+
 var LOs := TJetStreamObjectStore.CreateBucket(LJs, 'files');
 LOs.PutFile('report.pdf', 'C:\tmp\report.pdf');   // chunked past max_payload
 LOs.GetFile('report.pdf', 'C:\out\report.pdf');   // digest-verified on the way back
@@ -458,7 +470,7 @@ socket so the protocol can be tested byte for byte without a server.
 ## Tests
 
 `Tests\Nats.Tests.Framework.dproj` is a [DUnitX](https://github.com/VSoftTechnologies/DUnitX)
-suite of **343 tests**: the parser, entities and NUID; the connection driven
+suite of **403 tests**: the parser, entities and NUID; the connection driven
 against a mock socket asserting the exact bytes on the wire; thread-safety and
 lifecycle tests; the JetStream units, offline; and end-to-end tests against a
 real server.
@@ -492,12 +504,12 @@ Implemented and tested:
 - **JetStream** — the management API (streams, consumers, account), publish with
   acknowledgement and the deduplication / expectation headers, pull consumption
   (`Fetch`, `FetchNoWait`, `Next`), push consumption with flow control, message
-  acknowledgement (`Ack` / `Nak` / `InProgress` / `Term`), Key/Value and Object
-  Store.
+  acknowledgement (`Ack` / `Nak` / `InProgress` / `Term`), Key/Value (with live
+  watches on a key, a wildcard or the whole bucket) and Object Store.
 
 Not implemented yet:
 
-- **Automatic reconnect.** A dropped connection is reported, not re-established; `connect_urls` from the server's `INFO` is ignored.
+- **Automatic reconnect.** A dropped connection is reported, not re-established; `connect_urls` from the server's `INFO` is ignored. The same goes for a Key/Value watch: start a new one after reconnecting.
 - **TLS.** A server whose `INFO` says `tls_required` is refused with a clear error rather than being talked to in plaintext.
 - **NKey / JWT authentication.** `User`, `Pass` and `AuthToken` work; nothing signs the server's nonce.
 - **A timeout on the asynchronous `Request`.** `RequestSync` has one.

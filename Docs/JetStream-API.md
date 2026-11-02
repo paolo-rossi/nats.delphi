@@ -13,7 +13,7 @@ so a program that only wants core NATS never links any of this.
 | `Nats.JetStream.Client` | `TJetStreamContext` (management, publish, consume), `TJetStreamPubOptions`, the exceptions |
 | `Nats.JetStream.Entities` | The API records — stream and consumer configs, infos, requests, responses |
 | `Nats.JetStream.Message` | `IJetStreamMsg`, `TJetStreamMsgMetadata` |
-| `Nats.JetStream.KV` | `TJetStreamKV`, `TKVEntry`, `TJetStreamKVConfig` |
+| `Nats.JetStream.KV` | `TJetStreamKV`, `TKVEntry`, `TJetStreamKVConfig`, `IJetStreamKVWatcher`, `TKVWatchOptions` |
 | `Nats.JetStream.ObjectStore` | `TJetStreamObjectStore`, `TJetStreamObjectInfo` |
 | `Nats.JetStream.Consts` | `JetStreamConstants` — API subjects, headers, ack payloads |
 
@@ -124,16 +124,19 @@ deliver the API's reply, so the call would block until it timed out. This is
 - `Publish` / `PublishBytes`
 - `Fetch` / `FetchNoWait` / `Next` / `ScanSubject`
 - `IJetStreamMsg.AckSync`
-- every `TJetStreamKV` and `TJetStreamObjectStore` method
+- every `TJetStreamKV` and `TJetStreamObjectStore` method, `Watch` included,
+  and the watcher's `WaitForInitialValues` and `Stop`
 
 Inside a push handler, plain `Ack` / `Nak` / `Term` / `InProgress` are fine —
-they only write and wait for nothing.
+they only write and wait for nothing. The same rule covers a Key/Value watch
+handler, which is a push handler too.
 
 ---
 
 ## TJetStreamContext
 
 ```pascal
+property Connection: TNatsConnection; // the connection it runs over - not owned
 property Domain: string;              // empty unless built for a domain
 property Timeout: Cardinal;           // how long to wait for an API reply
 ```
@@ -481,6 +484,35 @@ Idle heartbeats and flow-control requests are answered and swallowed here rather
 than handed on: they are the server talking to the client, not data. A
 flow-control request **must** be answered or the server stops sending, which is
 why it is not simply ignored.
+
+```pascal
+function SubscribeDelivery(const ADeliverSubject: string;
+  AHandler: TJetStreamMsgHandler): Integer;
+```
+
+The half of `SubscribePush` that does not need the consumer to exist yet. It
+subscribes to `ADeliverSubject` with the same wrapping, flow-control and
+heartbeat handling, and the same threading rules. Use it when you create your
+**own** push consumer. Subscribe first, then create the consumer: the server
+starts pushing as soon as the consumer exists, often before the create reply is
+back. Core NATS keeps nothing for a subject nobody is subscribed to, so anything
+delivered in that gap is lost. `SubscribePush` can't do it in that order because
+it reads the delivery subject from an existing consumer. A Key/Value watch is
+built this way:
+
+```pascal
+var LInbox := LJs.Connection.GetNewInbox;
+var LSid := LJs.SubscribeDelivery(LInbox, LHandler);   // 1. listen
+try
+  var LCfg := Default(TJetStreamConsumerConfig);
+  LCfg.DeliverSubject := LInbox;
+  LCfg.AckPolicy := TJetStreamAckPolicy.None;
+  LJs.AddConsumer('EVENTS', LCfg);                     // 2. then create
+except
+  LJs.Connection.Unsubscribe(LSid);
+  raise;
+end;
+```
 
 ### ScanSubject
 
@@ -842,7 +874,7 @@ class function TJetStreamJSON.FromJSON<T: record>(const AJson: string): T; stati
 | `EJetStreamStatusError` | The server answered with a header status line instead of a body | `Status`, `Description` |
 | `EJetStreamTimeout` | Nothing answered at all — usually means JetStream is not enabled | — |
 | `EJetStreamAckError` | Acknowledging a message that cannot be, or already has been | — |
-| `EJetStreamKVError` | An unusable bucket or key name, or a failed compare-and-set | — |
+| `EJetStreamKVError` | An unusable bucket name, key or key filter, a failed compare-and-set, or contradictory watch options | — |
 | `EJetStreamObjectError` | An unusable bucket or object name, or a failed digest check | — |
 
 All descend from `ENatsException`.
@@ -890,7 +922,8 @@ like a successful call whose every field happened to be a default.
 stream `KV_<bucket>` capturing `$KV.<bucket>.>`; a key is a subject under it;
 the current value is the **last message** on that subject; a revision **is** the
 stream sequence; and a delete is a tombstone message rather than the removal of
-one. Everything below is that convention and nothing more.
+one. Everything below is that convention and nothing more. That includes
+watching: a watch is just a push consumer filtered on the key subjects.
 
 ### Creating and binding
 
@@ -1042,17 +1075,105 @@ had to be expressible.
 what the value used to be. `Purge` removes the key **and** its history by
 rolling the subject up to a single tombstone; the old values are gone for good.
 
+### Watching
+
+```pascal
+function Watch(const AKey: string; AHandler: TKVWatchHandler;
+  AOptions: TKVWatchOptions = []): IJetStreamKVWatcher;
+function WatchAll(AHandler: TKVWatchHandler;
+  AOptions: TKVWatchOptions = []): IJetStreamKVWatcher;   // Watch('>')
+
+TKVWatchHandler = reference to procedure(const AEntry: TKVEntry);
+```
+
+Calls `AHandler` for every change to the keys `AKey` matches, until the watcher
+is stopped or released. `AKey` is a subject filter, not just a key: `*` matches
+exactly one token and a trailing `>` matches the rest (`users.*`, `users.>`,
+`>`).
+
+By default the handler first gets the **current value of every matching key**,
+then each change as it happens. That includes deleted keys, delivered as
+tombstones (`IsDelete`, with `Operation` set to `Delete` or `Purge` and an
+empty `Value`), so a cache built from the watch knows to drop them.
+
+```pascal
+var LWatcher := LKV.Watch('db.>',
+  procedure (const AEntry: TKVEntry)
+  begin
+    // consumer thread: thread-safe state only, no blocking calls
+    if AEntry.IsDelete then
+      LCache.Remove(AEntry.Key)
+    else
+      LCache.AddOrSetValue(AEntry.Key, AEntry.ValueString);
+  end);
+
+if not LWatcher.WaitForInitialValues(5000) then
+  raise Exception.Create('the cache did not load in time');
+
+// LCache now holds every db.* key; changes keep arriving until:
+LWatcher.Stop;      // or simply release the last reference
+```
+
+| Option | Effect |
+|---|---|
+| `IncludeHistory` | Every revision still held, oldest first, rather than only the current one |
+| `UpdatesOnly` | No initial values: only changes made after the watch starts |
+| `IgnoreDeletes` | Deletes and purges are not passed to the handler |
+| `MetaOnly` | Values stay on the server, so entries arrive with an empty `Value` |
+
+`IncludeHistory` and `UpdatesOnly` contradict each other, and passing both
+raises `EJetStreamKVError`.
+
+```pascal
+IJetStreamKVWatcher = interface
+  function WaitForInitialValues(ATimeoutMs: Cardinal): Boolean;
+  procedure Stop;
+  property InitialValuesDone: Boolean;
+end;
+```
+
+- **`WaitForInitialValues`** returns True once the handler has *run* for every
+  value that existed when the watch started, not merely once those values have
+  arrived. It is signalled when a delivery reports nothing left pending. An
+  empty bucket or a filter that matches nothing is done straight away, and so
+  is `UpdatesOnly`. It returns False on timeout.
+- **`Stop`** unsubscribes and then deletes the server-side consumer. Deliveries
+  already queued when you call it are dropped, not handed to the handler. A
+  second `Stop` does nothing.
+- **Releasing the last reference stops the watch**, so a watch nobody holds
+  cannot keep running. It stops through the context, so **the
+  `TJetStreamContext` must outlive the watcher**: stop it, or set it to `nil`,
+  before freeing the context.
+
+Under the hood a watch is an ephemeral **push** consumer on the bucket's stream:
+`DeliverPolicy` `LastPerSubject` (`All` with `IncludeHistory`, `New` with
+`UpdatesOnly`), `AckPolicy` `None`, flow control, 5 s idle heartbeats, memory
+storage, one replica, and a 60 s inactivity threshold, so the server cleans up
+after a client that dies without stopping it.
+
+> The handler runs on the connection's consumer thread, like every push
+> handler. It must not call `Get`, `Put` or any other bucket or context method,
+> nor `WaitForInitialValues` / `Stop`. Marshal anything that touches the UI.
+
+> A watch is **not** an ordered consumer: nothing recreates it after a gap, and
+> it does not survive a dropped connection. After reconnecting, start a new
+> watch. Its initial values bring a cache back up to date.
+
 ### Names
 
 ```pascal
 class procedure CheckBucket(const ABucket: string); static;
 class procedure CheckKey(const AKey: string); static;
+class procedure CheckKeyFilter(const AKey: string); static;
 ```
 
 A **bucket** name becomes part of a stream name *and* of every subject, so it is
 restricted to letters, digits, `_` and `-`. A **key** becomes a subject token,
 so dots are fine — they simply make several tokens — but wildcards are not, and
-it may neither begin nor end with a dot. Both raise `EJetStreamKVError`.
+it may neither begin nor end with a dot. A **key filter**, used by `Watch`,
+follows the key rules but also accepts `*` and `>` as whole tokens, with `>`
+only last. A star *inside* a token (`user*`) is not a wildcard and is refused.
+All three raise `EJetStreamKVError`.
 
 ```pascal
 property Bucket: string;

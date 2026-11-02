@@ -308,6 +308,19 @@ type
     /// </remarks>
     function SubscribePush(const AStream, AConsumer: string;
       AHandler: TJetStreamMsgHandler): Integer;
+    /// <summary>
+    ///   The half of SubscribePush that does not need the consumer to exist
+    ///   yet: subscribes to ADeliverSubject and hands each JetStream delivery
+    ///   to AHandler, answering flow control and swallowing heartbeats
+    /// </summary>
+    /// <remarks>
+    ///   For a caller that creates its OWN push consumer. The subscription
+    ///   must be in place BEFORE the consumer is created - core NATS keeps
+    ///   nothing for a subject nobody is subscribed to, so whatever the server
+    ///   delivers in between is simply gone. Same threading rules as
+    ///   SubscribePush.
+    /// </remarks>
+    function SubscribeDelivery(const ADeliverSubject: string; AHandler: TJetStreamMsgHandler): Integer;
 
     /// <summary>
     ///   Reads every message matching AFilter through a THROWAWAY consumer,
@@ -411,6 +424,8 @@ type
     /// </summary>
     function ConsumerNames(const AStream: string; AOffset: Integer = 0): TArray<string>;
 
+    /// The connection this context runs over. Not owned
+    property Connection: TNatsConnection read FConnection;
     /// Empty unless this context was built for a JetStream domain
     property Domain: string read FDomain;
     /// How long to wait for an API reply. Defaults to the connection's own
@@ -989,7 +1004,6 @@ function TJetStreamContext.SubscribePush(const AStream, AConsumer: string;
   AHandler: TJetStreamMsgHandler): Integer;
 var
   LInfo: TJetStreamConsumerInfo;
-  LConnection: TNatsConnection;
 begin
   if not Assigned(AHandler) then
     raise ENatsException.Create('A push subscription needs a handler');
@@ -1003,9 +1017,19 @@ begin
       'Consumer [%s] on stream [%s] is a PULL consumer - it has no delivery ' +
       'subject to subscribe to. Use Fetch or Next instead', [AConsumer, AStream]);
 
+  Result := SubscribeDelivery(LInfo.Config.DeliverSubject, AHandler);
+end;
+
+function TJetStreamContext.SubscribeDelivery(const ADeliverSubject: string; AHandler: TJetStreamMsgHandler): Integer;
+var
+  LConnection: TNatsConnection;
+begin
+  if not Assigned(AHandler) then
+    raise ENatsException.Create('A push subscription needs a handler');
+
   LConnection := FConnection;
 
-  Result := FConnection.Subscribe(LInfo.Config.DeliverSubject,
+  Result := FConnection.Subscribe(ADeliverSubject,
     procedure (const AMsg: TNatsArgsMSG)
     var
       LWrapped: IJetStreamMsg;

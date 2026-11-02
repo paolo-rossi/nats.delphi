@@ -15,10 +15,12 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.NetEncoding, System.Generics.Collections,
+  System.SyncObjs,
 
   Nats.Consts,
   Nats.Classes,
   Nats.Parser,
+  Nats.Connection,
   Nats.Exceptions,
   Nats.JetStream.Consts,
   Nats.JetStream.Client,
@@ -107,6 +109,51 @@ type
   EJetStreamKVError = class(ENatsException);
 
   /// <summary>
+  ///   How a watch behaves. The empty set is the common case: the current value
+  ///   of every matching key first, then every change as it happens
+  /// </summary>
+  TKVWatchOption = (
+    /// Every revision still held, oldest first, instead of only the current one
+    IncludeHistory,
+    /// No initial values at all - only changes made after the watch starts
+    UpdatesOnly,
+    /// Deletes and purges are not reported
+    IgnoreDeletes,
+    /// Values are left on the server: entries arrive with an empty Value
+    MetaOnly
+  );
+  TKVWatchOptions = set of TKVWatchOption;
+
+  /// <summary>
+  ///   Called once per change. Runs on the connection's consumer thread, so it
+  ///   must not block on a reply - no Get, Put or any other bucket call
+  ///   inside it - and must marshal anything that touches the UI
+  /// </summary>
+  TKVWatchHandler = reference to procedure(const AEntry: TKVEntry);
+
+  /// <summary>
+  ///   A running watch. Releasing the last reference stops it
+  /// </summary>
+  IJetStreamKVWatcher = interface
+    ['{5C0F6A3E-2B7D-4E8A-9C1F-3D6B8E2A4F71}']
+    function GetInitialValuesDone: Boolean;
+    /// <summary>
+    ///   Blocks until every value that existed when the watch started has
+    ///   been handed to the handler. False on timeout. Never call it from a
+    ///   handler: the thread it would block is the one delivering them
+    /// </summary>
+    function WaitForInitialValues(ATimeoutMs: Cardinal): Boolean;
+    /// <summary>
+    ///   Stops delivery and deletes the server-side consumer. Blocks on that
+    ///   delete, so not from a handler either. Safe to call twice
+    /// </summary>
+    procedure Stop;
+    /// True once the initial values are all delivered - immediately, for
+    /// UpdatesOnly or a watch that matched nothing
+    property InitialValuesDone: Boolean read GetInitialValuesDone;
+  end;
+
+  /// <summary>
   ///   A handle on one key/value bucket
   /// </summary>
   /// <remarks>
@@ -140,6 +187,12 @@ type
     /// </summary>
     function EntryFromStored(const AMsg: TJetStreamStoredMsg): TKVEntry;
     function EntryFromDelivered(const AMsg: IJetStreamMsg): TKVEntry;
+    /// <summary>
+    ///   EntryFromDelivered without Self - a watch outlives nothing it should
+    ///   not, and its handler must keep working if this handle is freed first
+    /// </summary>
+    class function DeliveredEntry(const ABucket: string;
+      const AMsg: IJetStreamMsg): TKVEntry; static;
     /// Publishes to the key's subject and returns the revision it landed at
     function PutRaw(const AKey: string; const AValue: TBytes;
       AOptions: TJetStreamPubOptions): UInt64;
@@ -180,6 +233,11 @@ type
     ///   neither begin nor end with a dot
     /// </summary>
     class procedure CheckKey(const AKey: string); static;
+    /// <summary>
+    ///   CheckKey, except that '*' and '&gt;' are allowed as whole tokens - a
+    ///   watch takes a subject filter, not a single key
+    /// </summary>
+    class procedure CheckKeyFilter(const AKey: string); static;
     /// The subject '$KV.<bucket>.<key>' that AKey is stored on - the bucket's
     /// stream captures it. Needed by anything that purges or scans the stream
     /// directly rather than going through this class
@@ -248,12 +306,239 @@ type
     /// </summary>
     procedure Purge(const AKey: string);
 
+    { watching }
+
+    /// <summary>
+    ///   Calls AHandler for every change to the keys AKey matches, until the
+    ///   returned watcher is stopped or released. AKey may use '*' for one
+    ///   token and a trailing '&gt;' for the rest, as a subject filter does
+    /// </summary>
+    /// <remarks>
+    ///   <para>
+    ///     Unless UpdatesOnly is given, the handler first receives the current
+    ///     value of every matching key - deleted keys included, as tombstones,
+    ///     so a cache built from the watch knows to drop them. Watcher's
+    ///     WaitForInitialValues tells when that initial set is complete.
+    ///   </para>
+    ///   <para>
+    ///     Built on an ephemeral, unacknowledged push consumer, which is what
+    ///     every NATS client does. It is NOT an ordered consumer: there is no
+    ///     automatic recreation after a gap, so a watch does not survive a
+    ///     dropped connection - start a new one.
+    ///   </para>
+    ///   <para>
+    ///     Blocks while the consumer is created, so never call it from a
+    ///     handler. The handler itself runs on the consumer thread.
+    ///   </para>
+    /// </remarks>
+    function Watch(const AKey: string; AHandler: TKVWatchHandler; AOptions: TKVWatchOptions = []): JetStreamKVWatcher;
+    /// Watch('&gt;'): every key in the bucket
+    function WatchAll(AHandler: TKVWatchHandler; AOptions: TKVWatchOptions = []): IJetStreamKVWatcher;
+
     property Bucket: string read FBucket;
     /// KV_<bucket> - a bucket is a stream, and this is the stream
     property StreamName: string read FStream;
   end;
 
 implementation
+
+const
+  /// <summary>
+  ///   How often the server proves a quiet watch is still alive. Required for
+  ///   flow control, which a push consumer without heartbeats cannot enable
+  /// </summary>
+  WATCH_HEARTBEAT_SECONDS = 5;
+  /// <summary>
+  ///   How long the server keeps a watch consumer nobody is listening to. The
+  ///   safety net for a client that dies without stopping its watch
+  /// </summary>
+  WATCH_IDLE_SECONDS = 60;
+
+type
+  /// <summary>
+  ///   What the delivery handler needs, kept apart from the watcher so the
+  ///   handler's reference does not keep the watcher alive - releasing the
+  ///   watcher is what stops the watch
+  /// </summary>
+  IKVWatchState = interface
+    ['{8E4B1D27-6A3C-4F95-B0D2-71C5E9A3F648}']
+    procedure Deliver(const AMsg: IJetStreamMsg);
+    procedure MarkInitialDone;
+    procedure Halt;
+    function IsInitialDone: Boolean;
+    function WaitInitial(ATimeoutMs: Cardinal): Boolean;
+  end;
+
+  TKVWatchState = class(TInterfacedObject, IKVWatchState)
+  private
+    FBucket: string;
+    FHandler: TKVWatchHandler;
+    FOptions: TKVWatchOptions;
+    FInitial: TLightweightEvent;
+    FHalted: Integer;
+  public
+    constructor Create(const ABucket: string; AHandler: TKVWatchHandler;
+      AOptions: TKVWatchOptions);
+    destructor Destroy; override;
+
+    procedure Deliver(const AMsg: IJetStreamMsg);
+    procedure MarkInitialDone;
+    procedure Halt;
+    function IsInitialDone: Boolean;
+    function WaitInitial(ATimeoutMs: Cardinal): Boolean;
+  end;
+
+  TJetStreamKVWatcher = class(TInterfacedObject, IJetStreamKVWatcher)
+  private
+    FContext: TJetStreamContext;
+    FStream: string;
+    FConsumer: string;
+    FSid: Integer;
+    FState: IKVWatchState;
+    FStopped: Integer;
+  public
+    constructor Create(AContext: TJetStreamContext; const AStream, AConsumer: string;
+      ASid: Integer; const AState: IKVWatchState);
+    destructor Destroy; override;
+
+    function GetInitialValuesDone: Boolean;
+    function WaitForInitialValues(ATimeoutMs: Cardinal): Boolean;
+    procedure Stop;
+  end;
+
+{ TKVWatchState }
+
+constructor TKVWatchState.Create(const ABucket: string; AHandler: TKVWatchHandler;
+  AOptions: TKVWatchOptions);
+begin
+  inherited Create;
+  FBucket := ABucket;
+  FHandler := AHandler;
+  FOptions := AOptions;
+  FInitial := TLightweightEvent.Create(False);
+end;
+
+destructor TKVWatchState.Destroy;
+begin
+  FInitial.Free;
+  inherited;
+end;
+
+procedure TKVWatchState.Deliver(const AMsg: IJetStreamMsg);
+var
+  LEntry: TKVEntry;
+begin
+  { Deliveries already queued when the watch was stopped still reach this
+    point - the caller asked for them to stop, so they stop here }
+  if TInterlocked.CompareExchange(FHalted, 0, 0) <> 0 then
+    Exit;
+
+  LEntry := TJetStreamKV.DeliveredEntry(FBucket, AMsg);
+
+  if not (LEntry.IsDelete and (TKVWatchOption.IgnoreDeletes in FOptions)) then
+    FHandler(LEntry);
+
+  { NumPending is what the consumer still has to send. Zero on a delivery
+    means the backlog that existed when the watch started is drained - AFTER
+    the handler, so a waiter released by it sees that entry handled. Checked
+    even for an ignored delete, which can be the last of the backlog }
+  if AMsg.Metadata.NumPending = 0 then
+    MarkInitialDone;
+end;
+
+procedure TKVWatchState.MarkInitialDone;
+begin
+  FInitial.SetEvent;
+end;
+
+procedure TKVWatchState.Halt;
+begin
+  TInterlocked.Exchange(FHalted, 1);
+end;
+
+function TKVWatchState.IsInitialDone: Boolean;
+begin
+  Result := FInitial.IsSet;
+end;
+
+function TKVWatchState.WaitInitial(ATimeoutMs: Cardinal): Boolean;
+begin
+  Result := FInitial.WaitFor(ATimeoutMs) = TWaitResult.wrSignaled;
+end;
+
+{ TJetStreamKVWatcher }
+
+constructor TJetStreamKVWatcher.Create(AContext: TJetStreamContext;
+  const AStream, AConsumer: string; ASid: Integer; const AState: IKVWatchState);
+begin
+  inherited Create;
+  FContext := AContext;
+  FStream := AStream;
+  FConsumer := AConsumer;
+  FSid := ASid;
+  FState := AState;
+end;
+
+destructor TJetStreamKVWatcher.Destroy;
+begin
+  { Releasing the watcher IS stopping it - a watch nobody holds would go on
+    receiving and discarding every change for the life of the connection.
+    A destructor must not raise, and the consumer's inactivity threshold
+    cleans up whatever this could not }
+  try
+    Stop;
+  except
+  end;
+  inherited;
+end;
+
+function TJetStreamKVWatcher.GetInitialValuesDone: Boolean;
+begin
+  Result := FState.IsInitialDone;
+end;
+
+function TJetStreamKVWatcher.WaitForInitialValues(ATimeoutMs: Cardinal): Boolean;
+begin
+  Result := FState.WaitInitial(ATimeoutMs);
+end;
+
+procedure TJetStreamKVWatcher.Stop;
+var
+  LConnection: TNatsConnection;
+begin
+  if TInterlocked.Exchange(FStopped, 1) <> 0 then
+    Exit;
+
+  { First, so nothing more reaches the handler whatever happens below }
+  FState.Halt;
+
+  LConnection := FContext.Connection;
+
+  if not LConnection.Connected then
+  begin
+    { Nothing to tell the server, which dropped the consumer's interest along
+      with the connection. Unsubscribe still clears the local entry - it
+      removes it before it tries to write, and the write is what fails }
+    try
+      LConnection.Unsubscribe(FSid);
+    except
+    end;
+    Exit;
+  end;
+
+  { Unsubscribing first removes the consumer's interest, so the server stops
+    pushing before it is asked to delete }
+  LConnection.Unsubscribe(FSid);
+
+  try
+    FContext.DeleteConsumer(FStream, FConsumer);
+  except
+    { Already gone - the inactivity threshold got there first, or the bucket
+      was deleted under the watch. Either way the watch is stopped }
+    on E: EJetStreamApiError do ;
+    on E: EJetStreamTimeout do ;
+  end;
+end;
 
 { TKVEntry }
 
@@ -476,13 +761,26 @@ begin
 end;
 
 function TJetStreamKV.EntryFromDelivered(const AMsg: IJetStreamMsg): TKVEntry;
+begin
+  Result := DeliveredEntry(FBucket, AMsg);
+end;
+
+class function TJetStreamKV.DeliveredEntry(const ABucket: string; const AMsg: IJetStreamMsg): TKVEntry;
 var
-  LOperation: string;
+  LOperation, LPrefix: string;
   LHeaders: TNatsHeaders;
 begin
   Result := Default(TKVEntry);
-  Result.Bucket := FBucket;
-  Result.Key := SubjectKey(AMsg.Subject);
+  Result.Bucket := ABucket;
+
+  { As SubjectKey, which needs an instance - '$KV.<bucket>.' and everything
+    after it, dots and all }
+  LPrefix := Format(JetStreamConstants.KV.SUBJECT_KEY, [ABucket, '']);
+  if AMsg.Subject.StartsWith(LPrefix) then
+    Result.Key := AMsg.Subject.Substring(Length(LPrefix))
+  else
+    Result.Key := AMsg.Subject;
+
   Result.Revision := AMsg.Metadata.StreamSeq;
   Result.Operation := TKVOperation.Put;
   Result.Value := AMsg.PayloadData;
@@ -703,6 +1001,124 @@ begin
   finally
     LResult.Free;
   end;
+end;
+
+class procedure TJetStreamKV.CheckKeyFilter(const AKey: string);
+var
+  LTokens: TArray<string>;
+  LIndex: Integer;
+  LToken: string;
+begin
+  if AKey.IsEmpty then
+    raise EJetStreamKVError.Create('A key filter cannot be empty');
+
+  LTokens := AKey.Split([NatsConstants.SEP]);
+
+  for LIndex := 0 to High(LTokens) do
+  begin
+    LToken := LTokens[LIndex];
+
+    if LToken = '*' then
+      Continue;
+
+    { '>' swallows everything after it, so anything following it is a
+      filter the server would reject rather than a narrower one }
+    if LToken = '>' then
+    begin
+      if LIndex <> High(LTokens) then
+        raise EJetStreamKVError.CreateFmt(
+          'Key filter [%s]: ''>'' may only be the last token', [AKey]);
+      Continue;
+    end;
+
+    { Anything else is an ordinary key token - including the rule that a
+      wildcard character inside a token ('a*') is not a wildcard at all }
+    if LToken.IsEmpty then
+      raise EJetStreamKVError.CreateFmt(
+        'Key filter [%s] has an empty token - a doubled, leading or trailing dot',
+        [AKey]);
+    CheckKey(LToken);
+  end;
+end;
+
+function TJetStreamKV.Watch(const AKey: string; AHandler: TKVWatchHandler; AOptions: TKVWatchOptions): IJetStreamKVWatcher;
+var
+  LState: IKVWatchState;
+  LConnection: TNatsConnection;
+  LInbox: string;
+  LSid: Integer;
+  LConfig: TJetStreamConsumerConfig;
+  LInfo: TJetStreamConsumerInfo;
+begin
+  CheckKeyFilter(AKey);
+
+  if not Assigned(AHandler) then
+    raise EJetStreamKVError.Create('A watch needs a handler');
+
+  if (TKVWatchOption.IncludeHistory in AOptions) and
+     (TKVWatchOption.UpdatesOnly in AOptions) then
+    raise EJetStreamKVError.Create(
+      'IncludeHistory and UpdatesOnly contradict each other - one asks for ' +
+      'every past revision, the other for none');
+
+  LState := TKVWatchState.Create(FBucket, AHandler, AOptions);
+  LConnection := FContext.Connection;
+  LInbox := LConnection.GetNewInbox;
+
+  { Subscribe FIRST. The server starts pushing the moment the consumer exists,
+    often before the create reply is back, and core NATS keeps nothing for a
+    subject nobody is subscribed to - the initial values would be lost }
+  LSid := FContext.SubscribeDelivery(LInbox,
+    procedure (const AMsg: IJetStreamMsg)
+    begin
+      LState.Deliver(AMsg);
+    end);
+
+  try
+    LConfig := Default(TJetStreamConsumerConfig);
+    LConfig.FilterSubject := KeySubject(AKey);
+    LConfig.DeliverSubject := LInbox;
+    LConfig.HeadersOnly := TKVWatchOption.MetaOnly in AOptions;
+
+    if TKVWatchOption.UpdatesOnly in AOptions then
+      LConfig.DeliverPolicy := TJetStreamDeliverPolicy.New
+    else if TKVWatchOption.IncludeHistory in AOptions then
+      LConfig.DeliverPolicy := TJetStreamDeliverPolicy.All
+    else
+      LConfig.DeliverPolicy := TJetStreamDeliverPolicy.LastPerSubject;
+
+    { The shape every NATS client gives a watch: nothing to ack (a watch
+      observes, it does not process), flow control so a slow handler is not
+      cut off as a slow consumer, heartbeats which flow control requires, and
+      memory storage with one replica because the consumer is throwaway }
+    LConfig.AckPolicy := TJetStreamAckPolicy.None;
+    LConfig.FlowControl := True;
+    LConfig.IdleHeartbeat := TJetStreamDuration.FromSeconds(WATCH_HEARTBEAT_SECONDS);
+    LConfig.MemStorage := True;
+    LConfig.NumReplicas := 1;
+    LConfig.InactiveThreshold := TJetStreamDuration.FromSeconds(WATCH_IDLE_SECONDS);
+
+    LInfo := FContext.AddConsumer(FStream, LConfig);
+  except
+    LState.Halt;
+    LConnection.Unsubscribe(LSid);
+    raise;
+  end;
+
+  { Nothing to wait for when no initial values were asked for, or none
+    matched. Delivered must be zero too: if the server already pushed
+    something, the handler will see NumPending reach zero on its own, AFTER
+    that entry is handled - marking it here could release a waiter early }
+  if (TKVWatchOption.UpdatesOnly in AOptions) or
+     ((LInfo.NumPending = 0) and (LInfo.Delivered.ConsumerSeq = 0)) then
+    LState.MarkInitialDone;
+
+  Result := TJetStreamKVWatcher.Create(FContext, FStream, LInfo.Name, LSid, LState);
+end;
+
+function TJetStreamKV.WatchAll(AHandler: TKVWatchHandler; AOptions: TKVWatchOptions): IJetStreamKVWatcher;
+begin
+  Result := Watch('>', AHandler, AOptions);
 end;
 
 function TJetStreamKV.Status: TJetStreamKVStatus;

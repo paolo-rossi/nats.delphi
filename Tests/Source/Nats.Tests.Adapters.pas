@@ -496,7 +496,7 @@ begin
   FSocket := TNatsMockSocket.LastInstance;
   Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
 
-  FConn.Name := 'TestConn';
+  FConn.SetName('TestConn');
   FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
 end;
 

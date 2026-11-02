@@ -465,6 +465,14 @@ type
     procedure CheckKey_LeadingOrTrailingDot_Raises;
     [Test]
     procedure CheckKey_DotsInTheMiddle_AreAllowed;
+    [Test]
+    procedure CheckKeyFilter_WholeTokenWildcards_AreAllowed;
+    [Test]
+    procedure CheckKeyFilter_GreaterThanBeforeTheEnd_Raises;
+    [Test]
+    procedure CheckKeyFilter_WildcardInsideAToken_Raises;
+    [Test]
+    procedure CheckKeyFilter_EmptyToken_Raises;
 
     { a bucket is a stream }
 
@@ -1352,7 +1360,7 @@ begin
   FSocket := TNatsMockSocket.LastInstance;
   Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
 
-  FConn.Name := 'JsTestConn';
+  FConn.SetName('JsTestConn');
   FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);
@@ -2893,7 +2901,7 @@ begin
   FSocket := TNatsMockSocket.LastInstance;
   Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
 
-  FConn.Name := 'JsMsgConn';
+  FConn.SetName('JsMsgConn');
   FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
 end;
 
@@ -3254,7 +3262,7 @@ begin
   FSocket := TNatsMockSocket.LastInstance;
   Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
 
-  FConn.Name := 'KvTestConn';
+  FConn.SetName('KvTestConn');
   FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);
@@ -3448,6 +3456,52 @@ begin
     so the check must not be a blanket ban on dots }
   TJetStreamKV.CheckKey('app.db.host');
   Assert.Pass('a multi-token key is a valid key');
+end;
+
+procedure TJetStreamKVTests.CheckKeyFilter_WholeTokenWildcards_AreAllowed;
+begin
+  { A watch takes a subject filter, so the forms a subject filter allows have
+    to pass - a plain key included }
+  TJetStreamKV.CheckKeyFilter('>');
+  TJetStreamKV.CheckKeyFilter('users.*');
+  TJetStreamKV.CheckKeyFilter('users.*.profile');
+  TJetStreamKV.CheckKeyFilter('users.>');
+  TJetStreamKV.CheckKeyFilter('app.db.host');
+  Assert.Pass('every whole-token wildcard is a valid filter');
+end;
+
+procedure TJetStreamKVTests.CheckKeyFilter_GreaterThanBeforeTheEnd_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKeyFilter('users.>.profile');
+    end, EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckKeyFilter_WildcardInsideAToken_Raises;
+begin
+  { 'user*' is not a wildcard to the server - it is a literal token holding a
+    star, which a key may not contain }
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKeyFilter('user*');
+    end, EJetStreamKVError);
+end;
+
+procedure TJetStreamKVTests.CheckKeyFilter_EmptyToken_Raises;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKeyFilter('users..*');
+    end, EJetStreamKVError);
+  Assert.WillRaise(
+    procedure
+    begin
+      TJetStreamKV.CheckKeyFilter('.users');
+    end, EJetStreamKVError);
 end;
 
 procedure TJetStreamKVTests.CreateBucket_UsesTheKvNameAndSubject;
@@ -3888,7 +3942,7 @@ begin
   FSocket := TNatsMockSocket.LastInstance;
   Assert.IsNotNull(FSocket, 'the connection did not create a mock socket');
 
-  FConn.Name := 'ObjTestConn';
+  FConn.SetName('ObjTestConn');
   FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);

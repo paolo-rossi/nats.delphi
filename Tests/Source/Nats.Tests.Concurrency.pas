@@ -240,7 +240,7 @@ begin
   FLog := TNatsTestLog.Create;
   FConn := TNatsConnection.Create;
   FSocket := TNatsMockSocket.LastInstance;
-  FConn.Name := 'ConcurrencyConn';
+  FConn.SetName('ConcurrencyConn');
   FConn.SetChannel('127.0.0.1', NatsConstants.DEFAULT_PORT, MOCK_TIMEOUT);
 end;
 

@@ -253,6 +253,29 @@ type
     /// The F6 fix: Values counts keys, not messages, tombstones included
     [Test]
     procedure Status_Values_CountsKeysNotMessages;
+
+    { watching }
+
+    /// The common case, and proof that WaitForInitialValues waits for the handler
+    [Test]
+    procedure Watch_DeliversCurrentValuesThenUpdates;
+    /// An empty bucket has no last delivery to signal on - it must not hang
+    [Test]
+    procedure Watch_EmptyBucket_IsInitiallyDoneAtOnce;
+    [Test]
+    procedure Watch_IncludeHistory_DeliversEveryRevision;
+    [Test]
+    procedure Watch_UpdatesOnly_SkipsExistingValues;
+    [Test]
+    procedure Watch_ReportsADeleteAsATombstone;
+    [Test]
+    procedure Watch_IgnoreDeletes_LeavesThemOut;
+    [Test]
+    procedure Watch_KeyFilter_SeesOnlyMatchingKeys;
+    [Test]
+    procedure Watch_Stop_DeletesTheConsumer;
+    [Test]
+    procedure Watch_ReleasingTheWatcher_StopsIt;
   end;
 
   /// <summary>
@@ -402,7 +425,7 @@ begin
   FSubject := 'nats.delphi.test.' + TNUID.NextNuid;
 
   FConn := TNatsConnection.Create;
-  FConn.Name := 'LiveConn';
+  FConn.SetName('LiveConn');
   FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
 end;
 
@@ -794,7 +817,7 @@ begin
   FStream := 'DELPHI_TEST_' + TNUID.NextNuid;
 
   FConn := TNatsConnection.Create;
-  FConn.Name := 'JsLiveConn';
+  FConn.SetName('JsLiveConn');
   FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);
@@ -1514,7 +1537,7 @@ begin
   FBucket := 'delphi_kv_' + TNUID.NextNuid;
 
   FConn := TNatsConnection.Create;
-  FConn.Name := 'KvLiveConn';
+  FConn.SetName('KvLiveConn');
   FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);
@@ -1935,6 +1958,304 @@ begin
   Assert.AreEqual(2, Length(FKV.Keys), 'two live keys besides the tombstone');
 end;
 
+/// <summary>
+///   'key=value' for a put, 'key:Delete' / 'key:Purge' for a tombstone. Unit
+///   level because the watch handlers are anonymous methods, which cannot
+///   capture a nested function
+/// </summary>
+function WatchText(const AEntry: TKVEntry): string;
+begin
+  case AEntry.Operation of
+    TKVOperation.Delete: Result := AEntry.Key + ':Delete';
+    TKVOperation.Purge:  Result := AEntry.Key + ':Purge';
+  else
+    Result := AEntry.Key + '=' + AEntry.ValueString;
+  end;
+end;
+
+function WatchInto(ALog: TNatsTestLog): TKVWatchHandler;
+begin
+  Result :=
+    procedure (const AEntry: TKVEntry)
+    begin
+      ALog.Add(WatchText(AEntry));
+    end;
+end;
+
+function WatchCountReaches(ALog: TNatsTestLog; ACount: Integer): Boolean;
+begin
+  Result := WaitForCondition(
+    function: Boolean
+    begin
+      Result := ALog.Count >= ACount;
+    end, WAIT_MS);
+end;
+
+procedure TJetStreamKVLiveTests.Watch_DeliversCurrentValuesThenUpdates;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  FKV.Put('alpha', '1');
+  FKV.Put('beta', '2');
+  FKV.Put('alpha', '1b');
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog));
+
+    Assert.IsTrue(LWatcher.WaitForInitialValues(WAIT_MS), 'initial values never completed');
+
+    { Read straight after the wait, with no polling: the wait must not return
+      until the handler has run for the LAST initial entry. Current values
+      only, in stream order - beta (seq 2) before alpha's latest (seq 3) }
+    Assert.AreEqual(2, LLog.Count, LLog.Text);
+    Assert.AreEqual('beta=2', LLog.Item(0));
+    Assert.AreEqual('alpha=1b', LLog.Item(1));
+
+    FKV.Put('gamma', '3');
+
+    Assert.IsTrue(WatchCountReaches(LLog, 3), 'the update never arrived: ' + LLog.Text);
+    Assert.AreEqual('gamma=3', LLog.Item(2));
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_EmptyBucket_IsInitiallyDoneAtOnce;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog));
+
+    { No WaitFor: there is no delivery to signal on, so unless Watch itself
+      marks the empty case, a caller waiting for the initial values waits
+      forever }
+    Assert.IsTrue(LWatcher.InitialValuesDone, 'an empty bucket left the watch waiting');
+    Assert.AreEqual(0, LLog.Count);
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_IncludeHistory_DeliversEveryRevision;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 5));
+
+  FKV.Put('alpha', '1');
+  FKV.Put('alpha', '2');
+  FKV.Put('alpha', '3');
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.Watch('alpha', WatchInto(LLog), [TKVWatchOption.IncludeHistory]);
+
+    Assert.IsTrue(LWatcher.WaitForInitialValues(WAIT_MS));
+    Assert.AreEqual(3, LLog.Count, LLog.Text);
+    Assert.AreEqual('alpha=1', LLog.Item(0));
+    Assert.AreEqual('alpha=3', LLog.Item(2));
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_UpdatesOnly_SkipsExistingValues;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  FKV.Put('alpha', '1');
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog), [TKVWatchOption.UpdatesOnly]);
+    Assert.IsTrue(LWatcher.InitialValuesDone, 'UpdatesOnly has no initial values to wait for');
+
+    FKV.Put('beta', '2');
+
+    { beta arriving proves the watch is live; alpha, stored before the watch,
+      would have been delivered ahead of it }
+    Assert.IsTrue(WatchCountReaches(LLog, 1), 'the update never arrived');
+    Assert.AreEqual(1, LLog.Count, LLog.Text);
+    Assert.AreEqual('beta=2', LLog.Item(0));
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_ReportsADeleteAsATombstone;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  FKV.Put('alpha', '1');
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog));
+    Assert.IsTrue(LWatcher.WaitForInitialValues(WAIT_MS));
+
+    FKV.Delete('alpha');
+    FKV.Purge('alpha');
+
+    { A watch that dropped tombstones would leave a cache built from it
+      holding a key that no longer exists }
+    Assert.IsTrue(WatchCountReaches(LLog, 3), LLog.Text);
+    Assert.AreEqual('alpha:Delete', LLog.Item(1));
+    Assert.AreEqual('alpha:Purge', LLog.Item(2));
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_IgnoreDeletes_LeavesThemOut;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  FKV.Put('alpha', '1');
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog), [TKVWatchOption.IgnoreDeletes]);
+    Assert.IsTrue(LWatcher.WaitForInitialValues(WAIT_MS));
+
+    FKV.Delete('alpha');
+    FKV.Put('beta', '2');
+
+    { beta is published after the delete, so once it is here the delete has
+      been through the watch too - and been left out }
+    Assert.IsTrue(WaitForCondition(
+      function: Boolean
+      begin
+        Result := LLog.Contains('beta=2');
+      end, WAIT_MS), LLog.Text);
+    Assert.IsFalse(LLog.Contains('alpha:Delete'), LLog.Text);
+    Assert.AreEqual(2, LLog.Count, LLog.Text);
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_KeyFilter_SeesOnlyMatchingKeys;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.Watch('users.*', WatchInto(LLog));
+    Assert.IsTrue(LWatcher.WaitForInitialValues(WAIT_MS));
+
+    FKV.Put('orders.1', 'x');
+    FKV.Put('users.1.profile', 'y');   // '*' is exactly one token
+    FKV.Put('users.1', 'ann');
+
+    { users.1 is published last, so once it is here the other two have had
+      their chance to arrive }
+    Assert.IsTrue(WatchCountReaches(LLog, 1), 'the matching key never arrived');
+    Assert.AreEqual(1, LLog.Count, LLog.Text);
+    Assert.AreEqual('users.1=ann', LLog.Item(0));
+
+    LWatcher.Stop;
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_Stop_DeletesTheConsumer;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog));
+    Assert.AreEqual(1, Length(FJs.ConsumerNames(FKV.StreamName)), 'the watch consumer');
+
+    LWatcher.Stop;
+    LWatcher.Stop;   // a second Stop is a no-op, not an error
+
+    Assert.AreEqual(0, Length(FJs.ConsumerNames(FKV.StreamName)),
+      'Stop left the consumer on the server');
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
+procedure TJetStreamKVLiveTests.Watch_ReleasingTheWatcher_StopsIt;
+var
+  LLog: TNatsTestLog;
+  LWatcher: IJetStreamKVWatcher;
+begin
+  Connect;
+  FKV := TJetStreamKV.CreateBucket(FJs, KVConfig(FBucket, 1));
+
+  LLog := TNatsTestLog.Create;
+  try
+    LWatcher := FKV.WatchAll(WatchInto(LLog));
+    Assert.AreEqual(1, Length(FJs.ConsumerNames(FKV.StreamName)));
+
+    { Dropping the last reference must stop the watch - otherwise a watch
+      nobody holds keeps a consumer and a subscription alive for good }
+    LWatcher := nil;
+
+    Assert.AreEqual(0, Length(FJs.ConsumerNames(FKV.StreamName)),
+      'releasing the watcher left the consumer on the server');
+  finally
+    LWatcher := nil;
+    LLog.Free;
+  end;
+end;
+
 { TJetStreamObjectStoreLiveTests }
 
 procedure TJetStreamObjectStoreLiveTests.Setup;
@@ -1944,7 +2265,7 @@ begin
   FBucket := 'delphi_obj_' + TNUID.NextNuid;
 
   FConn := TNatsConnection.Create;
-  FConn.Name := 'ObjLiveConn';
+  FConn.SetName('ObjLiveConn');
   FConn.SetChannel(LIVE_HOST, NatsConstants.DEFAULT_PORT, LIVE_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);

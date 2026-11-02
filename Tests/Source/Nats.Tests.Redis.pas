@@ -185,7 +185,7 @@ begin
   UseIndySocket;
 
   FConn := TNatsConnection.Create;
-  FConn.Name := 'RedisLiveConn';
+  FConn.SetName('RedisLiveConn');
   FConn.SetChannel(HOST, NatsConstants.DEFAULT_PORT, CONNECT_TIMEOUT);
 
   FJs := TJetStreamContext.Create(FConn);
