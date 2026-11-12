@@ -331,7 +331,7 @@ type
     ///     handler. The handler itself runs on the consumer thread.
     ///   </para>
     /// </remarks>
-    function Watch(const AKey: string; AHandler: TKVWatchHandler; AOptions: TKVWatchOptions = []): JetStreamKVWatcher;
+    function Watch(const AKey: string; AHandler: TKVWatchHandler; AOptions: TKVWatchOptions = []): IJetStreamKVWatcher;
     /// Watch('&gt;'): every key in the bucket
     function WatchAll(AHandler: TKVWatchHandler; AOptions: TKVWatchOptions = []): IJetStreamKVWatcher;
 
